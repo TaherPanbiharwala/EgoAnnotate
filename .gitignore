@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# runtime data — never committed
+data/
+runs/
+*.parquet
+*.jsonl
+!examples/**/*.jsonl
+*.mp4
+!examples/**/*.mp4
+*.MP4
+*.db
+*.db-wal
+*.db-shm
+
+# secrets
+.env
+*.key
+
+.DS_Store

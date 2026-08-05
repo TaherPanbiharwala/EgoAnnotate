@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this pipeline, please cite it as below."
+title: "egoannote: a reusable annotation pipeline for egocentric video"
+authors:
+  - family-names: Panbiharwala
+    given-names: Taher
+version: 0.1.0
+date-released: 2026-08-05
+license: MIT
+repository-code: "https://github.com/TaherPanbiharwala/egoannote"

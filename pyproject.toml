@@ -1,0 +1,64 @@
+[project]
+name = "egoannote"
+version = "0.1.0"
+description = "A reusable annotation pipeline for egocentric video: dense subtask segmentation, hand pose, and measured quality — not asserted."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "mediapipe>=0.10.18",
+    "opencv-contrib-python>=4.10",
+    "pyarrow>=18.0",
+    "pillow>=11.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "httpx>=0.27",
+    "numpy>=1.26,<2.3",
+    "json-repair>=0.30",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+dev = ["ruff>=0.7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/egoannote"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+# Pin the rule set explicitly. Relying on ruff's defaults means a ruff
+# upgrade silently changes what "clean" means.
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes — undefined names, unused imports
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear — likely bugs
+    "C4",   # comprehension clarity
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line length — the formatter owns this
+    "RUF059",  # unused unpacked variable — common and readable in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately reach into private helpers to pin internal behavior,
+# construct throwaway objects, and use dict() for readable kwargs defaults.
+"tests/*" = ["B008", "B017", "C408"]
+# demo.py is a standalone script: it must extend sys.path before importing
+# egoannote so it runs from a bare checkout without an editable install.
+"scripts/demo.py" = ["E402"]
+# probe.py: `(s.split("/") + ["1"])[:2]` reads more clearly than unpacking
+# for "split, and default the denominator if absent".
+"src/egoannote/media/probe.py" = ["RUF005"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,76 @@
+# VLM model registry — a capability table, not a name registry.
+# Adding a model is a config edit here, not a code change in backends/openai_compat.py.
+#
+# NOTE: tokens_per_image_fn is DECLARED but NOT YET CONSUMED. The spend guard
+# currently accounts cost AFTER each call from provider-reported token counts,
+# which means a single call can overshoot the cap by its own cost. Wiring this
+# field up would allow a pre-call estimate and a hard pre-flight check.
+# Recorded here now because the value differs per provider family and is easy
+# to get wrong later:
+#
+#   "qwen_tile"    : tokens ≈ ceil(w/28) * ceil(h/28)                  (pixel-proportional)
+#   "anthropic"    : tokens ≈ min(w*h, 1_150_000) / 750                (pixel-proportional, capped)
+#   "openai_tile"  : fixed 512px tile grid — cost is often IDENTICAL across 768/1280/1920
+#
+# That last family is why "resize to 1280 to save money" is not universally
+# true: under a fixed tile grid, 768/1280/1920 can all cost exactly the same.
+#
+# Two entries are required for the two-model agreement design, and they must be
+# from DIFFERENT labs — same-family models make correlated errors, which inflates
+# agreement (it measures similarity, not correctness). Model pair is an open item;
+# fill in real prices from the provider before running Phase 4 for real.
+
+[backend.openai-compat]
+base_url = "https://openrouter.ai/api/v1"
+# api_key is read from $OPENROUTER_API_KEY — never put a key in this file.
+
+# --- fake backend for CI / scripts/demo.py — no network, no key required ---
+[models.fake]
+backend = "fake"
+supports_json_schema = true
+max_images = 8
+
+# --- example entries: verify current model IDs, capabilities and prices at
+#     https://openrouter.ai/models before using these for a real run ---
+#
+# ENTRY CONTRACT (validated by backends/registry.py — unknown keys are an
+# error, because a mistyped price key would otherwise default to $0.00 and
+# silently disable the spend cap):
+#
+#   backend             REQUIRED  "openai-compat" | "fake"
+#   model               REQUIRED for openai-compat. Provider-facing id.
+#   base_url            optional. Falls back to [backend.openai-compat].
+#   max_images          optional, default 8. Must be >= the window size.
+#   price_in_per_mtok   optional, default 0.0. REQUIRED if you use a spend cap.
+#   price_out_per_mtok  optional, default 0.0. REQUIRED if you use a spend cap.
+#   provider_order      optional. See the warning below — set it for any run
+#                       whose agreement numbers you intend to report.
+#
+#   NOT YET CONSUMED by any code path (declared for future use only):
+#   supports_json_schema, image_detail, tokens_per_image_fn
+
+[models.example-a]
+backend = "openai-compat"
+model = "REPLACE_ME/model-a"          # e.g. a Google-family model
+max_images = 8
+price_in_per_mtok = 0.0                # USD per 1M input tokens — verify before use
+price_out_per_mtok = 0.0               # USD per 1M output tokens — verify before use
+# provider_order pins which upstream actually serves this model. Without it
+# OpenRouter may re-route mid-run, and the two-model agreement metric then
+# measures provider variance rather than model disagreement. registry.py
+# warns when this is unset on an OpenRouter base_url.
+# provider_order = ["REPLACE_ME-provider"]
+supports_json_schema = true            # not yet consumed
+image_detail = "high"                  # not yet consumed
+tokens_per_image_fn = "qwen_tile"      # not yet consumed
+
+[models.example-b]
+backend = "openai-compat"
+model = "REPLACE_ME/model-b"          # e.g. an Anthropic-family model — different lab than A
+max_images = 8
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+# provider_order = ["REPLACE_ME-provider"]
+supports_json_schema = true            # not yet consumed
+image_detail = "high"                  # not yet consumed
+tokens_per_image_fn = "anthropic"      # not yet consumed

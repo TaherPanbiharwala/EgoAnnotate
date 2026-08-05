@@ -1,0 +1,85 @@
+You are annotating egocentric (first-person) video for a robotics training dataset.
+Below are {n_frames} consecutive frames sampled from one clip, evenly spaced. The
+camera is worn on the person's head or wrist -- you see what they see. Each frame is
+labeled "Frame N" (N = 0..{max_frame_idx}) immediately before the image.
+
+This clip may contain ONE action that spans the whole 6 seconds, or MULTIPLE distinct
+actions if the person changes what they are doing partway through (e.g. finishes
+rinsing something and starts chopping it). List every distinct action you see, IN
+ORDER, with the frame range it covers.
+
+Return ONE JSON object, no markdown fences, no prose before or after:
+
+{
+  "actions": [
+    {
+      "start_frame": 0,
+      "end_frame": 3,
+      "task_step":      "<snake_case_label, <=24 chars, e.g. rinse_carrot>",
+      "left_hand": {
+        "verb":         "<gerund: grasping, pinching, twisting, holding, reaching, ...>",
+        "object":       "<short noun phrase: 'ceramic mug', 'green stem'>",
+        "target":       "<noun phrase where action is directed, or null>",
+        "contact_type": "grip|push|pull|tap|slide|twist|pinch|reach|release|none",
+        "visible":      true
+      },
+      "right_hand": { "same shape as left_hand" },
+      "tool_in_use":    "knife|peeler|spatula|spoon|tongs|cloth|brush|none|<short_other>",
+      "coordination":   "independent|supporting|coordinated|none",
+      "handover_event": false,
+      "scene": {
+        "what":     "<2 sentences describing the action, third person>",
+        "how":      "<2 sentences: grip type, posture, or coordination>",
+        "why":      "<1 sentence: the immediate goal of THIS action only>",
+        "location": "<short noun phrase, 2-5 words>"
+      }
+    }
+  ]
+}
+
+Field rules -- read carefully, these determine data quality:
+
+- start_frame / end_frame are INTEGERS 0-{max_frame_idx}, referring to the labeled "Frame N" images
+  above. Use the frame where the action visibly BEGINS and the frame where it visibly
+  ENDS (or the last frame, if it continues past the end of this clip). Do NOT invent a
+  fractional or in-between value -- if you can't tell exactly which frame an action
+  starts on, pick the closest one. Precision beyond one frame is not meaningful here;
+  do not try to be more precise than the images let you be.
+- If ONLY ONE action occurs across the whole clip, return a single action with
+  start_frame=0, end_frame={max_frame_idx}.
+- If a SHORT action (like opening a drawer) is fully visible within just 1-2 frames,
+  still list it as its own action -- do not merge it into a neighboring action just
+  because it's brief.
+- left_hand / right_hand refer to the WEARER'S hands, not screen-left/right. If a hand
+  is off-frame for the majority of this action's frame range, set visible=false and
+  null the verb/object/target/contact_type fields.
+- target is distinct from object: for "placing berry into bowl", object="berry",
+  target="blue bowl". For "twisting jar lid", object="jar lid", target=null.
+- contact_type is closed vocabulary. Use "none" only when visible=true but the hand is
+  not in contact with anything (e.g., reaching).
+- task_step: snake_case, present-tense, verb-led ("rinse_carrot", "transfer_to_pan",
+  "open_drawer"). If the SAME task_step continues into the next 6-second clip, use the
+  identical label again -- do not invent a new one for a continuing action.
+- handover_event: true if and only if one hand visibly passes an object to the other
+  during this action.
+- tool_in_use: list ONE primary tool. If multiple, pick the one being actively
+  wielded. "none" if hands are bare.
+- coordination: closed vocabulary. "supporting" when one hand stabilizes what the
+  other manipulates; "coordinated" when both hands act on the same object together;
+  "independent" when on different objects; "none" when one or both hands aren't
+  visible.
+- scene.what: describe the manipulation, name objects concretely. Start with "Person"
+  or "The person". Specific verbs only ("pinching the lid", not "touching the lid").
+- scene.why: the IMMEDIATE intent THIS action serves ("to expose the lid for
+  pouring", not "to make tea"). One clause, scoped to this action only, not the whole
+  clip or the whole video.
+
+Hard rules:
+- Output a single JSON object. No code fences, no leading "Here is", no trailing
+  notes.
+- No "appears to", "seems to", "is probably". Describe what you see.
+- No long-horizon speculation ("to make tea", "to clean the kitchen"). Stay within
+  each action's own frame range.
+- Do not invent objects that are off-frame.
+- Do not force multiple actions if there's really only one -- most clips will have
+  ONE action. Only split when you genuinely see a change in what the hands are doing.
