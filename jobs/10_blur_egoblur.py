@@ -1,0 +1,1741 @@
+# /// script
+# requires-python = ">=3.10,<3.13"
+# dependencies = [
+#   "egoblur==2.0.1",
+#   "opencv-python-headless>=4.10,<5",
+#   "numpy>=1.24,<3",
+#   "tqdm>=4.64,<5",
+# ]
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu128"
+# url = "https://download.pytorch.org/whl/cu128"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu128" }
+# torchvision = { index = "pytorch-cu128" }
+# ///
+"""GPU anonymization job: EgoBlur face + license-plate redaction, one burn-in
+re-encode. Runs on an ephemeral RunPod pod. Self-contained per PEP 723 — see
+jobs/_contract.py's module docstring for why this can't import src/.
+
+Pipeline: preflight -> discover clips -> detect (10 Hz, tracked +
+interpolated) -> redact + encode (one pass, yuv420p raw pipes) -> verify ->
+ship shards + manifest -> stop the pod. See _contract.py for the shard
+format; nothing here ever opens a database.
+
+EXIT CODE IS A REAL SIGNAL, NOT JUST "DIDN'T CRASH": exit 0 means every
+clip reached PASS_AUTOMATED (or PASS_AUTOMATED_NO_YUNET). Exit 1 means the
+run completed but at least one clip needs a human look (NEEDS_REVIEW —
+see build_audit()) or failed outright (see run_manifest.json's
+failed_clip_ids). Only an uncaught exception during setup (preflight,
+clip discovery, detector construction, the budget probe) leaves the pod
+running instead of shutting down cleanly — a single bad clip does not,
+by design (see main()'s per-clip try/except).
+
+A restart with the same --output-dir SKIPS clips that already have a
+manifest.json (pass --force-reprocess to redo them) — this is what makes
+resuming a partially-completed batch after a crash cheap instead of
+silently re-burning GPU cost on already-shipped clips.
+
+WHAT IS AND ISN'T VERIFIED, READ BEFORE RUNNING FOR REAL:
+  - The Gen2 detector glue (Gen2Detector below) is built from a byte-level
+    read of the egoblur==2.0.1 wheel's gen2/script/predictor.py — the
+    constructor signature, ClassID values, and the NMS+threshold formula in
+    Gen2Detector.detect_batch() are direct transcriptions of that source,
+    not guesses. What is NOT independently verified: (1) whether calling
+    .inference() directly (batched, bypassing the library's own .run()/
+    pre_process()) produces numerically correct detections on a real GPU
+    — .run() is the maintainers' own tested path but only accepts one
+    image at a time, .inference() is the documented multi-image entry
+    point but the demo script never actually calls it, so this
+    combination has no known-good reference run; (2) whether a
+    single-class-trained model's pred_classes actually uses the same 0/1
+    FACE/LICENSE_PLATE encoding the class filter assumes (logged at DEBUG
+    on every call — see Gen2Detector.detect_batch); (3) whether the raw
+    uint8 tensor built by _bgr_batch_to_cuda_tensor() is what the scripted
+    model's input layer actually expects when pre_process() is bypassed.
+    Use --probe-only first and eyeball probe_frames/*.jpg (written by
+    _write_probe_frames()) before trusting a real run — a wrong dtype or
+    class mapping most likely shows up there as garbage or empty boxes,
+    not a crash.
+  - The Gen1 fallback (Gen1Detector) has no upstream class to import at
+    all — gen1/script/ ships only a demo script (Apache-2.0), so
+    Gen1Detector.detect_batch() is that script's ~30 lines, kept close to
+    verbatim (torch.jit.load -> get_image_tensor -> forward -> NMS ->
+    threshold) rather than reworked, specifically so any future diff
+    against the upstream file stays legible. Gen1 cannot batch (confirmed:
+    GitHub facebookresearch/EgoBlur#6, #14 — a 4-D batch dim throws a
+    RuntimeError from inside the traced graph) and is reported at ~2 fps
+    per image (#14 cites a cudaStreamSync stall) with no official
+    benchmark — the probe phase measures your actual hardware rather than
+    trusting that number.
+  - Weights: both generations' code is Apache-2.0 (verified: the "EgoBlur
+    Model License Agreement" page is verbatim, unmodified Apache-2.0). The
+    .jit weight files themselves are gated behind an email-capture form at
+    projectaria.com that multiple users report as broken (GitHub #32,
+    still open at time of writing). Gen1 weights are also mirrored,
+    ungated, on HuggingFace at revision projectaria/EgoBlur@9c0b319 (NOT
+    the repo's current HEAD, which has removed them) as
+    ego_blur_face.zip / ego_blur_lp.zip. No ungated Gen2 mirror is known.
+    This script does not download weights for you — point --face-weights*
+    at files you already have.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import logging
+import math
+import os
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+# =============================================================================
+# VENDORED BY COPY from jobs/_contract.py — see that file's docstring for why
+# this is a copy and not an import. Keep byte-identical to the canonical file;
+# a CI check enforcing that is a known gap (no CI exists yet in this repo at
+# all — see the plan's open items), so for now this is enforced by hand.
+# =============================================================================
+
+CONTRACT_VERSION = "1"
+
+
+@dataclass(slots=True)
+class ShardMeta:
+    contract_version: str
+    video_id: str
+    pod_role: str  # "cpu" | "gpu"
+    stage: str  # "hands" | "blur" | "wilor" | "sam3" | "depth_v3" | "mast3r_slam"
+    shard_index: int
+    frame_indices: list[int]
+    timestamp_ms: list[int]  # SAME clock as media.probe.probe() — do not
+    # re-derive fps independently in a job script; pass it in from the
+    # manifest the laptop already computed, or you reintroduce the
+    # two-independent-clocks problem this project explicitly fixed.
+    model_name: str
+    model_version: str
+
+
+def write_shard(
+    out_dir: Path,
+    meta: ShardMeta,
+    arrays: dict[str, Any],
+) -> Path:
+    """Write one immutable shard: `<shard_index>.npz` + `<shard_index>_meta.json`.
+
+    Uniquely prefixed per (pod_role, stage, shard_index) by the caller's
+    out_dir convention (`<volume>/runs/<run_id>/<pod_role>/<stage>/`) — this
+    is what makes two pods writing concurrently safe with NO locking: they
+    never share a destination path.
+    """
+    import numpy as np
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = out_dir / f"{meta.shard_index}.npz"
+    meta_path = out_dir / f"{meta.shard_index}_meta.json"
+
+    np.savez_compressed(npz_path, **arrays)
+    meta_path.write_text(json.dumps(asdict(meta)), encoding="utf-8")
+    return npz_path
+
+
+def read_shard(out_dir: Path, shard_index: int) -> tuple[ShardMeta, dict[str, Any]]:
+    import numpy as np
+
+    meta_path = out_dir / f"{shard_index}_meta.json"
+    npz_path = out_dir / f"{shard_index}.npz"
+
+    meta_dict = json.loads(meta_path.read_text(encoding="utf-8"))
+    if meta_dict.get("contract_version") != CONTRACT_VERSION:
+        raise ValueError(
+            f"shard {npz_path} was written with contract_version="
+            f"{meta_dict.get('contract_version')!r}, expected {CONTRACT_VERSION!r}. "
+            f"A pod is running an out-of-date copy of _contract.py."
+        )
+    meta = ShardMeta(**meta_dict)
+    arrays = dict(np.load(npz_path))
+    return meta, arrays
+
+
+# =============================================================================
+# End vendored section.
+# =============================================================================
+
+log = logging.getLogger("blur")
+
+DETECT_HZ_DEFAULT = 10.0
+FACE_THRESHOLD_DEFAULT = 0.30  # NOT EgoBlur's 0.674 default — see module
+# docstring reasoning: EgoBlur's published recall on truncated faces (the
+# dominant case at the edge of an egocentric frame) is 0.430. A false
+# positive here costs a gray rectangle; a false negative costs a person's
+# identity. That asymmetry is why this is lower than the paper's operating
+# point, not a mistake.
+LP_THRESHOLD_DEFAULT = 0.40
+SWEEP_THRESHOLD_DEFAULT = 0.10  # candidate-miss band floor for the audit —
+# see check_low_threshold_sweep().
+NMS_IOU_DEFAULT = 0.30
+FILL_VALUE = 128  # mid-gray. Exact value matters: check_fill_integrity()
+# treats deviation from this as a hard invariant, not a heuristic.
+
+
+# =============================================================================
+# CLI / config
+# =============================================================================
+
+
+@dataclass(slots=True)
+class Config:
+    input_dir: Path
+    output_dir: Path
+    run_id: str
+    gen: str  # "1" | "2" | "auto"
+    device: str
+    face_weights_gen2: Path | None
+    lp_weights_gen2: Path | None
+    face_weights_gen1: Path | None
+    lp_weights_gen1: Path | None
+    face_weights_sha256: str | None
+    lp_weights_sha256: str | None
+    face_threshold: float
+    lp_threshold: float
+    sweep_threshold: float
+    nms_iou: float
+    detect_hz: float
+    redaction: str  # "fill" | "blur"
+    dilate_scale: float
+    motion_margin_px: int
+    hold_frames: int
+    min_box_px: int
+    encode_preset: str
+    encode_crf: int
+    budget_usd: float
+    gpu_rate_usd_per_hr: float
+    force: bool
+    probe_only: bool
+    probe_frames: int
+    yunet_model: Path | None
+    forced_boxes: Path | None
+    watchdog_hours: float
+    no_watchdog: bool
+    skip_shutdown: bool
+    force_reprocess: bool
+
+
+def parse_args(argv: list[str] | None = None) -> Config:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--input-dir", type=Path, required=True)
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--gen", choices=["1", "2", "auto"], default="auto")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--face-weights-gen2", type=Path)
+    p.add_argument("--lp-weights-gen2", type=Path)
+    p.add_argument("--face-weights-gen1", type=Path)
+    p.add_argument("--lp-weights-gen1", type=Path)
+    p.add_argument("--face-weights-sha256")
+    p.add_argument("--lp-weights-sha256")
+    p.add_argument("--face-threshold", type=float, default=FACE_THRESHOLD_DEFAULT)
+    p.add_argument("--lp-threshold", type=float, default=LP_THRESHOLD_DEFAULT)
+    p.add_argument("--sweep-threshold", type=float, default=SWEEP_THRESHOLD_DEFAULT)
+    p.add_argument("--nms-iou", type=float, default=NMS_IOU_DEFAULT)
+    p.add_argument("--detect-hz", type=float, default=DETECT_HZ_DEFAULT)
+    p.add_argument("--redaction", choices=["fill", "blur"], default="fill")
+    p.add_argument("--dilate-scale", type=float, default=1.3)
+    p.add_argument("--motion-margin-px", type=int, default=8)
+    p.add_argument("--hold-frames", type=int, default=0, help="0 = auto (1s of frames)")
+    p.add_argument("--min-box-px", type=int, default=8)
+    p.add_argument("--encode-preset", default="slow")
+    p.add_argument("--encode-crf", type=int, default=18)
+    p.add_argument("--budget-usd", type=float, default=3.00)
+    p.add_argument("--gpu-rate-usd-per-hr", type=float, default=0.16)
+    p.add_argument("--force", action="store_true", help="skip the budget gate")
+    p.add_argument("--probe-only", action="store_true")
+    p.add_argument("--probe-frames", type=int, default=600)
+    p.add_argument("--yunet-model", type=Path, help="cv2 FaceDetectorYN onnx path; omit to skip")
+    p.add_argument("--forced-boxes", type=Path, help="human-supplied JSON from a reject_reblur")
+    p.add_argument("--watchdog-hours", type=float, default=8.0)
+    p.add_argument("--no-watchdog", action="store_true")
+    p.add_argument("--skip-shutdown", action="store_true", help="for local/laptop testing")
+    p.add_argument("--force-reprocess", action="store_true",
+                    help="redo clips that already have a manifest.json from a prior run "
+                         "(default: skip them — a restart after a crash on clip N must not "
+                         "silently re-burn GPU/CPU cost and re-clobber clips 1..N-1)")
+    a = p.parse_args(argv)
+
+    if a.dilate_scale < 1.0:
+        p.error(
+            f"--dilate-scale {a.dilate_scale} < 1.0 would SHRINK redaction boxes below "
+            f"the raw detected box instead of padding them — almost certainly a typo "
+            f"for a value like 1.3."
+        )
+    if a.motion_margin_px < 0:
+        p.error(f"--motion-margin-px {a.motion_margin_px} is negative — would shrink boxes.")
+
+    return Config(
+        input_dir=a.input_dir,
+        output_dir=a.output_dir,
+        run_id=a.run_id,
+        gen=a.gen,
+        device=a.device,
+        face_weights_gen2=a.face_weights_gen2,
+        lp_weights_gen2=a.lp_weights_gen2,
+        face_weights_gen1=a.face_weights_gen1,
+        lp_weights_gen1=a.lp_weights_gen1,
+        face_weights_sha256=a.face_weights_sha256,
+        lp_weights_sha256=a.lp_weights_sha256,
+        face_threshold=a.face_threshold,
+        lp_threshold=a.lp_threshold,
+        sweep_threshold=a.sweep_threshold,
+        nms_iou=a.nms_iou,
+        detect_hz=a.detect_hz,
+        redaction=a.redaction,
+        dilate_scale=a.dilate_scale,
+        motion_margin_px=a.motion_margin_px,
+        hold_frames=a.hold_frames,
+        min_box_px=a.min_box_px,
+        encode_preset=a.encode_preset,
+        encode_crf=a.encode_crf,
+        budget_usd=a.budget_usd,
+        gpu_rate_usd_per_hr=a.gpu_rate_usd_per_hr,
+        force=a.force,
+        probe_only=a.probe_only,
+        probe_frames=a.probe_frames,
+        yunet_model=a.yunet_model,
+        forced_boxes=a.forced_boxes,
+        watchdog_hours=a.watchdog_hours,
+        no_watchdog=a.no_watchdog,
+        skip_shutdown=a.skip_shutdown,
+        force_reprocess=a.force_reprocess,
+    )
+
+
+# =============================================================================
+# Phase 0 — preflight
+# =============================================================================
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def arm_watchdog(hours: float, output_dir: Path) -> None:
+    """A wall-clock backstop independent of whether the job itself succeeds,
+    fails, or hangs — Risk 7 in the plan measures a forgotten L4 at
+    $9.36/day; this bounds the damage of ANY failure mode, not just the
+    ones the code anticipates. Its own output is logged, not discarded —
+    an unmonitored watchdog (missing runpodctl, a stale pod_id, an auth
+    failure) fails exactly the way it exists to prevent: silently."""
+    pod_id = os.environ.get("RUNPOD_POD_ID")
+    if not pod_id:
+        log.warning(
+            "RUNPOD_POD_ID not set (not on a RunPod pod, or the env var is "
+            "missing) — watchdog NOT armed. Set --no-watchdog explicitly if "
+            "that's intentional, so this isn't a silent gap."
+        )
+        return
+    if not shutil.which("runpodctl"):
+        raise RuntimeError(
+            "runpodctl not found on PATH but RUNPOD_POD_ID is set — the "
+            "watchdog and the clean-exit shutdown both depend on it. "
+            "Refusing to start a job whose only cost backstop can't fire."
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "watchdog.log"
+    seconds = int(hours * 3600)
+    with log_path.open("w") as logf:
+        subprocess.Popen(
+            ["bash", "-c", f"sleep {seconds}; runpodctl pod stop {pod_id}"],
+            start_new_session=True,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+        )
+    log.info("watchdog armed: pod stops in %.1fh regardless of job state (log: %s)",
+              hours, log_path)
+
+
+def _bin(name: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        raise RuntimeError(f"{name} not found on PATH — check the pod image.")
+    return path
+
+
+def preflight(cfg: Config) -> dict:
+    """Fail loudly here, not 40 minutes into a paid GPU run."""
+    report: dict[str, Any] = {}
+
+    ffmpeg = _bin("ffmpeg")
+    ffprobe = _bin("ffprobe")
+    report["ffmpeg"] = ffmpeg
+    report["ffprobe"] = ffprobe
+
+    encoders = subprocess.run(
+        [ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, check=True
+    ).stdout
+    if "libx264" not in encoders:
+        raise RuntimeError("ffmpeg build has no libx264 encoder — wrong image?")
+
+    try:
+        import torch
+    except ImportError as e:
+        raise RuntimeError("torch not importable — PEP 723 env resolution failed") from e
+
+    report["torch_version"] = torch.__version__
+    report["cuda_available"] = torch.cuda.is_available()
+    if cfg.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "cfg.device='cuda' but torch.cuda.is_available() is False. "
+            "Do not silently fall back to CPU — Gen1/Gen2 on CPU is a "
+            "different (much slower) cost regime the budget gate hasn't "
+            "priced. Fix the pod or pass --device cpu explicitly."
+        )
+    if torch.cuda.is_available():
+        report["gpu_name"] = torch.cuda.get_device_name(0)
+
+    weight_pairs = [
+        (cfg.face_weights_gen2, cfg.face_weights_sha256, "face_weights_gen2"),
+        (cfg.lp_weights_gen2, cfg.lp_weights_sha256, "lp_weights_gen2"),
+        (cfg.face_weights_gen1, None, "face_weights_gen1"),
+        (cfg.lp_weights_gen1, None, "lp_weights_gen1"),
+    ]
+    for wpath, wsha, label in weight_pairs:
+        if wpath is None:
+            continue
+        if not wpath.exists():
+            raise RuntimeError(f"{label} does not exist: {wpath}")
+        if wsha:
+            actual = sha256_file(wpath)
+            if actual != wsha:
+                raise RuntimeError(
+                    f"{label} sha256 mismatch: expected {wsha}, got {actual}. "
+                    f"Refusing to run inference on unexpected model bytes."
+                )
+            report[f"{label}_sha256_verified"] = True
+
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    du = shutil.disk_usage(cfg.output_dir)
+    report["free_gb"] = du.free / 1e9
+    if du.free < 5 * 1e9:
+        raise RuntimeError(f"only {du.free/1e9:.1f} GB free at {cfg.output_dir} — too tight")
+
+    log.info("preflight OK: %s", json.dumps(report, default=str))
+    return report
+
+
+# =============================================================================
+# Phase 1 — clip discovery + integrity gates
+# =============================================================================
+
+
+@dataclass(slots=True)
+class ClipInfo:
+    path: Path
+    clip_id: str
+    clip_group: str
+    chapter_index: int
+    width: int
+    height: int
+    fps: float
+    n_frames: int
+    duration_s: float
+    rotation: int
+    sha256: str
+
+
+def ffprobe_json(ffprobe: str, path: Path) -> dict:
+    cmd = [
+        ffprobe, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,avg_frame_rate,nb_read_packets,"
+        "duration,rotation,codec_name,pix_fmt",
+        "-show_entries", "stream_tags=rotate",
+        "-of", "json",
+        "-count_packets",
+        str(path),
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def _parse_rate(rate: str) -> float:
+    num, _, den = rate.partition("/")
+    den = den or "1"
+    return float(num) / float(den) if float(den) else 0.0
+
+
+def assert_cfr(probe: dict, path: Path) -> None:
+    """GoPro records CFR. Anything else means the file was already touched
+    by something upstream, and every t = frame_idx / fps computation this
+    job and everything downstream relies on would silently be wrong for
+    that clip. Refuse rather than paper over it with -fps_mode cfr, which
+    would fabricate timestamps instead of surfacing the problem."""
+    stream = probe["streams"][0]
+    r = _parse_rate(stream["r_frame_rate"])
+    avg = _parse_rate(stream["avg_frame_rate"])
+    if r <= 0:
+        raise RuntimeError(f"{path}: ffprobe reports r_frame_rate={r}")
+    if abs(r - avg) / r > 0.001:
+        raise RuntimeError(
+            f"{path}: r_frame_rate={r:.4f} avg_frame_rate={avg:.4f} — not CFR. "
+            f"Marking NEEDS_MANUAL rather than guessing a fps."
+        )
+
+
+def parse_gopro_chapter(path: Path) -> tuple[str, int]:
+    """GXjjcccc.MP4: jj = chapter (01, 02, ...), cccc = clip group. Chapters
+    of one recording must not be silently concatenated (that's a second
+    re-encode) but DO need a shared clip_group so the laptop can order
+    them. Falls back to (stem, 0) for non-GoPro filenames."""
+    stem = path.stem
+    if len(stem) == 8 and stem[:2].upper() == "GX" and stem[2:].isdigit():
+        chapter = int(stem[2:4])
+        group = stem[4:8]
+        return group, chapter
+    return stem, 0
+
+
+def discover_clips(input_dir: Path, ffprobe: str) -> list[ClipInfo]:
+    paths = sorted(
+        p for p in input_dir.rglob("*")
+        if p.suffix.lower() in (".mp4", ".mov") and p.is_file()
+    )
+    if not paths:
+        raise RuntimeError(f"no video files under {input_dir}")
+
+    names = [p.name for p in paths]
+    dupes = {n for n in names if names.count(n) > 1}
+    if dupes:
+        raise RuntimeError(
+            f"duplicate filenames across subdirectories: {sorted(dupes)}. "
+            f"The rclone dedupe gate lives upstream of this script (Drive "
+            f"permits same-name files in one folder and silently drops "
+            f"one on copy) — this refusal is the backstop, not the fix."
+        )
+
+    clips = []
+    for path in paths:
+        probe = ffprobe_json(ffprobe, path)
+        assert_cfr(probe, path)
+        stream = probe["streams"][0]
+        rotation = int(stream.get("rotation", stream.get("tags", {}).get("rotate", 0)) or 0)
+        w, h = int(stream["width"]), int(stream["height"])
+        if rotation in (90, -90, 270, -270):
+            w, h = h, w  # ffmpeg -autorotate (default on) swaps display dims
+        group, chapter = parse_gopro_chapter(path)
+        clips.append(ClipInfo(
+            path=path,
+            clip_id=path.stem,
+            clip_group=group,
+            chapter_index=chapter,
+            width=w,
+            height=h,
+            fps=_parse_rate(stream["r_frame_rate"]),
+            n_frames=int(stream["nb_read_packets"]),
+            duration_s=float(stream.get("duration", 0.0)),
+            rotation=rotation,
+            sha256=sha256_file(path),
+        ))
+    log.info("discovered %d clip(s)", len(clips))
+    return clips
+
+
+# =============================================================================
+# Detector abstraction — ONE call shape, TWO real, verified APIs behind it.
+# =============================================================================
+
+
+@dataclass(slots=True)
+class Detection:
+    frame_idx: int
+    cls: str  # "face" | "lp"
+    box: tuple[float, float, float, float]  # x1,y1,x2,y2, ORIGINAL pixel space
+    score: float
+
+
+def _bgr_batch_to_cuda_tensor(frames_bgr: list, device: str):
+    """CxHxW uint8, BGR, unnormalized. The tensor-BUILDING recipe (transpose
+    to CHW, no normalization, no dtype cast) is verified to match
+    get_image_tensor() in both gen1 and gen2's own demo scripts — that part
+    is not a guess. What is NOT verified: whether Gen2's .inference(),
+    called directly and bypassing pre_process()/transform_image() (done
+    here specifically to sidestep transform_image()'s reported unwanted
+    RGB2BGR conversion), accepts this same uint8 tensor as-is, or whether
+    the scripted model's true input layer expects something pre_process()
+    would otherwise have produced (e.g. a float/normalized tensor).
+    Stacked here into BxCxHxW for Gen2's real batched .inference() call.
+    This is exactly the assumption --probe-only's probe_frames/*.jpg
+    output exists to let a human catch before a real run: a wrong dtype
+    here would likely surface as garbage or empty detections, not a
+    crash."""
+    import numpy as np
+    import torch
+
+    arr = np.stack([np.transpose(f, (2, 0, 1)) for f in frames_bgr])  # B,C,H,W
+    return torch.from_numpy(np.ascontiguousarray(arr)).to(device)
+
+
+class Gen2Detector:
+    """gen2.script.predictor.EgoblurDetector, called at the low-level
+    .inference() entry point (true multi-image batching) rather than the
+    demo's .run() (confirmed single-image-only: it accepts rank-3 and
+    auto-unsqueezes to a batch of 1). Constructor signature, ClassID
+    values, and the NMS+threshold formula below are transcribed from a
+    direct read of gen2/script/predictor.py in the egoblur==2.0.1 wheel —
+    see the module docstring for exactly what is and isn't independently
+    verified about this path."""
+
+    def __init__(self, weights_path: Path, cls: str, device: str, score_threshold: float,
+                 nms_iou: float):
+        from gen2.script.predictor import ClassID, EgoblurDetector
+
+        self.cls = cls
+        self.score_threshold = score_threshold
+        self.nms_iou = nms_iou
+        self.device = device
+        class_id = ClassID.FACE if cls == "face" else ClassID.LICENSE_PLATE
+        self._detector = EgoblurDetector(
+            model_path=str(weights_path),
+            device=device,
+            detection_class=class_id,
+            score_threshold=score_threshold,
+            nms_iou_threshold=nms_iou,
+            resize_aug=None,  # native resolution — see module docstring on
+            # why: small/distant bystander faces keep full linear size
+            # instead of losing 37.5% to the trained 1200px operating
+            # point. No rescale-back step needed since input and
+            # inference resolution are then identical.
+        )
+        self._class_value = int(class_id.value)
+
+    def detect_batch(self, frames_bgr: list, frame_idxs: list[int]) -> list[Detection]:
+        import torch
+        import torchvision
+        from gen2.script.detectron2.export.torchscript_patch import patch_instances
+        from gen2.script.detectron2.utils.utils import convert_scripted_instances
+        from gen2.script.predictor import PATCH_INSTANCES_FIELDS
+
+        batch = _bgr_batch_to_cuda_tensor(frames_bgr, self.device)
+        out: list[Detection] = []
+        with torch.no_grad(), patch_instances(fields=PATCH_INSTANCES_FIELDS):
+            preds = self._detector.inference(batch)
+            for frame_idx, scripted_inst in zip(frame_idxs, preds, strict=True):
+                inst = convert_scripted_instances(scripted_inst)
+                boxes = inst.pred_boxes.tensor
+                scores = inst.scores
+                if boxes.numel() == 0:
+                    continue
+                if inst.has("pred_classes"):
+                    n_before = boxes.shape[0]
+                    mask = inst.pred_classes == self._class_value
+                    boxes, scores = boxes[mask], scores[mask]
+                    # UNVERIFIED ASSUMPTION (see module docstring): this
+                    # filter is transcribed verbatim from predictor.py's
+                    # _post_process(), but whether a single-class-trained
+                    # model's pred_classes actually uses the SAME 0/1
+                    # FACE/LICENSE_PLATE encoding this detector instance
+                    # assumes was never independently confirmed against a
+                    # running model. If it's wrong, this filter zeroes out
+                    # every detection for that class, silently. Logged at
+                    # DEBUG on every call, not just probe, so a real run
+                    # left with default logging can still be diagnosed
+                    # after the fact from its own log.
+                    log.debug("%s: class filter kept %d/%d raw detections",
+                              self.cls, boxes.shape[0], n_before)
+                if boxes.numel() == 0:
+                    continue
+                # NMS + threshold, verbatim from predictor.py's
+                # _post_process() — .inference() itself applies neither.
+                keep = torchvision.ops.nms(boxes, scores, self.nms_iou)
+                boxes, scores = boxes[keep], scores[keep]
+                boxes_np = boxes.cpu().numpy()
+                scores_np = scores.cpu().numpy()
+                for box, score in zip(boxes_np, scores_np, strict=True):
+                    if score <= self.score_threshold:
+                        continue
+                    out.append(Detection(
+                        frame_idx=frame_idx, cls=self.cls,
+                        box=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                        score=float(score),
+                    ))
+        return out
+
+
+class Gen1Detector:
+    """Gen1 ships no importable detector class — gen1/script/ contains only
+    a demo script (facebookresearch/EgoBlur, Apache-2.0), re-exported as a
+    console-script main(), nothing else. This is that script's
+    get_image_tensor + get_detections logic (demo_ego_blur_gen1.py, lines
+    ~246-286), reproduced close to verbatim rather than reworked, so any
+    future diff against the upstream file stays legible. Single image
+    only — batching a 4-D tensor throws inside the traced graph itself
+    (facebookresearch/EgoBlur#6, #14), not merely a limitation of this
+    demo code, so detect_batch() loops internally."""
+
+    def __init__(self, weights_path: Path, cls: str, device: str, score_threshold: float,
+                 nms_iou: float):
+        import torch
+
+        self.cls = cls
+        self.score_threshold = score_threshold
+        self.nms_iou = nms_iou
+        self.device = device
+        model = torch.jit.load(str(weights_path), map_location="cpu")
+        model.to(device)
+        model.eval()
+        self._model = model
+
+    def detect_batch(self, frames_bgr: list, frame_idxs: list[int]) -> list[Detection]:
+        import numpy as np
+        import torch
+        import torchvision
+
+        out: list[Detection] = []
+        with torch.no_grad():
+            for frame_idx, bgr in zip(frame_idxs, frames_bgr, strict=True):
+                transposed = np.transpose(bgr, (2, 0, 1))
+                image_tensor = torch.from_numpy(np.ascontiguousarray(transposed)).to(self.device)
+                detections = self._model(image_tensor)
+                boxes, _, scores, _ = detections  # model returns (boxes, labels, scores, dims)
+                if boxes.numel() == 0:
+                    continue
+                keep = torchvision.ops.nms(boxes, scores, self.nms_iou)
+                boxes, scores = boxes[keep], scores[keep]
+                boxes_np = boxes.cpu().numpy()
+                scores_np = scores.cpu().numpy()
+                for box, score in zip(boxes_np, scores_np, strict=True):
+                    if score <= self.score_threshold:
+                        continue
+                    out.append(Detection(
+                        frame_idx=frame_idx, cls=self.cls,
+                        box=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                        score=float(score),
+                    ))
+        return out
+
+
+def build_detectors(cfg: Config) -> tuple[str, Any, Any]:
+    """Resolves gen='auto' at startup only — never mid-run. Switching
+    detectors partway through a clip would mean two different recall
+    profiles inside one manifest, which defeats the point of recording
+    egoblur.gen in provenance at all."""
+    have_gen2 = cfg.face_weights_gen2 is not None and cfg.lp_weights_gen2 is not None
+    have_gen1 = cfg.face_weights_gen1 is not None and cfg.lp_weights_gen1 is not None
+
+    if cfg.gen == "2":
+        use_gen2 = True
+        if not have_gen2:
+            raise RuntimeError("--gen 2 requires BOTH --face-weights-gen2 and --lp-weights-gen2")
+    elif cfg.gen == "1":
+        use_gen2 = False
+        if not have_gen1:
+            raise RuntimeError("--gen 1 requires BOTH --face-weights-gen1 and --lp-weights-gen1")
+    else:  # auto — requires a COMPLETE pair, not just one weight file present.
+        # A partial gen2 pair (e.g. only --face-weights-gen2 set, a likely
+        # typo) must fall through to gen1 or a clear error, not silently
+        # resolve to gen2 and then fail with an error that names --gen 2
+        # explicitly when the user never asked for it.
+        if have_gen2:
+            use_gen2 = True
+        elif have_gen1:
+            use_gen2 = False
+        else:
+            raise RuntimeError(
+                "--gen auto found neither a complete Gen2 weight pair "
+                "(--face-weights-gen2 + --lp-weights-gen2) nor a complete "
+                "Gen1 pair (--face-weights-gen1 + --lp-weights-gen1)."
+            )
+
+    if use_gen2:
+        log.info("using Gen2 detector (batched)")
+        face = Gen2Detector(cfg.face_weights_gen2, "face", cfg.device,
+                             cfg.face_threshold, cfg.nms_iou)
+        lp = Gen2Detector(cfg.lp_weights_gen2, "lp", cfg.device,
+                           cfg.lp_threshold, cfg.nms_iou)
+        return "2", face, lp
+
+    log.info("using Gen1 detector (single-image, no batching — see module docstring)")
+    face = Gen1Detector(cfg.face_weights_gen1, "face", cfg.device,
+                         cfg.face_threshold, cfg.nms_iou)
+    lp = Gen1Detector(cfg.lp_weights_gen1, "lp", cfg.device,
+                       cfg.lp_threshold, cfg.nms_iou)
+    return "1", face, lp
+
+
+# =============================================================================
+# Raw yuv420p pipe I/O — shared by detection (decode only), redact+encode
+# (decode+encode), and verify (decode only).
+# =============================================================================
+
+
+def frame_byte_size(w: int, h: int) -> int:
+    if w % 2 or h % 2:
+        raise RuntimeError(f"odd dimensions {w}x{h} — yuv420p needs even W and H")
+    return w * h + 2 * (w // 2) * (h // 2)
+
+
+def open_decoder(ffmpeg: str, path: Path, stderr_log: Path) -> subprocess.Popen:
+    """CPU decode, not -hwaccel cuda: decode-only measured at ~380 fps on
+    CPU vs. detector throughput an order of magnitude lower — keeping the
+    GPU at 100% for inference is worth more than a faster decode.
+    -fps_mode passthrough (not the default cfr) so a frame is never
+    duplicated or dropped to hit a target rate, which is what the
+    frames_read == nb_read_packets assertion at EOF depends on.
+
+    stderr goes straight to a file, never subprocess.PIPE: this pipeline
+    exists specifically to handle real-world corrupted/truncated GoPro
+    footage, and ffmpeg keeps logging at -loglevel error even for a
+    survivable decode error (a bad NAL, a missing reference frame). An
+    undrained stderr PIPE fills its OS buffer (~64KB), ffmpeg blocks on
+    write() and stops producing stdout too, and read_frames()'s stdout.read()
+    then hangs forever with no error — a real deadlock, not a hypothetical
+    one, on exactly the input this job is built to tolerate."""
+    stderr_log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-i", str(path), "-map", "0:v:0",
+        "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
+    ]
+    with stderr_log.open("wb") as errf:
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
+
+
+def read_frames(proc: subprocess.Popen, w: int, h: int) -> Iterator[tuple]:
+    import numpy as np
+
+    frame_size = frame_byte_size(w, h)
+    cw, ch = w // 2, h // 2
+    y_size = w * h
+    u_size = cw * ch
+    stdout = proc.stdout
+    assert stdout is not None
+    while True:
+        buf = stdout.read(frame_size)
+        if len(buf) == 0:
+            break
+        if len(buf) < frame_size:
+            raise RuntimeError(f"short read: got {len(buf)} of {frame_size} bytes — truncated?")
+        arr = np.frombuffer(buf, dtype=np.uint8)
+        y = arr[:y_size].reshape(h, w).copy()
+        u = arr[y_size:y_size + u_size].reshape(ch, cw).copy()
+        v = arr[y_size + u_size:].reshape(ch, cw).copy()
+        yield y, u, v
+
+
+def open_encoder(ffmpeg: str, w: int, h: int, fps: float, out_path: Path,
+                  preset: str, crf: int, stderr_log: Path) -> subprocess.Popen:
+    """Raw yuv420p in, never bgr24: a BGR round trip costs real quality on
+    EVERY pixel (measured 45.5 dB PSNR), not just the redacted ones, and
+    this file becomes the single source of truth for hand tracking, VLM
+    captioning, and the public release. -color_* flags are needed because
+    raw pipes carry no color metadata at all — without them the output is
+    tagged as unspecified colorspace, which some players render washed
+    out. -an -sn -dn strips audio/subtitles/data unconditionally: voices
+    are biometric and GPMF timed metadata can carry GPS, both defeating
+    the point of this whole job.
+
+    stderr to a file, same reasoning as open_decoder — the failure path in
+    redact_and_encode() reads this file back on a nonzero exit instead of
+    proc.stderr, so nothing is lost."""
+    stderr_log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}", "-r", f"{fps}",
+        "-i", "-",
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+        "-color_range", "tv",
+        "-an", "-sn", "-dn", "-map_metadata", "-1", "-movflags", "+faststart",
+        str(out_path),
+    ]
+    with stderr_log.open("wb") as errf:
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errf)
+
+
+# =============================================================================
+# Phase 2 — probe & budget gate
+# =============================================================================
+
+
+def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
+                      ffmpeg: str) -> dict:
+    """Measures real ms/frame on real frames from the actual footage and
+    extrapolates dollars BEFORE committing to the full run. No published
+    Gen2 benchmark exists for any GPU this job can rent, and Gen1's ~2 fps
+    figure is one user's anecdote — this is the safety valve for both
+    being wrong, not a formality.
+
+    Also writes cfg.output_dir/probe_frames/*.jpg with drawn detection
+    boxes — the module docstring's "eyeball this before trusting a real
+    run" line refers to these. Given the Gen2 .inference() bypass path
+    (see module docstring: constructor/ClassID/NMS verified against the
+    wheel source, but never executed against a real GPU) this is the
+    cheapest available check that the detector is finding plausible faces
+    at all, not silently returning garbage from a dtype/shape mismatch."""
+    biggest = max(clips, key=lambda c: c.n_frames)
+    stride = max(1, round(biggest.fps / cfg.detect_hz))
+    n_sample = min(cfg.probe_frames, biggest.n_frames // stride) or 1
+
+    proc = open_decoder(ffmpeg, biggest.path, cfg.output_dir / "logs" / "probe_decode.stderr.log")
+    sampled_bgr, sampled_idx = [], []
+    idx = 0
+    for y, u, v in read_frames(proc, biggest.width, biggest.height):
+        if idx % stride == 0:
+            import cv2
+            yuv = _pack_yuv420p(y, u, v)
+            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+            sampled_bgr.append(bgr)
+            sampled_idx.append(idx)
+            if len(sampled_bgr) >= n_sample:
+                break
+        idx += 1
+    proc.stdout.close()
+    proc.terminate()
+    proc.wait()
+
+    t0 = time.monotonic()
+    face_dets = face_det.detect_batch(sampled_bgr, sampled_idx)
+    lp_dets = lp_det.detect_batch(sampled_bgr, sampled_idx)
+    detect_s = time.monotonic() - t0
+    ms_per_frame = 1000 * detect_s / max(1, len(sampled_bgr))
+
+    _write_probe_frames(cfg.output_dir / "probe_frames", sampled_bgr, sampled_idx,
+                         face_dets + lp_dets)
+
+    total_detect_frames = sum(math.ceil(c.n_frames / stride) for c in clips)
+    total_frames = sum(c.n_frames for c in clips)
+    detect_hours = (total_detect_frames * ms_per_frame / 1000) / 3600
+    # Encode/verify are rough multipliers on total (not detect-sampled)
+    # frames — refined once real encode throughput is measured below.
+    est_encode_hours = total_frames / (60 * 3600)  # placeholder floor; see note
+    est_hours = detect_hours + est_encode_hours + 0.5  # + ingest/setup slack
+    est_usd = est_hours * cfg.gpu_rate_usd_per_hr
+
+    report = {
+        "sampled_frames": len(sampled_bgr),
+        "n_face_detections": len(face_dets),
+        "n_lp_detections": len(lp_dets),
+        "ms_per_frame_detect_both_models": ms_per_frame,
+        "stride": stride,
+        "total_detect_frames": total_detect_frames,
+        "total_frames": total_frames,
+        "estimated_hours": est_hours,
+        "estimated_usd": est_usd,
+        "budget_usd": cfg.budget_usd,
+        "probe_frames_dir": str(cfg.output_dir / "probe_frames"),
+    }
+    log.info("probe: %s", json.dumps(report, indent=2))
+    if len(face_dets) == 0 and len(lp_dets) == 0:
+        log.warning(
+            "probe found ZERO detections of either class across %d sampled "
+            "frames. Could be genuinely empty footage, or could be the "
+            "unverified Gen2 .inference()-bypass path (see module docstring) "
+            "silently returning nothing. Check probe_frames/*.jpg before "
+            "trusting a full run.",
+            len(sampled_bgr),
+        )
+
+    if not cfg.force and est_usd > cfg.budget_usd:
+        raise RuntimeError(
+            f"estimated ${est_usd:.2f} exceeds --budget-usd ${cfg.budget_usd:.2f}. "
+            f"Pass --force to override, or lower cost (raise --detect-hz "
+            f"stride implicitly via a lower rate, or reduce clip count)."
+        )
+    return report
+
+
+def _write_probe_frames(out_dir: Path, frames_bgr: list, frame_idxs: list[int],
+                         detections: list[Detection], max_images: int = 20) -> None:
+    import cv2
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    by_idx: dict[int, list[Detection]] = {}
+    for d in detections:
+        by_idx.setdefault(d.frame_idx, []).append(d)
+
+    for idx, bgr in list(zip(frame_idxs, frames_bgr, strict=True))[:max_images]:
+        img = bgr.copy()
+        for d in by_idx.get(idx, []):
+            x1, y1, x2, y2 = (int(v) for v in d.box)
+            color = (0, 255, 0) if d.cls == "face" else (0, 165, 255)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(img, f"{d.cls} {d.score:.2f}", (x1, max(0, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.imwrite(str(out_dir / f"frame_{idx:08d}.jpg"), img)
+
+
+def _pack_yuv420p(y, u, v):
+    """cv2.cvtColor(..., COLOR_YUV2BGR_I420) wants one interleaved I420
+    buffer, not three separate planes — repack for the conversion only;
+    the y/u/v arrays used for redaction elsewhere stay separate."""
+    import numpy as np
+    h, w = y.shape
+    return np.concatenate([y.reshape(-1), u.reshape(-1), v.reshape(-1)]).reshape(
+        h * 3 // 2, w
+    )
+
+
+# =============================================================================
+# Phase 3 — detection pass (checkpointed via contract shards, resumable)
+# =============================================================================
+
+
+def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
+                    shard_dir: Path, gen: str) -> list[Detection]:
+    """Checkpoint format: ONE JSONL line per ATTEMPTED sampled frame —
+    `{"frame_idx": i, "detections": [...]}`, empty list included — not one
+    line per detection. This is deliberate, fixing two real bugs a
+    per-detection log has: (1) a crowded frame producing multiple lines
+    means a crash between them lets resume see the frame as 'done' from
+    just the first line, permanently skipping re-detection of whatever
+    didn't get written — a silent missed-face risk, not just a data-loss
+    one; (2) a frame with zero detections never appears in a per-detection
+    log at all, so resume can't tell 'attempted, found nothing' from
+    'never attempted' and always redundantly redoes it. One line per
+    frame, written+flushed+fsynced as the last step of handling that
+    frame, makes each frame's checkpoint atomic in practice: either the
+    whole frame's line lands, or (on a crash) it doesn't, and either way
+    resume's done-set is exactly correct."""
+    stride = max(1, round(clip.fps / cfg.detect_hz))
+    done_frames: set[int] = set()
+    detections: list[Detection] = []
+
+    # Resume checkpoint is the JSONL file below, not shards — shards
+    # (write_shard/read_shard) are the OUTPUT contract for downstream
+    # stages (laptop ingest), not this stage's own progress format.
+    jsonl_path = shard_dir / f"{clip.clip_id}.detections.jsonl"
+    if jsonl_path.exists():
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                if i == len(lines) - 1:
+                    # Only the LAST line can legitimately be a crash-mid-
+                    # write truncation in an append-only log; anything
+                    # earlier being malformed means real corruption, and
+                    # should still raise rather than be silently dropped.
+                    log.warning(
+                        "%s: discarding truncated trailing line in %s "
+                        "(crash mid-write) — that frame will be re-detected",
+                        clip.clip_id, jsonl_path,
+                    )
+                    continue
+                raise
+            done_frames.add(row["frame_idx"])
+            for d in row["detections"]:
+                detections.append(Detection(
+                    frame_idx=row["frame_idx"], cls=d["cls"],
+                    box=tuple(d["box"]), score=d["score"],
+                ))
+        log.info("%s: resuming, %d detection-frames already attempted", clip.clip_id, len(done_frames))
+
+    stderr_log = cfg.output_dir / "logs" / f"{clip.clip_id}.detect_decode.stderr.log"
+    proc = open_decoder(ffmpeg, clip.path, stderr_log)
+    batch_bgr, batch_idx = [], []
+    frames_read = 0
+    BATCH = 8
+
+    def flush():
+        nonlocal detections
+        if not batch_bgr:
+            return
+        new_dets = face_det.detect_batch(batch_bgr, batch_idx) + lp_det.detect_batch(batch_bgr, batch_idx)
+        detections.extend(new_dets)
+        by_frame: dict[int, list[Detection]] = {i: [] for i in batch_idx}
+        for d in new_dets:
+            by_frame[d.frame_idx].append(d)
+        with jsonl_path.open("a", encoding="utf-8") as f:
+            for i in batch_idx:
+                row = {
+                    "frame_idx": i,
+                    "detections": [
+                        {"cls": d.cls, "box": list(d.box), "score": d.score}
+                        for d in by_frame[i]
+                    ],
+                }
+                f.write(json.dumps(row) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        batch_bgr.clear()
+        batch_idx.clear()
+
+    idx = 0
+    for y, u, v in read_frames(proc, clip.width, clip.height):
+        if idx % stride == 0 and idx not in done_frames:
+            import cv2
+            yuv = _pack_yuv420p(y, u, v)
+            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+            batch_bgr.append(bgr)
+            batch_idx.append(idx)
+            if len(batch_bgr) >= BATCH:
+                flush()
+        idx += 1
+        frames_read += 1
+    flush()
+    proc.wait()
+
+    if frames_read != clip.n_frames:
+        raise RuntimeError(
+            f"{clip.clip_id}: decoded {frames_read} frames, ffprobe reported "
+            f"nb_read_packets={clip.n_frames}. Refusing to trust this clip's "
+            f"frame indexing — a mismatch here is exactly the failure mode "
+            f"that produces boxes on the wrong frames."
+        )
+    log.info("%s: detection pass done, %d detections over %d frames",
+              clip.clip_id, len(detections), frames_read)
+    return detections
+
+
+# =============================================================================
+# Phase 4 — track building + interpolation
+# =============================================================================
+
+
+@dataclass(slots=True)
+class Track:
+    track_id: int
+    cls: str
+    # frame_idx -> (box, source) where source in {"det", "interp", "hold"}
+    frames: dict = field(default_factory=dict)
+
+
+def _iou(a: tuple, b: tuple) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float,
+                  hold_frames: int) -> list[Track]:
+    """Greedy nearest-IoU association across consecutive DETECTION frames
+    (not every video frame — detections are already sparse at detect_hz),
+    then linear interpolation across the gap between consecutive detection
+    frames of one track, then a hold for `hold_frames` video-frames past
+    the last real detection. This — not re-detection — is where most of
+    the actual recall against missed frames comes from: a face seen at
+    detection-frame k-1 and k+1 stays covered at every frame in between
+    even when the detector missed the frame(s) that would have covered
+    them directly."""
+    by_frame: dict[int, list[Detection]] = {}
+    for d in detections:
+        w = d.box[2] - d.box[0]
+        h = d.box[3] - d.box[1]
+        if w < min_box_px or h < min_box_px:
+            continue
+        by_frame.setdefault(d.frame_idx, []).append(d)
+
+    frame_order = sorted(by_frame)
+    tracks: list[Track] = []
+    next_id = 0
+    # keyed by (cls, box) isn't enough for multi-face frames; keep a small
+    # per-class list of "active" tracks and match by best IoU each step.
+    active: dict[str, list[Track]] = {"face": [], "lp": []}
+
+    for frame_idx in frame_order:
+        dets = by_frame[frame_idx]
+        by_cls: dict[str, list[Detection]] = {}
+        for d in dets:
+            by_cls.setdefault(d.cls, []).append(d)
+
+        for cls in ("face", "lp"):
+            cur_dets = by_cls.get(cls, [])
+
+            # Evict tracks unmatched for more than hold_frames BEFORE
+            # matching this frame. Without this, a track that lost its
+            # subject stays "active" forever and can silently reattach to
+            # an entirely unrelated face/plate arbitrarily far in the
+            # future purely because the two happen to overlap in screen
+            # space (very plausible with a semi-fixed egocentric framing
+            # — a doorway, a desk — reused by different people) —
+            # _interpolate() would then draw a straight-line blend across
+            # the whole gap between two different people. Reusing
+            # hold_frames as the max gap keeps this consistent with the
+            # forward-hold semantics below: a track's identity is trusted
+            # for exactly as long as its coverage is trusted.
+            active[cls] = [tr for tr in active[cls]
+                           if frame_idx - max(tr.frames) <= hold_frames]
+
+            still_active = []
+            used = set()
+            for tr in active[cls]:
+                last_frame = max(tr.frames)
+                last_box = tr.frames[last_frame][0]
+                best_iou, best_j = 0.0, -1
+                for j, d in enumerate(cur_dets):
+                    if j in used:
+                        continue
+                    iou = _iou(last_box, d.box)
+                    if iou > best_iou:
+                        best_iou, best_j = iou, j
+                if best_iou >= iou_thresh:
+                    d = cur_dets[best_j]
+                    used.add(best_j)
+                    if frame_idx > last_frame + 1:
+                        _interpolate(tr, last_frame, last_box, frame_idx, d.box)
+                    tr.frames[frame_idx] = (d.box, "det")
+                    still_active.append(tr)
+                else:
+                    still_active.append(tr)  # kept alive for hold_frames, see below
+            active[cls] = still_active
+
+            for j, d in enumerate(cur_dets):
+                if j in used:
+                    continue
+                tr = Track(track_id=next_id, cls=cls)
+                next_id += 1
+                tr.frames[frame_idx] = (d.box, "det")
+                tracks.append(tr)
+                active[cls].append(tr)
+
+    # Hold: extend each track hold_frames video-frames past its last real
+    # detection, repeating the last known box. Interpolation already ran
+    # above between consecutive detections of the SAME track.
+    for tr in tracks:
+        last_frame = max(tr.frames)
+        last_box, _ = tr.frames[last_frame]
+        for f in range(last_frame + 1, last_frame + 1 + hold_frames):
+            tr.frames.setdefault(f, (last_box, "hold"))
+
+    return tracks
+
+
+def _interpolate(tr: Track, f0: int, box0: tuple, f1: int, box1: tuple) -> None:
+    span = f1 - f0
+    for f in range(f0 + 1, f1):
+        t = (f - f0) / span
+        box = tuple(box0[k] + t * (box1[k] - box0[k]) for k in range(4))
+        tr.frames[f] = (box, "interp")
+
+
+def dilate_box(box: tuple, scale: float, margin_px: int, w: int, h: int) -> tuple:
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    bw, bh = (x2 - x1) * scale + 2 * margin_px, (y2 - y1) * scale + 2 * margin_px
+    nx1, ny1 = cx - bw / 2, cy - bh / 2
+    nx2, ny2 = cx + bw / 2, cy + bh / 2
+    return (max(0.0, nx1), max(0.0, ny1), min(float(w), nx2), min(float(h), ny2))
+
+
+def tracks_to_fill_map(tracks: list[Track], w: int, h: int, dilate_scale: float,
+                        margin_px: int) -> dict:
+    fill_map: dict[int, list[tuple]] = {}
+    for tr in tracks:
+        for frame_idx, (box, _source) in tr.frames.items():
+            dbox = dilate_box(box, dilate_scale, margin_px, w, h)
+            fill_map.setdefault(frame_idx, []).append(dbox)
+    return fill_map
+
+
+# =============================================================================
+# Phase 5 — redact + encode (one burn-in re-encode)
+# =============================================================================
+
+
+def redact_frame_inplace(y, u, v, boxes: list[tuple], mode: str) -> bool:
+    """Returns whether anything was actually redacted on this frame (for
+    counting). mode='fill' sets an exact mid-gray — see FILL_VALUE and
+    check_fill_integrity(). mode='blur' is a best-effort alternative kept
+    for completeness; fill is the recommended default (re-identification
+    risk — Revelio reports 95.9% re-ID at a blur kernel 32% of face
+    width — and it turns verification into an exact invariant instead of
+    a variance heuristic)."""
+    h, w = y.shape
+    touched = False
+    for x1, y1, x2, y2 in boxes:
+        ix1, iy1 = max(0, int(x1)), max(0, int(y1))
+        ix2, iy2 = min(w, math.ceil(x2)), min(h, math.ceil(y2))
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        touched = True
+        if mode == "fill":
+            y[iy1:iy2, ix1:ix2] = FILL_VALUE
+            # Chroma is half-resolution: the chroma columns/rows that
+            # fully COVER luma range [a, b) are [a//2, ceil(b/2)), i.e.
+            # floor on the start, CEILING on the end. Using floor on both
+            # ends (iy2//2 / ix2//2) under-covers by one chroma unit
+            # whenever ix2/iy2 is odd — leaves a ~2-luma-pixel strip at
+            # the box's right/bottom edge with original (non-gray) hue
+            # under gray luma. (ix2+1)//2 is integer ceiling division.
+            cy1, cx1 = iy1 // 2, ix1 // 2
+            cy2, cx2 = max(cy1 + 1, (iy2 + 1) // 2), max(cx1 + 1, (ix2 + 1) // 2)
+            u[cy1:cy2, cx1:cx2] = FILL_VALUE
+            v[cy1:cy2, cx1:cx2] = FILL_VALUE
+        else:
+            import cv2
+            region = y[iy1:iy2, ix1:ix2]
+            k = max(3, (min(region.shape) // 2) | 1)  # odd kernel
+            y[iy1:iy2, ix1:ix2] = cv2.GaussianBlur(region, (k, k), 0)
+    return touched
+
+
+def redact_and_encode(cfg: Config, clip: ClipInfo, fill_map: dict, ffmpeg: str,
+                       out_path: Path) -> dict:
+    dec_log = cfg.output_dir / "logs" / f"{clip.clip_id}.redact_decode.stderr.log"
+    enc_log = cfg.output_dir / "logs" / f"{clip.clip_id}.encode.stderr.log"
+    dec = open_decoder(ffmpeg, clip.path, dec_log)
+    enc = open_encoder(ffmpeg, clip.width, clip.height, clip.fps, out_path,
+                        cfg.encode_preset, cfg.encode_crf, enc_log)
+    assert enc.stdin is not None
+    n_frames_with_fill = 0
+    max_area_frac = 0.0
+    frame_area = clip.width * clip.height
+    frames_written = 0
+    try:
+        for idx, (y, u, v) in enumerate(read_frames(dec, clip.width, clip.height)):
+            boxes = fill_map.get(idx, [])
+            if boxes:
+                touched = redact_frame_inplace(y, u, v, boxes, cfg.redaction)
+                if touched:
+                    n_frames_with_fill += 1
+                    area = sum((b[2] - b[0]) * (b[3] - b[1]) for b in boxes)
+                    max_area_frac = max(max_area_frac, area / frame_area)
+            enc.stdin.write(y.tobytes())
+            enc.stdin.write(u.tobytes())
+            enc.stdin.write(v.tobytes())
+            frames_written += 1
+    finally:
+        # If the loop above was abandoned mid-iteration (any exception —
+        # a dead encoder raising BrokenPipeError, a bug in
+        # redact_frame_inplace), `dec` is still decoding and trying to
+        # write more frames to a stdout pipe nobody is reading anymore.
+        # terminate() BEFORE wait() unblocks that write so wait() can't
+        # hang forever; harmless to call on a decoder that already hit
+        # EOF normally (it's a zombie by then, terminate() is a no-op).
+        try:
+            enc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        dec.terminate()
+        if dec.stdout is not None:
+            dec.stdout.close()
+        dec.wait()
+        enc.wait()
+
+    if enc.returncode != 0:
+        stderr = enc_log.read_text(errors="replace") if enc_log.exists() else ""
+        raise RuntimeError(f"{clip.clip_id}: encode failed (see {enc_log}): {stderr}")
+    if frames_written != clip.n_frames:
+        raise RuntimeError(
+            f"{clip.clip_id}: wrote {frames_written} frames, expected "
+            f"{clip.n_frames} — do not ship a mismatched output."
+        )
+    return {
+        "n_frames_with_fill": n_frames_with_fill,
+        "frames_with_fill_frac": n_frames_with_fill / max(1, frames_written),
+        "max_fill_area_frac": max_area_frac,
+    }
+
+
+# =============================================================================
+# Phase 6 — verify
+# =============================================================================
+
+
+def check_fill_integrity(ffmpeg: str, out_path: Path, w: int, h: int,
+                          fill_map: dict, mode: str, stderr_log: Path) -> dict:
+    """Only meaningful for mode='fill': every redacted region is a
+    constant value, so this is an EXACT invariant, not a heuristic
+    threshold on variance-of-Laplacian. Erode 2px to skip DCT ringing at
+    box edges. Catches frame-index desync directly: if boxes are on the
+    wrong frame, gray will not be where fill_map says it is.
+
+    Checks ALL THREE planes (Y, U, V), not just luma — a box can have
+    perfectly gray luma while still carrying its original hue/saturation
+    in chroma if only Y got redacted (redact_frame_inplace() sets all
+    three, but this check exists specifically to catch cases where the
+    two drift, including a future refactor that touches one and not the
+    other). A box that erodes to empty (small boxes) falls back to being
+    checked UNERODED rather than silently exempted — counted separately
+    as fill_integrity_unverifiable so a gap in coverage is visible in the
+    audit instead of invisible."""
+    if mode != "fill":
+        return {"skipped": "mode != fill"}
+    import numpy as np
+
+    proc = open_decoder(ffmpeg, out_path, stderr_log)
+    violations = 0
+    checked = 0
+    unverifiable = 0
+    for idx, (y, u, v) in enumerate(read_frames(proc, w, h)):
+        boxes = fill_map.get(idx)
+        if not boxes:
+            continue
+        for x1, y1, x2, y2 in boxes:
+            ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+            eix1, eiy1, eix2, eiy2 = ix1 + 2, iy1 + 2, ix2 - 2, iy2 - 2
+            if eix2 <= eix1 or eiy2 <= eiy1:
+                eix1, eiy1, eix2, eiy2 = ix1, iy1, ix2, iy2  # too small to erode — check raw
+            if eix2 <= eix1 or eiy2 <= eiy1:
+                unverifiable += 1  # genuinely zero-area box; nothing to check
+                continue
+            y_region = y[eiy1:eiy2, eix1:eix2].astype(np.int16)
+            cy1, cx1 = eiy1 // 2, eix1 // 2
+            cy2, cx2 = max(cy1 + 1, (eiy2 + 1) // 2), max(cx1 + 1, (eix2 + 1) // 2)
+            u_region = u[cy1:cy2, cx1:cx2].astype(np.int16)
+            v_region = v[cy1:cy2, cx1:cx2].astype(np.int16)
+            checked += 1
+            planes_ok = all(
+                np.max(np.abs(region - FILL_VALUE)) <= 3 and np.std(region) <= 2
+                for region in (y_region, u_region, v_region)
+            )
+            if not planes_ok:
+                violations += 1
+    proc.wait()
+    return {
+        "fill_integrity_checked": checked,
+        "fill_integrity_violations": violations,
+        "fill_integrity_unverifiable": unverifiable,
+    }
+
+
+def check_low_threshold_sweep(detections: list[Detection], fill_map: dict,
+                               sweep_threshold: float, operating_thresholds: dict) -> dict:
+    """The check with real statistical power against false negatives — it
+    uses ORIGINAL pixels. Everything scored in [sweep_threshold,
+    operating_threshold) that isn't already covered by a fill box is a
+    candidate miss for human review."""
+    candidates = []
+    for d in detections:
+        op_thresh = operating_thresholds.get(d.cls, 0.5)
+        if not (sweep_threshold <= d.score < op_thresh):
+            continue
+        boxes = fill_map.get(d.frame_idx, [])
+        covered = any(_iou(d.box, b) > 0.1 for b in boxes)
+        if not covered:
+            candidates.append(d)
+    return {
+        "n_candidate_misses": len(candidates),
+        "n_frames_with_candidate_miss": len({d.frame_idx for d in candidates}),
+        "candidates": [dataclasses.asdict(d) for d in
+                        sorted(candidates, key=lambda d: -d.score)[:200]],
+    }
+
+
+def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
+                 fill_map: dict, detect_hz: float, fps: float) -> dict:
+    """Second, independent detector — different training distribution
+    (WIDER FACE, not egocentric) and inductive biases from EgoBlur, so it
+    catches a different slice of misses. MIT-licensed, ships inside
+    opencv-python's bindings — but the ONNX weights are a separate
+    download this script does not fetch; pass --yunet-model or this check
+    is honestly skipped rather than silently faked."""
+    if cfg.yunet_model is None:
+        log.warning(
+            "%s: --yunet-model not provided — the independent second-"
+            "detector check is SKIPPED. This is the only check with power "
+            "against faces EgoBlur itself is systematically blind to; "
+            "running without it means the audit's only real signal against "
+            "missed faces is the low-threshold sweep alone.",
+            out_path.stem,
+        )
+        return {"skipped": "no --yunet-model provided"}
+    import cv2
+
+    detector = cv2.FaceDetectorYN.create(str(cfg.yunet_model), "", (w, h))
+    stride = max(1, round(fps / detect_hz))
+    stderr_log = cfg.output_dir / "logs" / f"{out_path.stem}.yunet_decode.stderr.log"
+    proc = open_decoder(ffmpeg, out_path, stderr_log)
+    uncovered = []
+    for idx, (y, u, v) in enumerate(read_frames(proc, w, h)):
+        if idx % stride != 0:
+            continue
+        yuv = _pack_yuv420p(y, u, v)
+        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+        _n, faces = detector.detect(bgr)
+        if faces is None:
+            continue
+        boxes_here = fill_map.get(idx, [])
+        for f in faces:
+            if f[4] < 0.5:  # cv2 FaceDetectorYN score column
+                continue
+            box = (float(f[0]), float(f[1]), float(f[0] + f[2]), float(f[1] + f[3]))
+            if not any(_iou(box, b) > 0.1 for b in boxes_here):
+                uncovered.append({"frame_idx": idx, "box": box, "score": float(f[4])})
+    proc.wait()
+    return {"n_yunet_uncovered": len(uncovered), "yunet_uncovered": uncovered[:200]}
+
+
+def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
+                 yunet: dict, gen: str) -> dict:
+    """status/hard_fail gate on EVERY check with actual power against a
+    missed face, not just fill_integrity. fill_integrity only proves boxes
+    that already exist are correctly gray — it is structurally incapable
+    of catching a face the detector never boxed at all. The low-threshold
+    sweep and YuNet are the two checks that use signal OTHER than 'did the
+    fill match the fill_map', so a nonzero count from either is a hard
+    fail here too, by design biased toward over-flagging (the sweep WILL
+    have false positives) rather than ever silently reporting PASS on an
+    unreviewed candidate miss."""
+    yunet_ran = "skipped" not in yunet
+    hard_fail = (
+        integrity.get("fill_integrity_violations", 0) > 0
+        or sweep.get("n_candidate_misses", 0) > 0
+        or (yunet_ran and yunet.get("n_yunet_uncovered", 0) > 0)
+    )
+    status = "NEEDS_REVIEW" if hard_fail else "PASS_AUTOMATED"
+    if status == "PASS_AUTOMATED" and not yunet_ran:
+        status = "PASS_AUTOMATED_NO_YUNET"  # a real but weaker claim — say so
+    return {
+        "clip_id": clip.clip_id,
+        "status": status,
+        "yunet_ran": yunet_ran,  # explicit, not inferred from a "skipped" key
+        # that also appears (for an unrelated reason — blur vs fill mode)
+        # in **integrity below, and would collide when flattened.
+        "gen": gen,
+        "note": (
+            "Re-running the detector on the redacted output cannot find a "
+            "face the detector missed in pass 1 — those pixels are "
+            "unchanged, so the same detector at the same threshold misses "
+            "them again by construction; fill_integrity_violations alone "
+            "therefore does NOT gate status here. The checks with real "
+            "power against misses are the low-threshold sweep on the "
+            "ORIGINAL pixels and the independent YuNet pass — both feed "
+            "hard_fail directly, since a nonzero count from either means a "
+            "specific frame needs a human look before this clip ships."
+        ),
+        **fill_stats,
+        **integrity,
+        **sweep,
+        **yunet,
+    }
+
+
+def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
+    lines = [
+        f"# {clip.clip_id} — {audit['status']}",
+        "",
+        f"frames {clip.n_frames}  fps {clip.fps:.2f}  gen {audit['gen']}",
+        f"frames_with_fill: {audit.get('n_frames_with_fill', 0)} "
+        f"({audit.get('frames_with_fill_frac', 0) * 100:.1f}%)",
+        f"fill_integrity_violations: {audit.get('fill_integrity_violations', 'n/a')}  (hard gate — desync/leak proof, must be 0)",
+        f"fill_integrity_unverifiable: {audit.get('fill_integrity_unverifiable', 'n/a')}  (boxes too small to check even unerroded)",
+        f"candidate_misses [sweep_threshold, operating): {audit.get('n_candidate_misses', 'n/a')}  (hard gate — review these)",
+        f"yunet_uncovered: {audit.get('n_yunet_uncovered', 'n/a') if audit.get('yunet_ran') else 'SKIPPED — see note'}  (hard gate when run — review these first)",
+        f"max_fill_area_frac: {audit.get('max_fill_area_frac', 0):.4f}  (runaway false-positive canary)",
+        "",
+        audit["note"],
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# =============================================================================
+# Phase 7 — ship & shutdown
+# =============================================================================
+
+
+def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
+                    audit: dict, timing: dict, manifest_path: Path) -> None:
+    import torch
+
+    manifest = {
+        "schema_version": 1,
+        "run_id": cfg.run_id,
+        "clip_id": clip.clip_id,
+        "clip_group": clip.clip_group,
+        "chapter_index": clip.chapter_index,
+        "source": {
+            "filename": clip.path.name,
+            "sha256": clip.sha256,
+            "width": clip.width, "height": clip.height, "fps": clip.fps,
+            "n_frames": clip.n_frames, "duration_s": clip.duration_s,
+            "rotation": clip.rotation,
+        },
+        "egoblur": {
+            "gen": gen,
+            "face_threshold": cfg.face_threshold, "lp_threshold": cfg.lp_threshold,
+            "sweep_threshold": cfg.sweep_threshold, "nms_iou": cfg.nms_iou,
+            "detect_hz": cfg.detect_hz, "redaction": cfg.redaction,
+            "dilate_scale": cfg.dilate_scale, "motion_margin_px": cfg.motion_margin_px,
+            "hold_frames": cfg.hold_frames, "min_box_px": cfg.min_box_px,
+        },
+        "env": {
+            "torch": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "python": sys.version,
+        },
+        "output": {
+            "path": out_path.name,
+            "sha256": sha256_file(out_path),
+            "bytes": out_path.stat().st_size,
+        },
+        "audit": audit,
+        "timing": timing,
+        "status": audit["status"],
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def shutdown_pod() -> None:
+    pod_id = os.environ.get("RUNPOD_POD_ID")
+    if not pod_id:
+        log.warning("RUNPOD_POD_ID not set — skipping shutdown (not on a pod?)")
+        return
+    log.info("clean exit — stopping pod %s (stop, not terminate: logs survive)", pod_id)
+    subprocess.run(["runpodctl", "pod", "stop", pod_id], check=False)
+
+
+# =============================================================================
+# main
+# =============================================================================
+
+
+def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
+                  ffmpeg: str, shard_dir: Path) -> dict:
+    manifest_path = cfg.output_dir / f"{clip.clip_id}.manifest.json"
+    if manifest_path.exists() and not cfg.force_reprocess:
+        # A restart after clip N crashed must not silently re-decode +
+        # re-encode + re-verify clips 1..N-1 that already shipped —
+        # detection_pass()'s own jsonl checkpoint is cheap to redo, but
+        # redact_and_encode()/check_fill_integrity()/check_yunet() have no
+        # such checkpoint and would otherwise unconditionally overwrite an
+        # already-audited, possibly already-delivered output file.
+        existing = json.loads(manifest_path.read_text())
+        log.info("%s: manifest already exists (status=%s) — skipping, pass "
+                  "--force-reprocess to redo", clip.clip_id, existing.get("status"))
+        return existing["audit"]
+
+    t0 = time.monotonic()
+    log.info("=== %s ===", clip.clip_id)
+
+    detections = detection_pass(cfg, clip, face_det, lp_det, ffmpeg, shard_dir, gen)
+    t_detect = time.monotonic()
+
+    hold_frames = cfg.hold_frames or round(clip.fps)
+    tracks = build_tracks(detections, cfg.min_box_px, iou_thresh=0.2, hold_frames=hold_frames)
+    fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
+                                   cfg.dilate_scale, cfg.motion_margin_px)
+
+    if cfg.forced_boxes and cfg.forced_boxes.exists():
+        forced = json.loads(cfg.forced_boxes.read_text())
+        for entry in forced.get(clip.clip_id, []):
+            fill_map.setdefault(entry["frame_idx"], []).append(tuple(entry["box"]))
+        log.info("%s: applied %d forced boxes from human review",
+                  clip.clip_id, len(forced.get(clip.clip_id, [])))
+
+    out_path = cfg.output_dir / f"{clip.clip_id}.blurred.mp4"
+    fill_stats = redact_and_encode(cfg, clip, fill_map, ffmpeg, out_path)
+    t_encode = time.monotonic()
+
+    integrity_log = cfg.output_dir / "logs" / f"{clip.clip_id}.integrity_decode.stderr.log"
+    integrity = check_fill_integrity(ffmpeg, out_path, clip.width, clip.height,
+                                      fill_map, cfg.redaction, integrity_log)
+    sweep = check_low_threshold_sweep(
+        detections, fill_map, cfg.sweep_threshold,
+        {"face": cfg.face_threshold, "lp": cfg.lp_threshold},
+    )
+    yunet = check_yunet(cfg, ffmpeg, out_path, clip.width, clip.height,
+                         fill_map, cfg.detect_hz, clip.fps)
+    t_verify = time.monotonic()
+
+    audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen)
+    write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
+
+    timing = {
+        "detect_s": t_detect - t0,
+        "encode_s": t_encode - t_detect,
+        "verify_s": t_verify - t_encode,
+        "total_s": t_verify - t0,
+    }
+    write_manifest(clip, gen, cfg, out_path, audit,
+                    timing, cfg.output_dir / f"{clip.clip_id}.manifest.json")
+
+    log.info("%s: %s (%.1fs)", clip.clip_id, audit["status"], timing["total_s"])
+    return audit
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = parse_args(argv)
+
+    if not cfg.no_watchdog:
+        arm_watchdog(cfg.watchdog_hours, cfg.output_dir)
+
+    try:
+        preflight(cfg)
+        ffmpeg, ffprobe = _bin("ffmpeg"), _bin("ffprobe")
+        clips = discover_clips(cfg.input_dir, ffprobe)
+        gen, face_det, lp_det = build_detectors(cfg)
+
+        budget = probe_and_budget(cfg, clips, face_det, lp_det, ffmpeg)
+        if cfg.probe_only:
+            print(json.dumps(budget, indent=2))
+            return 0
+
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        shard_dir = cfg.output_dir / "shards"
+        shard_dir.mkdir(exist_ok=True)
+
+        # One bad clip (corrupt file, a transient CUDA error) must not
+        # abort clips that haven't been attempted yet — that would leave
+        # the pod up (per the except below) burning cost for no reason
+        # when the actual problem is scoped to a single input file.
+        audits = []
+        failed_clip_ids = []
+        for c in clips:
+            try:
+                audits.append(process_clip(cfg, c, gen, face_det, lp_det, ffmpeg, shard_dir))
+            except Exception:
+                log.exception("%s: failed — continuing with remaining clips", c.clip_id)
+                failed_clip_ids.append(c.clip_id)
+                audits.append({"clip_id": c.clip_id, "status": "FAILED"})
+
+        pass_statuses = {"PASS_AUTOMATED", "PASS_AUTOMATED_NO_YUNET"}
+        n_pass = sum(1 for a in audits if a["status"] in pass_statuses)
+        n_needs_review = sum(1 for a in audits if a["status"] == "NEEDS_REVIEW")
+        run_manifest = {
+            "run_id": cfg.run_id, "gen": gen, "n_clips": len(clips),
+            "clip_ids": [c.clip_id for c in clips],
+            "n_pass": n_pass,
+            "n_needs_review": n_needs_review,
+            "n_failed": len(failed_clip_ids),
+            "failed_clip_ids": failed_clip_ids,
+        }
+        (cfg.output_dir / "run_manifest.json").write_text(
+            json.dumps(run_manifest, indent=2), encoding="utf-8"
+        )
+        log.info("run complete: %s", json.dumps(run_manifest))
+
+    except Exception:
+        log.exception("job failed — pod left running (not stopped) so logs survive for debugging")
+        raise
+    else:
+        if not cfg.skip_shutdown:
+            shutdown_pod()
+
+    # Exit code reflects the run's actual outcome, not just "no uncaught
+    # exception" — a caller (or a human glancing at $?) must not be able
+    # to read exit 0 as an unconditional green light when clips came back
+    # NEEDS_REVIEW or FAILED. See build_audit()'s docstring for why
+    # fill_integrity alone was never a sufficient gate for this.
+    return 0 if (n_needs_review == 0 and not failed_clip_ids) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
