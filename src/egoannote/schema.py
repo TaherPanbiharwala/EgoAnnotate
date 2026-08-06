@@ -5,6 +5,7 @@ per-frame hand landmarks — kept from v1, which got this split right)."""
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -70,52 +71,72 @@ class HandsMissingGap:
     n_frames: int
 
 
-def derive_hands_missing(records: list[HandFrame]) -> list[HandsMissingGap]:
-    """Run-length-encode the contiguous frame ranges where hands_present == 0.
-    Unchanged from v1 — correct, and tested."""
-    gaps: list[HandsMissingGap] = []
-    if not records:
-        return gaps
+class GapTracker:
+    """Incremental run-length encoder for hands_present==0 stretches.
 
-    video_id = records[0].video_id
-    in_gap = False
-    gap_start_idx = 0
-    gap_start_ts = 0
+    Extracted from derive_hands_missing (which used to index `records[i-1]`
+    into a fully-materialized list) so the SAME gap logic can fold over a
+    stream one record at a time — store.write_hands_parquet_streaming needs
+    that to derive gaps without ever holding the whole hand track in memory.
+    One implementation, two call sites, instead of two copies that could
+    silently drift out of agreement.
+    """
 
-    for i, r in enumerate(records):
-        if r.hands_present == 0 and not in_gap:
-            in_gap = True
-            gap_start_idx = r.frame_idx
-            gap_start_ts = r.timestamp_ms
-        elif r.hands_present != 0 and in_gap:
-            prev = records[i - 1]
-            gaps.append(
-                HandsMissingGap(
-                    video_id=video_id,
-                    gap_start_frame=gap_start_idx,
-                    gap_end_frame=prev.frame_idx,
-                    gap_start_ts_ms=gap_start_ts,
-                    gap_end_ts_ms=prev.timestamp_ms,
-                    duration_ms=prev.timestamp_ms - gap_start_ts,
-                    n_frames=prev.frame_idx - gap_start_idx + 1,
-                )
-            )
-            in_gap = False
+    def __init__(self) -> None:
+        self._video_id: str | None = None
+        self._in_gap = False
+        self._gap_start_idx = 0
+        self._gap_start_ts = 0
+        self._prev: HandFrame | None = None
+        self.gaps: list[HandsMissingGap] = []
 
-    if in_gap:
-        last = records[-1]
-        gaps.append(
+    def feed(self, rec: HandFrame) -> None:
+        if self._video_id is None:
+            self._video_id = rec.video_id
+        if rec.hands_present == 0 and not self._in_gap:
+            self._in_gap = True
+            self._gap_start_idx = rec.frame_idx
+            self._gap_start_ts = rec.timestamp_ms
+        elif rec.hands_present != 0 and self._in_gap:
+            assert self._prev is not None
+            self._close_gap(self._prev)
+        self._prev = rec
+
+    def finish(self) -> list[HandsMissingGap]:
+        """Call once after the last feed(). Flushes a gap still open at the
+        final record (mirrors the old function's tail-gap handling)."""
+        if self._in_gap and self._prev is not None:
+            self._close_gap(self._prev)
+        return self.gaps
+
+    def _close_gap(self, prev: HandFrame) -> None:
+        assert self._video_id is not None
+        self.gaps.append(
             HandsMissingGap(
-                video_id=video_id,
-                gap_start_frame=gap_start_idx,
-                gap_end_frame=last.frame_idx,
-                gap_start_ts_ms=gap_start_ts,
-                gap_end_ts_ms=last.timestamp_ms,
-                duration_ms=last.timestamp_ms - gap_start_ts,
-                n_frames=last.frame_idx - gap_start_idx + 1,
+                video_id=self._video_id,
+                gap_start_frame=self._gap_start_idx,
+                gap_end_frame=prev.frame_idx,
+                gap_start_ts_ms=self._gap_start_ts,
+                gap_end_ts_ms=prev.timestamp_ms,
+                duration_ms=prev.timestamp_ms - self._gap_start_ts,
+                n_frames=prev.frame_idx - self._gap_start_idx + 1,
             )
         )
-    return gaps
+        self._in_gap = False
+
+
+def derive_hands_missing(records: Iterable[HandFrame]) -> list[HandsMissingGap]:
+    """Run-length-encode the contiguous frame ranges where hands_present == 0.
+
+    Broadened from `list[HandFrame]` to `Iterable[HandFrame]`: the original
+    indexed `records[i - 1]`, which only a Sequence supports. GapTracker
+    folds over one record at a time instead, so this now also accepts a
+    generator (e.g. hands_layer.run()'s output) directly.
+    """
+    tracker = GapTracker()
+    for rec in records:
+        tracker.feed(rec)
+    return tracker.finish()
 
 
 # ---------------------------------------------------------------------------

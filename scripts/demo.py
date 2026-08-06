@@ -28,8 +28,7 @@ from egoannote.backends.fake import FakeBackend
 from egoannote.layers import caption as caption_layer
 from egoannote.layers import hands as hands_layer
 from egoannote.media.probe import probe
-from egoannote.schema import derive_hands_missing
-from egoannote.store import Store, write_hands_parquet
+from egoannote.store import Store, write_hands_parquet_streaming
 
 
 def _display(p: Path) -> str:
@@ -63,13 +62,31 @@ def main() -> int:
     print("== hands (MediaPipe, local CPU) ==")
     # Pass the SAME VideoInfo the caption track will use — both tracks must
     # derive timestamps from one clock or boundary metrics are meaningless.
-    hand_frames = list(hands_layer.run(video, video_id, config.MODELS_DIR, info=info))
-    n_present = sum(1 for h in hand_frames if h.hands_present > 0)
-    print(f"  {len(hand_frames)} frames sampled, {n_present} with a hand present"
-          f" (0 expected — this clip is a synthetic test pattern, not real footage)")
+    #
+    # The hand track is streamed straight into the parquet writer rather
+    # than materialized with list(...) first. hands_layer.run() is a
+    # one-shot generator; write_hands_parquet_streaming consumes it once and
+    # derives the no-hands gaps in the same pass (schema.GapTracker), so
+    # peak memory stays flat regardless of video length instead of holding
+    # every HandFrame (and then every Arrow column list) in memory at once.
+    # A small counting wrapper keeps this script's own printed stats without
+    # re-materializing anything.
+    counts = {"total": 0, "present": 0}
+
+    def _counted(frames):
+        for rec in frames:
+            counts["total"] += 1
+            if rec.hands_present > 0:
+                counts["present"] += 1
+            yield rec
+
     hands_path = run_dir / "hands.parquet"
-    write_hands_parquet(hand_frames, hands_path)
-    gaps = derive_hands_missing(hand_frames)
+    _n_hand_frames, gaps = write_hands_parquet_streaming(
+        _counted(hands_layer.run(video, video_id, config.MODELS_DIR, info=info)),
+        hands_path,
+    )
+    print(f"  {counts['total']} frames sampled, {counts['present']} with a hand present"
+          f" (0 expected — this clip is a synthetic test pattern, not real footage)")
     print(f"  wrote {_display(hands_path)} ({len(gaps)} no-hands gaps)")
 
     print("== captions (FakeBackend — no network, no key, $0) ==")

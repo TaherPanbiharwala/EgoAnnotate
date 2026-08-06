@@ -101,6 +101,18 @@ VLM_FRAME_RESIZE_LONG_EDGE: Final[int] = 1280
 
 VLM_RETRIES: Final[int] = 2
 
+# Every VLM call is network-bound — measured per-call latency is 5-15s of
+# mostly wait, not compute (perf review). Captioning ~900 windows serially
+# measured out to 1.25-3.75 hours of wall clock for zero correctness
+# benefit: the store (SQLite, 900 writes measured at 0.09s total), the HTTP
+# client, and the spend tracker are all concurrency-safe. At 8 concurrent
+# calls the same run is roughly 15-30 minutes. Each in-flight call holds
+# ~11 MB (raw + base64 JPEGs + the serialized request body), so 8 workers
+# costs ~90 MB — trivial on an 8 GB machine. Pass max_workers=1 to
+# layers.caption.caption_video for strictly serial, deterministic execution
+# (what the test suite uses for exact-call-count assertions).
+CAPTION_MAX_WORKERS: Final[int] = 8
+
 # ---------------------------------------------------------------------------
 # Segmentation (Phase 6 - see plan "S1-S5" + "C1 RESOLUTION")
 # ---------------------------------------------------------------------------

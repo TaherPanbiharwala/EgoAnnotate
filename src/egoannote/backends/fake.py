@@ -15,6 +15,7 @@ Two modes:
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from .base import VLMResponse
@@ -73,13 +74,18 @@ class FakeBackend:
                         row = json.loads(line)
                         self._responses.append(row["response_text"])
         self._call_count = 0
+        # caption() may now run from multiple threads at once (see
+        # config.CAPTION_MAX_WORKERS) — without this, concurrent calls race
+        # on the increment and can duplicate or skip a fixture index.
+        self._lock = threading.Lock()
 
     def caption(self, frames_jpeg: list[bytes], prompt: str) -> VLMResponse:
-        if self._responses:
-            text = self._responses[self._call_count % len(self._responses)]
-        else:
-            text = _DEFAULT_RESPONSE
-        self._call_count += 1
+        with self._lock:
+            if self._responses:
+                text = self._responses[self._call_count % len(self._responses)]
+            else:
+                text = _DEFAULT_RESPONSE
+            self._call_count += 1
         return VLMResponse(
             text=text,
             latency_ms=1,

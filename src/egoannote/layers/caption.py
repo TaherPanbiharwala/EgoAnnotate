@@ -10,11 +10,13 @@ no possibility of the duplicate-record bug v1 had with append-mode JSONL.
 from __future__ import annotations
 
 import logging
+import threading
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .. import config
 from ..backends.base import PermanentBackendError, SpendLimitExceeded, VLMBackend
-from ..media.frames import extract_frames, iter_window_indices
+from ..media.frames import Window, extract_frames, iter_window_indices
 from ..media.probe import VideoInfo, probe
 from ..parse import parse_caption_v3
 from ..schema import WindowCaption, hash_prompt, utc_now_isoformat
@@ -65,6 +67,129 @@ def _render_prompt(template: str, n_frames: int) -> str:
     )
 
 
+class _RunAborted(Exception):
+    """Internal only — never escapes caption_video. Raised by
+    _run_window_with_abort when a window is skipped because a prior
+    control-flow exception already tripped the abort flag."""
+
+
+def _caption_one_window(
+    window: Window,
+    frame_paths: list[Path],
+    backend: VLMBackend,
+    prompt_text: str,
+    prompt_hash: str,
+    video_id: str,
+    run_id: str,
+) -> WindowCaption:
+    """Do the VLM call + parse for one window. No store access — safe to
+    call from any thread; the caller does all writes. Control-flow
+    exceptions (SpendLimitExceeded, PermanentBackendError, KeyboardInterrupt)
+    propagate; anything else is captured into an error record instead of
+    raising, so one bad window doesn't abort the run.
+    """
+    start_ts_ms = round(window.frame_indices[0] * 1000 / config.VLM_FPS)
+    end_ts_ms = round((window.frame_indices[-1] + 1) * 1000 / config.VLM_FPS)
+
+    try:
+        jpegs = [frame_paths[i].read_bytes() for i in window.frame_indices]
+        # Render for THIS window's real length, and parse against the same
+        # number, so a partial window can never yield an action indexing a
+        # frame that was not sent.
+        n_in_window = len(jpegs)
+        resp = backend.caption(jpegs, _render_prompt(prompt_text, n_in_window))
+        parsed = parse_caption_v3(resp.text, n_frames=n_in_window)
+
+        return WindowCaption(
+            video_id=video_id,
+            window_idx=window.window_idx,
+            start_ts_ms=start_ts_ms,
+            end_ts_ms=end_ts_ms,
+            frame_indices=window.frame_indices,
+            is_partial=window.is_partial,
+            model_id=backend.model_id,
+            prompt_version=config.CAPTION_PROMPT_VERSION,
+            prompt_hash=prompt_hash,
+            run_id=run_id,
+            latency_ms=resp.latency_ms,
+            actions=parsed["actions"],
+            raw_json=parsed["raw_json"],
+            schema_ok=parsed["_schema_ok"],
+            input_tokens=resp.input_tokens,
+            output_tokens=resp.output_tokens,
+            cost_usd=resp.cost_usd,
+            provider=resp.provider,
+        )
+    except (SpendLimitExceeded, PermanentBackendError, KeyboardInterrupt):
+        # Control-flow signals, not per-window data problems. Writing an
+        # error row for every remaining window and returning normally would
+        # make a blown budget or a bad API key look like "the run finished"
+        # — the operator would have to read the error column to discover why
+        # every window is empty.
+        raise
+    except Exception as e:
+        log.exception("caption_video: window %d failed", window.window_idx)
+        return WindowCaption(
+            video_id=video_id,
+            window_idx=window.window_idx,
+            start_ts_ms=start_ts_ms,
+            end_ts_ms=end_ts_ms,
+            frame_indices=window.frame_indices,
+            is_partial=window.is_partial,
+            model_id=backend.model_id,
+            prompt_version=config.CAPTION_PROMPT_VERSION,
+            prompt_hash=prompt_hash,
+            run_id=run_id,
+            latency_ms=0,
+            actions=[],
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+def _run_window_with_abort(
+    window: Window,
+    frame_paths: list[Path],
+    backend: VLMBackend,
+    prompt_text: str,
+    prompt_hash: str,
+    video_id: str,
+    run_id: str,
+    abort_event: threading.Event,
+) -> WindowCaption:
+    """Wraps _caption_one_window with a self-checked abort flag.
+
+    Why this exists on top of the executor's own .cancel(): .cancel() only
+    stops a future that HASN'T STARTED, and only if the main thread gets to
+    call it before a worker claims that future. With max_workers=1 and a
+    backend that fails instantly (a bad API key returns 401 in
+    microseconds — a realistic case, not a test artifact), the single
+    worker thread can pull the NEXT queued task and start running it before
+    the main thread's as_completed loop even gets scheduled to react to the
+    first failure. Verified empirically: relying on cancel() alone let a
+    second call through under exactly this condition.
+
+    The fix: the thread that JUST failed sets abort_event itself, in its own
+    except clause, before re-raising — not the main thread, and not on a
+    delay. For max_workers=1 that is the same thread that will next pull the
+    following queued item, so the check-and-skip is sequential within one
+    thread with no cross-thread race: `abort_event.is_set()` is guaranteed
+    to already be True by the time that thread looks at it again. For
+    max_workers>1 this doesn't eliminate the (documented, intentional)
+    bounded overrun from OTHER threads already in flight — it only adds a
+    second, tighter backstop on top of .cancel() for whatever hasn't been
+    claimed yet.
+    """
+    if abort_event.is_set():
+        raise _RunAborted()
+    try:
+        return _caption_one_window(
+            window, frame_paths, backend, prompt_text, prompt_hash, video_id, run_id,
+        )
+    except (SpendLimitExceeded, PermanentBackendError, KeyboardInterrupt):
+        abort_event.set()
+        raise
+
+
 def caption_video(
     video: Path,
     video_id: str,
@@ -73,6 +198,7 @@ def caption_video(
     *,
     run_id: str | None = None,
     frames_dir: Path | None = None,
+    max_workers: int = config.CAPTION_MAX_WORKERS,
 ) -> int:
     """Caption every window of `video` with `backend`, writing to `store`
     under stage="caption", model_id=backend.model_id. Returns count written
@@ -84,6 +210,24 @@ def caption_video(
             Pass an explicit path to isolate concurrent runs or tests — the
             cache is keyed on video_id alone, so two callers sharing a root
             and a video_id share frames.
+        max_workers: how many VLM calls run concurrently (see
+            config.CAPTION_MAX_WORKERS for the measured rationale). Windows
+            complete out of order under concurrency, but each is still
+            written to the store as soon as it finishes, so a resume after
+            an abort skips exactly the windows already done — same
+            guarantee as serial execution, just not the same completion
+            order. Pass 1 for strictly serial, deterministic-order
+            execution.
+
+    Concurrency and control-flow exceptions: once any window raises
+    SpendLimitExceeded / PermanentBackendError / KeyboardInterrupt, no NEW
+    windows are started — pending futures are cancelled — but up to
+    `max_workers` windows already in flight are allowed to finish (each one
+    independently re-checks the backend's shared, thread-safe spend/permanent
+    state and fails the same way with no HTTP call if the condition still
+    holds). This is a deliberately bounded overrun, not the exactly-one-call
+    guarantee serial execution gives — call with max_workers=1 if you need
+    that guarantee (the test suite does, for exact call-count assertions).
     """
     prompt_text, prompt_hash = _load_prompt()
     run_id = run_id or utc_now_isoformat()
@@ -138,75 +282,62 @@ def caption_video(
             f"likely truncated or uses a codec ffmpeg can't decode."
         )
 
-    for window in iter_window_indices(n_frames, config.VLM_WINDOW_FRAMES):
-        if window.window_idx in done:
-            continue
+    todo = [
+        w for w in iter_window_indices(n_frames, config.VLM_WINDOW_FRAMES)
+        if w.window_idx not in done
+    ]
 
-        start_ts_ms = round(window.frame_indices[0] * 1000 / config.VLM_FPS)
-        end_ts_ms = round((window.frame_indices[-1] + 1) * 1000 / config.VLM_FPS)
+    # ThreadPoolExecutor(max_workers=1) is not a special case here: with one
+    # worker thread, tasks run strictly in submission order (a single thread
+    # pulling a FIFO queue can't do otherwise), so it gives the exact same
+    # ordering as a hand-written serial loop, with negligible pool overhead.
+    # The abort_event (see _run_window_with_abort) is what makes the
+    # exact-one-extra-call guarantee hold even for an instantly-failing
+    # backend — .cancel() alone races and loses that guarantee.
+    abort_event = threading.Event()
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _run_window_with_abort, window, frame_paths, backend,
+                prompt_text, prompt_hash, video_id, run_id, abort_event,
+            ): window
+            for window in todo
+        }
+        control_exc: BaseException | None = None
 
-        try:
-            jpegs = [frame_paths[i].read_bytes() for i in window.frame_indices]
-            # Render for THIS window's real length, and parse against the
-            # same number, so a partial window can never yield an action
-            # indexing a frame that was not sent.
-            n_in_window = len(jpegs)
-            resp = backend.caption(jpegs, _render_prompt(prompt_text, n_in_window))
-            parsed = parse_caption_v3(resp.text, n_frames=n_in_window)
+        for future in as_completed(futures):
+            try:
+                rec = future.result()
+            except (CancelledError, _RunAborted):
+                # Never ran — cancelled before a worker claimed it, or
+                # skipped via abort_event because a sibling window's
+                # control-flow exception fired first.
+                continue
+            except (SpendLimitExceeded, PermanentBackendError, KeyboardInterrupt) as e:
+                if control_exc is None:
+                    control_exc = e
+                    window = futures[future]
+                    log.warning(
+                        "caption_video: %s aborting after window %d — %s: %s. "
+                        "Windows already in flight may still complete; no new "
+                        "ones will start.",
+                        video_id, window.window_idx, type(e).__name__, e,
+                    )
+                    for f in futures:
+                        f.cancel()  # no-op for already-running/finished futures
+                continue
 
-            rec = WindowCaption(
+            store.write(
                 video_id=video_id,
-                window_idx=window.window_idx,
-                start_ts_ms=start_ts_ms,
-                end_ts_ms=end_ts_ms,
-                frame_indices=window.frame_indices,
-                is_partial=window.is_partial,
+                unit_idx=rec.window_idx,
+                stage="caption",
                 model_id=backend.model_id,
-                prompt_version=config.CAPTION_PROMPT_VERSION,
-                prompt_hash=prompt_hash,
-                run_id=run_id,
-                latency_ms=resp.latency_ms,
-                actions=parsed["actions"],
-                raw_json=parsed["raw_json"],
-                schema_ok=parsed["_schema_ok"],
-                input_tokens=resp.input_tokens,
-                output_tokens=resp.output_tokens,
-                cost_usd=resp.cost_usd,
-                provider=resp.provider,
+                payload=rec.to_payload(),
+                error=rec.error,
             )
-        except (SpendLimitExceeded, PermanentBackendError, KeyboardInterrupt):
-            # Control-flow signals, not per-window data problems. Writing
-            # an error row for every remaining window and returning
-            # normally would make a blown budget or a bad API key look
-            # like "the run finished" — the operator would have to read
-            # the error column to discover why every window is empty.
-            raise
-        except Exception as e:
-            log.exception("caption_video: window %d failed", window.window_idx)
-            rec = WindowCaption(
-                video_id=video_id,
-                window_idx=window.window_idx,
-                start_ts_ms=start_ts_ms,
-                end_ts_ms=end_ts_ms,
-                frame_indices=window.frame_indices,
-                is_partial=window.is_partial,
-                model_id=backend.model_id,
-                prompt_version=config.CAPTION_PROMPT_VERSION,
-                prompt_hash=prompt_hash,
-                run_id=run_id,
-                latency_ms=0,
-                actions=[],
-                error=f"{type(e).__name__}: {e}",
-            )
+            n_written += 1
 
-        store.write(
-            video_id=video_id,
-            unit_idx=window.window_idx,
-            stage="caption",
-            model_id=backend.model_id,
-            payload=rec.to_payload(),
-            error=rec.error,
-        )
-        n_written += 1
+        if control_exc is not None:
+            raise control_exc
 
     return n_written
