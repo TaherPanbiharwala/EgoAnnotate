@@ -22,8 +22,8 @@ jobs/_contract.py's module docstring for why this can't import src/.
 
 Pipeline: preflight -> discover clips -> detect (10 Hz, tracked +
 interpolated) -> redact + encode (one pass, yuv420p raw pipes) -> verify ->
-ship shards + manifest -> stop the pod. See _contract.py for the shard
-format; nothing here ever opens a database.
+ship manifest + artifacts -> stop the pod. Nothing here ever opens a
+database; the laptop owns the only one.
 
 EXIT CODE IS A REAL SIGNAL, NOT JUST "DIDN'T CRASH": exit 0 means every
 clip reached PASS_AUTOMATED (or PASS_AUTOMATED_NO_YUNET). Exit 1 means the
@@ -97,79 +97,21 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 # =============================================================================
-# VENDORED BY COPY from jobs/_contract.py — see that file's docstring for why
-# this is a copy and not an import. Keep byte-identical to the canonical file;
-# a CI check enforcing that is a known gap (no CI exists yet in this repo at
-# all — see the plan's open items), so for now this is enforced by hand.
-# =============================================================================
-
-CONTRACT_VERSION = "1"
-
-
-@dataclass(slots=True)
-class ShardMeta:
-    contract_version: str
-    video_id: str
-    pod_role: str  # "cpu" | "gpu"
-    stage: str  # "hands" | "blur" | "wilor" | "sam3" | "depth_v3" | "mast3r_slam"
-    shard_index: int
-    frame_indices: list[int]
-    timestamp_ms: list[int]  # SAME clock as media.probe.probe() — do not
-    # re-derive fps independently in a job script; pass it in from the
-    # manifest the laptop already computed, or you reintroduce the
-    # two-independent-clocks problem this project explicitly fixed.
-    model_name: str
-    model_version: str
-
-
-def write_shard(
-    out_dir: Path,
-    meta: ShardMeta,
-    arrays: dict[str, Any],
-) -> Path:
-    """Write one immutable shard: `<shard_index>.npz` + `<shard_index>_meta.json`.
-
-    Uniquely prefixed per (pod_role, stage, shard_index) by the caller's
-    out_dir convention (`<volume>/runs/<run_id>/<pod_role>/<stage>/`) — this
-    is what makes two pods writing concurrently safe with NO locking: they
-    never share a destination path.
-    """
-    import numpy as np
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    npz_path = out_dir / f"{meta.shard_index}.npz"
-    meta_path = out_dir / f"{meta.shard_index}_meta.json"
-
-    np.savez_compressed(npz_path, **arrays)
-    meta_path.write_text(json.dumps(asdict(meta)), encoding="utf-8")
-    return npz_path
-
-
-def read_shard(out_dir: Path, shard_index: int) -> tuple[ShardMeta, dict[str, Any]]:
-    import numpy as np
-
-    meta_path = out_dir / f"{shard_index}_meta.json"
-    npz_path = out_dir / f"{shard_index}.npz"
-
-    meta_dict = json.loads(meta_path.read_text(encoding="utf-8"))
-    if meta_dict.get("contract_version") != CONTRACT_VERSION:
-        raise ValueError(
-            f"shard {npz_path} was written with contract_version="
-            f"{meta_dict.get('contract_version')!r}, expected {CONTRACT_VERSION!r}. "
-            f"A pod is running an out-of-date copy of _contract.py."
-        )
-    meta = ShardMeta(**meta_dict)
-    arrays = dict(np.load(npz_path))
-    return meta, arrays
-
-
-# =============================================================================
-# End vendored section.
+# NOTE ON jobs/_contract.py
+#
+# Other job scripts vendor _contract.py's ShardMeta/write_shard by copy,
+# because a PEP-723 script cannot import from src/. This job does NOT: it
+# produces a redacted video plus a manifest, not arrays, so there is nothing
+# for the .npz shard format to carry. An earlier version pasted the contract
+# in anyway — 61 lines nothing ever called, while three comments and the
+# module docstring claimed shards were being shipped. Dead code that lies
+# about the output contract is worse than no code, so it is gone; add it back
+# only alongside a real write_shard() call.
 # =============================================================================
 
 log = logging.getLogger("blur")
@@ -185,6 +127,41 @@ LP_THRESHOLD_DEFAULT = 0.40
 SWEEP_THRESHOLD_DEFAULT = 0.10  # candidate-miss band floor for the audit —
 # see check_low_threshold_sweep().
 NMS_IOU_DEFAULT = 0.30
+
+# cv2.FaceDetectorYN.detect returns [n, 15]; col 14 is the face score.
+# Cols 4-5 are the RIGHT EYE x,y — reading those as a score (an earlier bug
+# here) silently disables the confidence gate, since a pixel coordinate is
+# essentially always >= any sane threshold.
+YUNET_SCORE_COL = 14
+YUNET_SCORE_MIN = 0.5
+
+# Track association IoU. Deliberately looser than --nms-iou: NMS decides
+# "are these the same detection in one frame", this decides "is this the
+# same face one detection-frame later", after it has moved.
+TRACK_IOU_DEFAULT = 0.2
+
+# Cap on per-check items written into the manifest/audit. The full counts
+# are always reported; this only bounds the embedded sample.
+AUDIT_MAX_ITEMS = 200
+
+# Frames per detector call. Used by BOTH the real detection pass and the
+# probe — the probe previously batched all --probe-frames at once, which
+# OOM'd the GPU before the run began.
+DETECT_BATCH = 8
+
+# Cost-model assumptions for the budget gate. These are ASSUMPTIONS, not
+# measurements: nothing in this job times encode or verify throughput, so
+# the estimate is a floor. Named here rather than buried as literals so the
+# gate's optimism is visible and adjustable.
+ASSUMED_ENCODE_FPS = 40.0   # libx264 -preset slow at 1080p on a pod's vCPUs
+ASSUMED_DECODE_FPS = 380.0  # CPU decode of the encoded output
+ASSUMED_YUNET_MS = 35.0     # per sampled frame, CPU
+
+# How much of a detected face must be inside the union of that frame's fill
+# boxes before it counts as redacted. Deliberately near-1: this gates a
+# privacy claim, so "mostly covered" is a miss, not a pass.
+COVERAGE_MIN_FRAC = 0.98
+
 FILL_VALUE = 128  # mid-gray. Exact value matters: check_fill_integrity()
 # treats deviation from this as a hard invariant, not a heuristic.
 
@@ -230,6 +207,7 @@ class Config:
     no_watchdog: bool
     skip_shutdown: bool
     force_reprocess: bool
+    probe_frames_dir: Path
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
@@ -263,7 +241,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--probe-only", action="store_true")
     p.add_argument("--probe-frames", type=int, default=600)
     p.add_argument("--yunet-model", type=Path, help="cv2 FaceDetectorYN onnx path; omit to skip")
-    p.add_argument("--forced-boxes", type=Path, help="human-supplied JSON from a reject_reblur")
+    p.add_argument("--forced-boxes", type=Path, help='JSON mapping clip_id -> [{"frame_idx": int, "box": [x1,y1,x2,y2]}], listing faces a human confirmed were missed. Requires --force-reprocess to re-run an already-manifested clip.')
     p.add_argument("--watchdog-hours", type=float, default=8.0)
     p.add_argument("--no-watchdog", action="store_true")
     p.add_argument("--skip-shutdown", action="store_true", help="for local/laptop testing")
@@ -271,6 +249,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
                     help="redo clips that already have a manifest.json from a prior run "
                          "(default: skip them — a restart after a crash on clip N must not "
                          "silently re-burn GPU/CPU cost and re-clobber clips 1..N-1)")
+    p.add_argument("--probe-frames-dir", type=Path, default=None,
+                    help="where --probe-only writes annotated sample frames. These are "
+                         "UNREDACTED originals, so this deliberately defaults OUTSIDE "
+                         "--output-dir (a sibling '<output-dir>-probe-DO-NOT-SHIP') and "
+                         "must never be synced or published.")
     a = p.parse_args(argv)
 
     if a.dilate_scale < 1.0:
@@ -281,6 +264,30 @@ def parse_args(argv: list[str] | None = None) -> Config:
         )
     if a.motion_margin_px < 0:
         p.error(f"--motion-margin-px {a.motion_margin_px} is negative — would shrink boxes.")
+    if a.detect_hz <= 0:
+        p.error(f"--detect-hz {a.detect_hz} must be > 0 (it divides fps to pick a stride).")
+    if a.hold_frames < 0:
+        p.error(f"--hold-frames {a.hold_frames} is negative — disables track association.")
+    if a.min_box_px < 0:
+        p.error(f"--min-box-px {a.min_box_px} is negative.")
+    for name, val in (("--face-threshold", a.face_threshold),
+                       ("--lp-threshold", a.lp_threshold),
+                       ("--sweep-threshold", a.sweep_threshold)):
+        if not 0.0 < val <= 1.0:
+            p.error(f"{name} {val} must be in (0, 1].")
+    if a.sweep_threshold >= min(a.face_threshold, a.lp_threshold):
+        # The sweep inspects [sweep, operating). If the floor is not strictly
+        # below the operating threshold the band is empty and the audit's
+        # candidate-miss check silently reports 0 forever — the exact bug
+        # this whole detect-low/filter-later design exists to prevent.
+        p.error(
+            f"--sweep-threshold {a.sweep_threshold} must be strictly below both "
+            f"--face-threshold {a.face_threshold} and --lp-threshold {a.lp_threshold}; "
+            f"otherwise the audit's low-confidence band is empty and the "
+            f"candidate-miss check can never fire."
+        )
+    if a.probe_frames_dir is None:
+        a.probe_frames_dir = a.output_dir.parent / f"{a.output_dir.name}-probe-DO-NOT-SHIP"
 
     return Config(
         input_dir=a.input_dir,
@@ -317,6 +324,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         no_watchdog=a.no_watchdog,
         skip_shutdown=a.skip_shutdown,
         force_reprocess=a.force_reprocess,
+        probe_frames_dir=a.probe_frames_dir,
     )
 
 
@@ -426,6 +434,15 @@ def preflight(cfg: Config) -> dict:
                     f"Refusing to run inference on unexpected model bytes."
                 )
             report[f"{label}_sha256_verified"] = True
+
+    if cfg.forced_boxes is not None and not cfg.forced_boxes.exists():
+        # Checked here, before any GPU time: these are faces a human already
+        # confirmed were missed, so silently running without them republishes
+        # a known face.
+        raise RuntimeError(
+            f"--forced-boxes {cfg.forced_boxes} does not exist. Refusing to "
+            f"start a remediation run that would silently skip them."
+        )
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     du = shutil.disk_usage(cfg.output_dir)
@@ -761,19 +778,28 @@ def build_detectors(cfg: Config) -> tuple[str, Any, Any]:
                 "Gen1 pair (--face-weights-gen1 + --lp-weights-gen1)."
             )
 
+    # Detectors run at the SWEEP floor, not the operating threshold. This is
+    # load-bearing, not a tuning choice: constructing them at the operating
+    # threshold makes check_low_threshold_sweep() structurally dead, because
+    # it looks for scores in [sweep, operating) and the detector has already
+    # dropped every one of them. The operating threshold is applied later,
+    # in process_clip(), when choosing which detections feed redaction — so
+    # what actually gets grayed out is unchanged, but the audit can finally
+    # see the low-confidence band it exists to inspect.
     if use_gen2:
-        log.info("using Gen2 detector (batched)")
+        log.info("using Gen2 detector (batched), detecting down to %.2f", cfg.sweep_threshold)
         face = Gen2Detector(cfg.face_weights_gen2, "face", cfg.device,
-                             cfg.face_threshold, cfg.nms_iou)
+                             cfg.sweep_threshold, cfg.nms_iou)
         lp = Gen2Detector(cfg.lp_weights_gen2, "lp", cfg.device,
-                           cfg.lp_threshold, cfg.nms_iou)
+                           cfg.sweep_threshold, cfg.nms_iou)
         return "2", face, lp
 
-    log.info("using Gen1 detector (single-image, no batching — see module docstring)")
+    log.info("using Gen1 detector (single-image, no batching — see module docstring), "
+              "detecting down to %.2f", cfg.sweep_threshold)
     face = Gen1Detector(cfg.face_weights_gen1, "face", cfg.device,
-                         cfg.face_threshold, cfg.nms_iou)
+                         cfg.sweep_threshold, cfg.nms_iou)
     lp = Gen1Detector(cfg.lp_weights_gen1, "lp", cfg.device,
-                       cfg.lp_threshold, cfg.nms_iou)
+                       cfg.sweep_threshold, cfg.nms_iou)
     return "1", face, lp
 
 
@@ -908,22 +934,49 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
     proc.terminate()
     proc.wait()
 
+    # Run the probe through the SAME batch size production uses. Passing all
+    # --probe-frames (default 600) as one batch meant ~3.7 GB of BGR frames,
+    # doubled by np.stack's contiguous copy, then a 600-image GPU batch — 75x
+    # the production BATCH — which OOMs any rentable card. The failure path
+    # deliberately leaves the pod up for debugging, so that OOM burned the
+    # full watchdog window for zero output.
     t0 = time.monotonic()
-    face_dets = face_det.detect_batch(sampled_bgr, sampled_idx)
-    lp_dets = lp_det.detect_batch(sampled_bgr, sampled_idx)
+    face_dets: list[Detection] = []
+    lp_dets: list[Detection] = []
+    for i in range(0, len(sampled_bgr), DETECT_BATCH):
+        chunk = sampled_bgr[i:i + DETECT_BATCH]
+        chunk_idx = sampled_idx[i:i + DETECT_BATCH]
+        face_dets.extend(face_det.detect_batch(chunk, chunk_idx))
+        lp_dets.extend(lp_det.detect_batch(chunk, chunk_idx))
     detect_s = time.monotonic() - t0
     ms_per_frame = 1000 * detect_s / max(1, len(sampled_bgr))
 
-    _write_probe_frames(cfg.output_dir / "probe_frames", sampled_bgr, sampled_idx,
-                         face_dets + lp_dets)
+    # Probe frames are crops of the ORIGINAL, UNREDACTED footage — the one
+    # place in this job that writes identifiable faces to disk. They must
+    # never land in output_dir, which is the tree that gets synced off the
+    # pod and published, and they are only worth writing when a human is
+    # actually sitting there to look at them (--probe-only).
+    if cfg.probe_only:
+        _write_probe_frames(cfg.probe_frames_dir, sampled_bgr, sampled_idx,
+                             face_dets + lp_dets)
+        log.warning(
+            "wrote %d UNREDACTED probe frames to %s — original faces, outside "
+            "the output dir on purpose. Do NOT sync or publish this directory; "
+            "delete it when you are done eyeballing the detections.",
+            min(len(sampled_bgr), 20), cfg.probe_frames_dir,
+        )
 
     total_detect_frames = sum(math.ceil(c.n_frames / stride) for c in clips)
     total_frames = sum(c.n_frames for c in clips)
     detect_hours = (total_detect_frames * ms_per_frame / 1000) / 3600
-    # Encode/verify are rough multipliers on total (not detect-sampled)
-    # frames — refined once real encode throughput is measured below.
-    est_encode_hours = total_frames / (60 * 3600)  # placeholder floor; see note
-    est_hours = detect_hours + est_encode_hours + 0.5  # + ingest/setup slack
+    # Encode and verify are NOT measured here — this is an assumed rate, and
+    # a real `-preset slow` 1080p encode runs well under it. Verify adds two
+    # more full decodes plus a YuNet pass per clip. Treat the estimate as a
+    # floor, which is why the watchdog check below exists as a second gate.
+    est_encode_hours = total_frames / (ASSUMED_ENCODE_FPS * 3600)
+    est_verify_hours = (2 * total_frames / (ASSUMED_DECODE_FPS * 3600)
+                         + total_detect_frames * ASSUMED_YUNET_MS / 1000 / 3600)
+    est_hours = detect_hours + est_encode_hours + est_verify_hours + 0.5
     est_usd = est_hours * cfg.gpu_rate_usd_per_hr
 
     report = {
@@ -934,20 +987,25 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
         "stride": stride,
         "total_detect_frames": total_detect_frames,
         "total_frames": total_frames,
+        "estimated_detect_hours": detect_hours,
+        "estimated_encode_hours": est_encode_hours,
+        "estimated_verify_hours": est_verify_hours,
         "estimated_hours": est_hours,
         "estimated_usd": est_usd,
         "budget_usd": cfg.budget_usd,
-        "probe_frames_dir": str(cfg.output_dir / "probe_frames"),
+        "watchdog_hours": None if cfg.no_watchdog else cfg.watchdog_hours,
     }
     log.info("probe: %s", json.dumps(report, indent=2))
     if len(face_dets) == 0 and len(lp_dets) == 0:
-        log.warning(
-            "probe found ZERO detections of either class across %d sampled "
-            "frames. Could be genuinely empty footage, or could be the "
-            "unverified Gen2 .inference()-bypass path (see module docstring) "
-            "silently returning nothing. Check probe_frames/*.jpg before "
-            "trusting a full run.",
-            len(sampled_bgr),
+        raise RuntimeError(
+            f"probe found ZERO detections of either class across "
+            f"{len(sampled_bgr)} sampled frames. That is either genuinely "
+            f"empty footage or — more likely — the unverified Gen2 "
+            f".inference() bypass path silently returning nothing (see the "
+            f"module docstring's list of unverified assumptions). Refusing "
+            f"to spend GPU hours producing a run that redacts nothing. "
+            f"Re-run with --probe-only and inspect the written frames, or "
+            f"pass --force if the footage really is empty."
         )
 
     if not cfg.force and est_usd > cfg.budget_usd:
@@ -955,6 +1013,18 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
             f"estimated ${est_usd:.2f} exceeds --budget-usd ${cfg.budget_usd:.2f}. "
             f"Pass --force to override, or lower cost (raise --detect-hz "
             f"stride implicitly via a lower rate, or reduce clip count)."
+        )
+    # The budget gate alone is not enough: at Gen1's documented ~2 fps the
+    # estimate can come in UNDER the dollar cap while still running past the
+    # watchdog, which then stops the pod mid-run — money spent, no complete
+    # output. Both numbers are right here, so check them together.
+    if not cfg.no_watchdog and not cfg.force and est_hours > cfg.watchdog_hours:
+        raise RuntimeError(
+            f"estimated {est_hours:.1f}h exceeds --watchdog-hours "
+            f"{cfg.watchdog_hours:.1f}; the watchdog would stop the pod "
+            f"mid-run and you would pay for a partial result. Raise "
+            f"--watchdog-hours, lower --detect-hz, split the clip set, or "
+            f"pass --force."
         )
     return report
 
@@ -991,12 +1061,12 @@ def _pack_yuv420p(y, u, v):
 
 
 # =============================================================================
-# Phase 3 — detection pass (checkpointed via contract shards, resumable)
+# Phase 3 — detection pass (checkpointed via per-clip JSONL, resumable)
 # =============================================================================
 
 
 def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
-                    shard_dir: Path, gen: str) -> list[Detection]:
+                    checkpoint_dir: Path) -> list[Detection]:
     """Checkpoint format: ONE JSONL line per ATTEMPTED sampled frame —
     `{"frame_idx": i, "detections": [...]}`, empty list included — not one
     line per detection. This is deliberate, fixing two real bugs a
@@ -1015,10 +1085,10 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
     done_frames: set[int] = set()
     detections: list[Detection] = []
 
-    # Resume checkpoint is the JSONL file below, not shards — shards
-    # (write_shard/read_shard) are the OUTPUT contract for downstream
-    # stages (laptop ingest), not this stage's own progress format.
-    jsonl_path = shard_dir / f"{clip.clip_id}.detections.jsonl"
+    # Resume checkpoint is the per-clip JSONL below. It is this stage's
+    # own progress format, not an output contract — the manifest and the
+    # redacted video are what downstream consumes.
+    jsonl_path = checkpoint_dir / f"{clip.clip_id}.detections.jsonl"
     if jsonl_path.exists():
         lines = jsonl_path.read_text(encoding="utf-8").splitlines()
         for i, line in enumerate(lines):
@@ -1051,7 +1121,6 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
     proc = open_decoder(ffmpeg, clip.path, stderr_log)
     batch_bgr, batch_idx = [], []
     frames_read = 0
-    BATCH = 8
 
     def flush():
         nonlocal detections
@@ -1085,7 +1154,7 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
             bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
             batch_bgr.append(bgr)
             batch_idx.append(idx)
-            if len(batch_bgr) >= BATCH:
+            if len(batch_bgr) >= DETECT_BATCH:
                 flush()
         idx += 1
         frames_read += 1
@@ -1115,6 +1184,11 @@ class Track:
     cls: str
     # frame_idx -> (box, source) where source in {"det", "interp", "hold"}
     frames: dict = field(default_factory=dict)
+    # Highest DETECTION frame index in `frames`. Kept as a field rather than
+    # recomputed with max(tr.frames): interpolation grows that dict by one
+    # entry per video frame, so scanning it once per detection frame is
+    # quadratic in how long the subject stays visible.
+    last_frame: int = -1
 
 
 def _iou(a: tuple, b: tuple) -> float:
@@ -1132,17 +1206,122 @@ def _iou(a: tuple, b: tuple) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _covered_fraction(box: tuple, fill_boxes: list[tuple]) -> float:
+    """What fraction of `box` is covered by the UNION of `fill_boxes`.
+
+    IoU is the wrong question for "did we redact this face", and it fails
+    in the dangerous direction. A face at (0,0,100,100) whose right half
+    only is filled by (50,0,150,100) scores IoU 0.33 — over any sane
+    threshold — so half an unredacted face reads as covered. The
+    symmetric error also bites: a small face fully inside a large dilated
+    box scores IoU 0.007 and reads as uncovered, hard-failing the clip
+    for nothing.
+
+    Union, not per-box: a face straddling two adjacent fill rectangles is
+    fully covered but overlaps neither one enough on its own.
+
+    Exact via coordinate compression rather than sampling — overlapping
+    rectangles can't just be summed. Cell count is O(n^2) in the number
+    of fill boxes that touch this one, and n is a handful per frame.
+    """
+    x1, y1, x2, y2 = box
+    area = (x2 - x1) * (y2 - y1)
+    if area <= 0:
+        return 1.0  # degenerate box encloses no pixels, so nothing can leak
+
+    clipped = []
+    for bx1, by1, bx2, by2 in fill_boxes:
+        cx1, cy1 = max(x1, bx1), max(y1, by1)
+        cx2, cy2 = min(x2, bx2), min(y2, by2)
+        if cx2 > cx1 and cy2 > cy1:
+            clipped.append((cx1, cy1, cx2, cy2))
+    if not clipped:
+        return 0.0
+
+    xs = sorted({x1, x2}.union(c[0] for c in clipped).union(c[2] for c in clipped))
+    ys = sorted({y1, y2}.union(c[1] for c in clipped).union(c[3] for c in clipped))
+    covered = 0.0
+    for i in range(len(xs) - 1):
+        for j in range(len(ys) - 1):
+            mx = (xs[i] + xs[i + 1]) / 2
+            my = (ys[j] + ys[j + 1]) / 2
+            for bx1, by1, bx2, by2 in clipped:
+                if bx1 <= mx <= bx2 and by1 <= my <= by2:
+                    covered += (xs[i + 1] - xs[i]) * (ys[j + 1] - ys[j])
+                    break
+    return covered / area
+
+
+def _box_is_covered(box: tuple, fill_boxes: list[tuple]) -> bool:
+    return _covered_fraction(box, fill_boxes) >= COVERAGE_MIN_FRAC
+
+
+def _apply_forced_boxes(path: Path, clip: ClipInfo, fill_map: dict) -> int:
+    """Merge human-supplied "you missed this face" boxes into fill_map.
+
+    Every failure here is loud, because this is the remediation path: the
+    boxes are by definition faces a human already confirmed the detector
+    missed, so a silently-skipped file republishes a known face. Previously
+    a typo'd path just failed an `.exists()` test with no warning, and a
+    clip_id that didn't match any key logged "applied 0 forced boxes" —
+    which reads like success.
+
+    Boxes are clamped to the frame here, once, rather than trusted by the
+    three consumers downstream; an unclamped negative coordinate reaching
+    check_fill_integrity()'s slice produced an empty array and a ValueError
+    from np.max, which main() then recorded as a FAILED clip. A reviewer
+    covering a face at the frame edge naturally draws a box that starts
+    slightly off-screen.
+    """
+    if not path.exists():
+        raise RuntimeError(
+            f"--forced-boxes {path} does not exist. These are faces a human "
+            f"confirmed were missed — refusing to run as though they were applied."
+        )
+    forced = json.loads(path.read_text(encoding="utf-8"))
+    if clip.clip_id not in forced:
+        log.warning(
+            "%s: --forced-boxes %s has no entry for this clip (keys: %s). If you "
+            "meant to cover a face here, the key must match the clip_id exactly.",
+            clip.clip_id, path, sorted(forced)[:10],
+        )
+        return 0
+
+    n = 0
+    for entry in forced[clip.clip_id]:
+        x1, y1, x2, y2 = (float(v) for v in entry["box"])
+        cx1, cy1 = max(0.0, min(x1, x2)), max(0.0, min(y1, y2))
+        cx2 = min(float(clip.width), max(x1, x2))
+        cy2 = min(float(clip.height), max(y1, y2))
+        if cx2 <= cx1 or cy2 <= cy1:
+            log.warning("%s: forced box %s on frame %s is empty after clamping — skipped",
+                         clip.clip_id, entry["box"], entry["frame_idx"])
+            continue
+        fill_map.setdefault(int(entry["frame_idx"]), []).append((cx1, cy1, cx2, cy2))
+        n += 1
+    if n == 0:
+        raise RuntimeError(
+            f"--forced-boxes listed {clip.clip_id} but no usable box survived "
+            f"clamping to {clip.width}x{clip.height}. Refusing to report a "
+            f"remediation run that redacted nothing new."
+        )
+    return n
+
+
 def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float,
-                  hold_frames: int) -> list[Track]:
+                  hold_frames: int, back_hold_frames: int = 0) -> list[Track]:
     """Greedy nearest-IoU association across consecutive DETECTION frames
     (not every video frame — detections are already sparse at detect_hz),
     then linear interpolation across the gap between consecutive detection
     frames of one track, then a hold for `hold_frames` video-frames past
-    the last real detection. This — not re-detection — is where most of
-    the actual recall against missed frames comes from: a face seen at
-    detection-frame k-1 and k+1 stays covered at every frame in between
-    even when the detector missed the frame(s) that would have covered
-    them directly."""
+    the last real detection and `back_hold_frames` before the first. This —
+    not re-detection — is where most of the actual recall against missed
+    frames comes from: a face seen at detection-frame k-1 and k+1 stays
+    covered at every frame in between even when the detector missed the
+    frame(s) that would have covered them directly.
+
+    Pass back_hold_frames=stride so the frames between a face appearing and
+    its first detection sample are covered too (see the hold loop below)."""
     by_frame: dict[int, list[Detection]] = {}
     for d in detections:
         w = d.box[2] - d.box[0]
@@ -1179,13 +1358,27 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
             # hold_frames as the max gap keeps this consistent with the
             # forward-hold semantics below: a track's identity is trusted
             # for exactly as long as its coverage is trusted.
+            #
+            # max_gap is at LEAST one detection stride. Using hold_frames
+            # alone silently breaks tracking whenever stride > hold_frames
+            # (e.g. --detect-hz 0.5 on 30fps gives stride 60 vs the auto
+            # hold of 30): every track is evicted before it can ever match
+            # its second detection, so interpolation never runs and the
+            # frames between two sightings of the SAME stationary face go
+            # unredacted — with no warning and a PASS status.
+            #
+            # tr.last_frame, not max(tr.frames): _interpolate() grows that
+            # dict by `stride` entries per detection frame, so re-scanning
+            # it here and again below is quadratic in track lifetime — for
+            # one subject visible through a 1.5h clip that measured out to
+            # ~8.7e9 key visits, minutes of pure Python with the GPU idle.
+            max_gap = max(hold_frames, back_hold_frames)
             active[cls] = [tr for tr in active[cls]
-                           if frame_idx - max(tr.frames) <= hold_frames]
+                           if frame_idx - tr.last_frame <= max_gap]
 
-            still_active = []
             used = set()
             for tr in active[cls]:
-                last_frame = max(tr.frames)
+                last_frame = tr.last_frame
                 last_box = tr.frames[last_frame][0]
                 best_iou, best_j = 0.0, -1
                 for j, d in enumerate(cur_dets):
@@ -1200,28 +1393,38 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                     if frame_idx > last_frame + 1:
                         _interpolate(tr, last_frame, last_box, frame_idx, d.box)
                     tr.frames[frame_idx] = (d.box, "det")
-                    still_active.append(tr)
-                else:
-                    still_active.append(tr)  # kept alive for hold_frames, see below
-            active[cls] = still_active
+                    tr.last_frame = frame_idx
+                # An unmatched track stays active until max_gap evicts it
+                # above; the previous rebuild-into-still_active was a no-op
+                # (both branches appended) and is gone.
 
             for j, d in enumerate(cur_dets):
                 if j in used:
                     continue
-                tr = Track(track_id=next_id, cls=cls)
+                tr = Track(track_id=next_id, cls=cls, last_frame=frame_idx)
                 next_id += 1
                 tr.frames[frame_idx] = (d.box, "det")
                 tracks.append(tr)
                 active[cls].append(tr)
 
-    # Hold: extend each track hold_frames video-frames past its last real
-    # detection, repeating the last known box. Interpolation already ran
-    # above between consecutive detections of the SAME track.
+    # Hold FORWARD past the last detection, and BACKWARD before the first.
+    # The backward hold is not symmetry for its own sake: detection only
+    # samples every `stride` video-frames, so a face that walks into shot
+    # between two samples is visible — and published unredacted — for up to
+    # stride-1 frames before its first detection. Nothing downstream can
+    # catch that: fill_integrity only inspects frames the fill_map already
+    # claims, and YuNet samples on the same stride, so it looks at the very
+    # frame that IS covered.
     for tr in tracks:
         last_frame = max(tr.frames)
         last_box, _ = tr.frames[last_frame]
         for f in range(last_frame + 1, last_frame + 1 + hold_frames):
             tr.frames.setdefault(f, (last_box, "hold"))
+
+        first_frame = min(tr.frames)
+        first_box, _ = tr.frames[first_frame]
+        for f in range(max(0, first_frame - back_hold_frames), first_frame):
+            tr.frames.setdefault(f, (first_box, "hold"))
 
     return tracks
 
@@ -1292,6 +1495,17 @@ def redact_frame_inplace(y, u, v, boxes: list[tuple], mode: str) -> bool:
             region = y[iy1:iy2, ix1:ix2]
             k = max(3, (min(region.shape) // 2) | 1)  # odd kernel
             y[iy1:iy2, ix1:ix2] = cv2.GaussianBlur(region, (k, k), 0)
+            # Chroma must be blurred too. Blurring luma alone leaves the
+            # face's original hue and saturation intact at full chroma
+            # resolution under a soft-looking grey — which is exactly the
+            # leak check_fill_integrity()'s docstring describes, and blur
+            # mode has no integrity check to catch it.
+            cy1, cx1 = iy1 // 2, ix1 // 2
+            cy2, cx2 = max(cy1 + 1, (iy2 + 1) // 2), max(cx1 + 1, (ix2 + 1) // 2)
+            for plane in (u, v):
+                creg = plane[cy1:cy2, cx1:cx2]
+                ck = max(3, (min(creg.shape) // 2) | 1)
+                plane[cy1:cy2, cx1:cx2] = cv2.GaussianBlur(creg, (ck, ck), 0)
     return touched
 
 
@@ -1359,7 +1573,8 @@ def redact_and_encode(cfg: Config, clip: ClipInfo, fill_map: dict, ffmpeg: str,
 
 
 def check_fill_integrity(ffmpeg: str, out_path: Path, w: int, h: int,
-                          fill_map: dict, mode: str, stderr_log: Path) -> dict:
+                          fill_map: dict, mode: str, stderr_log: Path,
+                          n_frames: int) -> dict:
     """Only meaningful for mode='fill': every redacted region is a
     constant value, so this is an EXACT invariant, not a heuristic
     threshold on variance-of-Laplacian. Erode 2px to skip DCT ringing at
@@ -1376,19 +1591,28 @@ def check_fill_integrity(ffmpeg: str, out_path: Path, w: int, h: int,
     as fill_integrity_unverifiable so a gap in coverage is visible in the
     audit instead of invisible."""
     if mode != "fill":
-        return {"skipped": "mode != fill"}
+        return {"integrity_skipped": f"mode={mode} has no exact-invariant check"}
     import numpy as np
 
     proc = open_decoder(ffmpeg, out_path, stderr_log)
     violations = 0
     checked = 0
     unverifiable = 0
+    frames_seen = 0
     for idx, (y, u, v) in enumerate(read_frames(proc, w, h)):
+        frames_seen = idx + 1
         boxes = fill_map.get(idx)
         if not boxes:
             continue
         for x1, y1, x2, y2 in boxes:
-            ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+            # Clamp exactly as redact_frame_inplace does. fill_map boxes from
+            # dilate_box() are already in range, but --forced-boxes entries
+            # reach here raw; a negative coord makes numpy wrap to a high
+            # index, the slice comes back empty, and np.max raises
+            # "zero-size array to reduction operation" — recorded as a
+            # FAILED clip on the human remediation path.
+            ix1, iy1 = max(0, int(x1)), max(0, int(y1))
+            ix2, iy2 = min(w, int(x2)), min(h, int(y2))
             eix1, eiy1, eix2, eiy2 = ix1 + 2, iy1 + 2, ix2 - 2, iy2 - 2
             if eix2 <= eix1 or eiy2 <= eiy1:
                 eix1, eiy1, eix2, eiy2 = ix1, iy1, ix2, iy2  # too small to erode — check raw
@@ -1408,10 +1632,27 @@ def check_fill_integrity(ffmpeg: str, out_path: Path, w: int, h: int,
             if not planes_ok:
                 violations += 1
     proc.wait()
+    # Fail CLOSED. A decode that dies or truncates yields zero frames, the
+    # loop body never runs, and violations stays 0 — which reads exactly
+    # like "verified clean". detection_pass() already guards this same risk
+    # with a frames_read assertion; the two checks that actually gate the
+    # privacy claim were the two without it.
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"integrity decode of {out_path} exited {proc.returncode} "
+            f"(see {stderr_log}) — refusing to report it as verified."
+        )
+    if frames_seen != n_frames:
+        raise RuntimeError(
+            f"integrity decode of {out_path} yielded {frames_seen} frames, "
+            f"expected {n_frames}. A short decode reads as zero violations, "
+            f"so this cannot be treated as a clean verification."
+        )
     return {
         "fill_integrity_checked": checked,
         "fill_integrity_violations": violations,
         "fill_integrity_unverifiable": unverifiable,
+        "fill_integrity_frames": frames_seen,
     }
 
 
@@ -1427,7 +1668,7 @@ def check_low_threshold_sweep(detections: list[Detection], fill_map: dict,
         if not (sweep_threshold <= d.score < op_thresh):
             continue
         boxes = fill_map.get(d.frame_idx, [])
-        covered = any(_iou(d.box, b) > 0.1 for b in boxes)
+        covered = _box_is_covered(d.box, boxes)
         if not covered:
             candidates.append(d)
     return {
@@ -1439,7 +1680,7 @@ def check_low_threshold_sweep(detections: list[Detection], fill_map: dict,
 
 
 def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
-                 fill_map: dict, detect_hz: float, fps: float) -> dict:
+                 fill_map: dict, detect_hz: float, fps: float, n_frames: int) -> dict:
     """Second, independent detector — different training distribution
     (WIDER FACE, not egocentric) and inductive biases from EgoBlur, so it
     catches a different slice of misses. MIT-licensed, ships inside
@@ -1455,7 +1696,7 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
             "missed faces is the low-threshold sweep alone.",
             out_path.stem,
         )
-        return {"skipped": "no --yunet-model provided"}
+        return {"yunet_skipped": "no --yunet-model provided"}
     import cv2
 
     detector = cv2.FaceDetectorYN.create(str(cfg.yunet_model), "", (w, h))
@@ -1463,7 +1704,9 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
     stderr_log = cfg.output_dir / "logs" / f"{out_path.stem}.yunet_decode.stderr.log"
     proc = open_decoder(ffmpeg, out_path, stderr_log)
     uncovered = []
+    frames_seen = 0
     for idx, (y, u, v) in enumerate(read_frames(proc, w, h)):
+        frames_seen = idx + 1
         if idx % stride != 0:
             continue
         yuv = _pack_yuv420p(y, u, v)
@@ -1473,13 +1716,37 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
             continue
         boxes_here = fill_map.get(idx, [])
         for f in faces:
-            if f[4] < 0.5:  # cv2 FaceDetectorYN score column
+            # cv2.FaceDetectorYN.detect returns [n, 15]: 0-1 bbox xy, 2-3 wh,
+            # 4-5 RIGHT EYE xy, 6-7 left eye, 8-9 nose, 10-13 mouth corners,
+            # 14 face score. Reading f[4] as the score (an earlier bug here)
+            # compares an eye's pixel x against 0.5 — always true — so the
+            # confidence gate never fired and a pixel coordinate was recorded
+            # and displayed as "score" all the way into the review page.
+            score = float(f[YUNET_SCORE_COL])
+            if score < YUNET_SCORE_MIN:
                 continue
             box = (float(f[0]), float(f[1]), float(f[0] + f[2]), float(f[1] + f[3]))
-            if not any(_iou(box, b) > 0.1 for b in boxes_here):
-                uncovered.append({"frame_idx": idx, "box": box, "score": float(f[4])})
+            if not _box_is_covered(box, boxes_here):
+                uncovered.append({"frame_idx": idx, "box": box, "score": score})
     proc.wait()
-    return {"n_yunet_uncovered": len(uncovered), "yunet_uncovered": uncovered[:200]}
+    # Fail closed, same reasoning as check_fill_integrity: a dead decode
+    # produces zero uncovered faces, which is indistinguishable from a
+    # genuinely clean pass.
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"YuNet decode of {out_path} exited {proc.returncode} "
+            f"(see {stderr_log}) — refusing to report it as verified."
+        )
+    if frames_seen != n_frames:
+        raise RuntimeError(
+            f"YuNet decode of {out_path} yielded {frames_seen} frames, "
+            f"expected {n_frames} — a short decode reads as zero findings."
+        )
+    return {
+        "n_yunet_uncovered": len(uncovered),
+        "yunet_uncovered": uncovered[:AUDIT_MAX_ITEMS],
+        "yunet_frames": frames_seen,
+    }
 
 
 def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
@@ -1492,33 +1759,62 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
     fill match the fill_map', so a nonzero count from either is a hard
     fail here too, by design biased toward over-flagging (the sweep WILL
     have false positives) rather than ever silently reporting PASS on an
-    unreviewed candidate miss."""
-    yunet_ran = "skipped" not in yunet
-    hard_fail = (
-        integrity.get("fill_integrity_violations", 0) > 0
-        or sweep.get("n_candidate_misses", 0) > 0
-        or (yunet_ran and yunet.get("n_yunet_uncovered", 0) > 0)
-    )
-    status = "NEEDS_REVIEW" if hard_fail else "PASS_AUTOMATED"
+    unreviewed candidate miss.
+
+    A check that did not RUN is never treated as a check that passed. The
+    integrity check is skipped entirely under --redaction blur, and YuNet
+    is skipped without --yunet-model; both previously contributed 0 to
+    hard_fail via .get(..., 0), so a blur-mode run with no YuNet model
+    could report PASS having verified literally nothing.
+
+    The zero-coverage canary is the other half. Every term above is a
+    count, and every count is 0 when the detector returns NOTHING — so a
+    run where detection silently produced no boxes at all (a wrong dtype,
+    a wrong class mapping, a dead model) redacted nothing, verified
+    nothing, and reported PASS. `max_fill_area_frac` guarded against too
+    MUCH fill; nothing guarded against none."""
+    yunet_ran = "yunet_skipped" not in yunet
+    integrity_ran = "integrity_skipped" not in integrity
+
+    reasons = []
+    if integrity.get("fill_integrity_violations", 0) > 0:
+        reasons.append("fill_integrity_violations > 0")
+    if sweep.get("n_candidate_misses", 0) > 0:
+        reasons.append("low-threshold sweep found uncovered candidates")
+    if yunet_ran and yunet.get("n_yunet_uncovered", 0) > 0:
+        reasons.append("YuNet found uncovered faces")
+    if not integrity_ran:
+        reasons.append(f"integrity check did not run ({integrity.get('integrity_skipped')})")
+    if fill_stats.get("n_frames_with_fill", 0) == 0 and clip.n_frames > 0:
+        reasons.append("ZERO frames were redacted — detection produced nothing")
+    if integrity_ran and integrity.get("fill_integrity_checked", 0) == 0 \
+            and fill_stats.get("n_frames_with_fill", 0) > 0:
+        reasons.append("integrity verified zero boxes despite a non-empty fill_map")
+
+    status = "NEEDS_REVIEW" if reasons else "PASS_AUTOMATED"
     if status == "PASS_AUTOMATED" and not yunet_ran:
         status = "PASS_AUTOMATED_NO_YUNET"  # a real but weaker claim — say so
     return {
         "clip_id": clip.clip_id,
         "status": status,
-        "yunet_ran": yunet_ran,  # explicit, not inferred from a "skipped" key
-        # that also appears (for an unrelated reason — blur vs fill mode)
-        # in **integrity below, and would collide when flattened.
+        "status_reasons": reasons,
+        # Explicit, not inferred from a shared "skipped" key: integrity and
+        # yunet each had one, for unrelated reasons, and they collided when
+        # flattened into this dict.
+        "yunet_ran": yunet_ran,
+        "integrity_ran": integrity_ran,
         "gen": gen,
         "note": (
             "Re-running the detector on the redacted output cannot find a "
             "face the detector missed in pass 1 — those pixels are "
             "unchanged, so the same detector at the same threshold misses "
-            "them again by construction; fill_integrity_violations alone "
-            "therefore does NOT gate status here. The checks with real "
-            "power against misses are the low-threshold sweep on the "
-            "ORIGINAL pixels and the independent YuNet pass — both feed "
-            "hard_fail directly, since a nonzero count from either means a "
-            "specific frame needs a human look before this clip ships."
+            "them again by construction. fill_integrity_violations gates "
+            "status but is NOT sufficient alone: it can only prove that "
+            "boxes which already exist are grey. The checks with real power "
+            "against a face that was never boxed are the low-threshold "
+            "sweep on the ORIGINAL pixels and the independent YuNet pass. A "
+            "check that did not run counts as a failure, not a pass, and a "
+            "clip where nothing at all was redacted is always NEEDS_REVIEW."
         ),
         **fill_stats,
         **integrity,
@@ -1607,7 +1903,7 @@ def shutdown_pod() -> None:
 
 
 def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
-                  ffmpeg: str, shard_dir: Path) -> dict:
+                  ffmpeg: str, checkpoint_dir: Path) -> dict:
     manifest_path = cfg.output_dir / f"{clip.clip_id}.manifest.json"
     if manifest_path.exists() and not cfg.force_reprocess:
         # A restart after clip N crashed must not silently re-decode +
@@ -1616,28 +1912,49 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
         # redact_and_encode()/check_fill_integrity()/check_yunet() have no
         # such checkpoint and would otherwise unconditionally overwrite an
         # already-audited, possibly already-delivered output file.
-        existing = json.loads(manifest_path.read_text())
-        log.info("%s: manifest already exists (status=%s) — skipping, pass "
-                  "--force-reprocess to redo", clip.clip_id, existing.get("status"))
-        return existing["audit"]
+        try:
+            existing = json.loads(manifest_path.read_text())
+            cached_audit = existing["audit"]
+        except (json.JSONDecodeError, KeyError) as e:
+            # A manifest torn by a kill mid-write would otherwise make this
+            # clip permanently FAILED: the file still exists, so every
+            # subsequent run re-parses it and re-raises, even though the
+            # .blurred.mp4 beside it may be perfectly good. Reprocess
+            # instead of getting stuck.
+            log.warning("%s: manifest exists but is unreadable (%s) — reprocessing",
+                         clip.clip_id, e)
+        else:
+            log.info("%s: manifest already exists (status=%s) — skipping, pass "
+                      "--force-reprocess to redo", clip.clip_id, existing.get("status"))
+            return cached_audit
 
     t0 = time.monotonic()
     log.info("=== %s ===", clip.clip_id)
 
-    detections = detection_pass(cfg, clip, face_det, lp_det, ffmpeg, shard_dir, gen)
+    detections = detection_pass(cfg, clip, face_det, lp_det, ffmpeg, checkpoint_dir)
     t_detect = time.monotonic()
 
+    # Detectors ran down to cfg.sweep_threshold (see build_detectors). Only
+    # the above-operating-threshold subset drives redaction; the full list —
+    # including the low-confidence band — goes to the audit, which is the
+    # whole point of detecting below the operating threshold.
+    operating = {"face": cfg.face_threshold, "lp": cfg.lp_threshold}
+    redact_dets = [d for d in detections if d.score > operating[d.cls]]
+    log.info("%s: %d detections total, %d above operating threshold (redacted), "
+              "%d in the audit sweep band", clip.clip_id, len(detections),
+              len(redact_dets), len(detections) - len(redact_dets))
+
     hold_frames = cfg.hold_frames or round(clip.fps)
-    tracks = build_tracks(detections, cfg.min_box_px, iou_thresh=0.2, hold_frames=hold_frames)
+    stride = max(1, round(clip.fps / cfg.detect_hz))
+    tracks = build_tracks(redact_dets, cfg.min_box_px, iou_thresh=TRACK_IOU_DEFAULT,
+                           hold_frames=hold_frames, back_hold_frames=stride)
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
+    del tracks  # ~260 MB of per-frame entries; nothing below reads it again
 
-    if cfg.forced_boxes and cfg.forced_boxes.exists():
-        forced = json.loads(cfg.forced_boxes.read_text())
-        for entry in forced.get(clip.clip_id, []):
-            fill_map.setdefault(entry["frame_idx"], []).append(tuple(entry["box"]))
-        log.info("%s: applied %d forced boxes from human review",
-                  clip.clip_id, len(forced.get(clip.clip_id, [])))
+    if cfg.forced_boxes is not None:
+        n_forced = _apply_forced_boxes(cfg.forced_boxes, clip, fill_map)
+        log.info("%s: applied %d forced boxes from human review", clip.clip_id, n_forced)
 
     out_path = cfg.output_dir / f"{clip.clip_id}.blurred.mp4"
     fill_stats = redact_and_encode(cfg, clip, fill_map, ffmpeg, out_path)
@@ -1645,13 +1962,13 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
 
     integrity_log = cfg.output_dir / "logs" / f"{clip.clip_id}.integrity_decode.stderr.log"
     integrity = check_fill_integrity(ffmpeg, out_path, clip.width, clip.height,
-                                      fill_map, cfg.redaction, integrity_log)
+                                      fill_map, cfg.redaction, integrity_log,
+                                      clip.n_frames)
     sweep = check_low_threshold_sweep(
-        detections, fill_map, cfg.sweep_threshold,
-        {"face": cfg.face_threshold, "lp": cfg.lp_threshold},
+        detections, fill_map, cfg.sweep_threshold, operating,
     )
     yunet = check_yunet(cfg, ffmpeg, out_path, clip.width, clip.height,
-                         fill_map, cfg.detect_hz, clip.fps)
+                         fill_map, cfg.detect_hz, clip.fps, clip.n_frames)
     t_verify = time.monotonic()
 
     audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen)
@@ -1689,8 +2006,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
-        shard_dir = cfg.output_dir / "shards"
-        shard_dir.mkdir(exist_ok=True)
+        checkpoint_dir = cfg.output_dir / "checkpoints"
+        checkpoint_dir.mkdir(exist_ok=True)
 
         # One bad clip (corrupt file, a transient CUDA error) must not
         # abort clips that haven't been attempted yet — that would leave
@@ -1700,7 +2017,7 @@ def main(argv: list[str] | None = None) -> int:
         failed_clip_ids = []
         for c in clips:
             try:
-                audits.append(process_clip(cfg, c, gen, face_det, lp_det, ffmpeg, shard_dir))
+                audits.append(process_clip(cfg, c, gen, face_det, lp_det, ffmpeg, checkpoint_dir))
             except Exception:
                 log.exception("%s: failed — continuing with remaining clips", c.clip_id)
                 failed_clip_ids.append(c.clip_id)
