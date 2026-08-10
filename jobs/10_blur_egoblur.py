@@ -430,6 +430,28 @@ def preflight(cfg: Config) -> dict:
     if "libx264" not in encoders:
         raise RuntimeError("ffmpeg build has no libx264 encoder — wrong image?")
 
+    # Every decode in this job passes -fps_mode, which needs ffmpeg >= 5.0.
+    # Ubuntu 22.04 still ships 4.4, which rejects it outright. ffprobe keeps
+    # working (its options are ancient and stable), so clip discovery passes
+    # and the FIRST decode yields zero bytes instead of an error the caller
+    # can see. That surfaced as "probe found zero detections" — a statement
+    # about the footage, from a binary that never decoded a single frame.
+    # Checking the option itself, not a parsed version string, because that
+    # is the thing that actually has to work.
+    opt_check = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+         "-i", "nullsrc=s=16x16:d=0.1", "-fps_mode", "passthrough",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    if opt_check.returncode != 0:
+        raise RuntimeError(
+            f"{ffmpeg} rejected -fps_mode, which every decode in this job "
+            f"uses (needs ffmpeg >= 5.0; 4.x fails exactly this way). Every "
+            f"decode would silently produce zero frames. ffmpeg said: "
+            f"{opt_check.stderr.strip()}"
+        )
+
     try:
         import torch
     except ImportError as e:
@@ -994,23 +1016,31 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
     per_clip = max(1, cfg.probe_frames // len(clips))
     sampled_bgr: list = []
     sampled_idx: list[int] = []
+    sampled_clip: list[str] = []
     stride = max(1, round(clips[0].fps / cfg.detect_hz))
     for clip in clips:
         stride = max(1, round(clip.fps / cfg.detect_hz))
         want = min(per_clip, max(1, clip.n_frames // stride))
+        # Spread the samples across the WHOLE clip. Sampling at the detection
+        # stride and stopping the moment `want` was reached only ever looked
+        # at the first want*stride frames — 60 seconds of a 4.5-minute clip —
+        # so "the probe found no faces" was a claim about the opening minute,
+        # not about the footage. A pipe can't seek, so this decodes the whole
+        # file either way; only the conversion of kept frames costs anything,
+        # and decode is cheap next to detection.
+        span = max(stride, clip.n_frames // max(1, want))
         proc = open_decoder(ffmpeg, clip.path,
                             cfg.output_dir / "logs" / f"probe_{clip.clip_id}.stderr.log")
         got = 0
         idx = 0
         for y, u, v in read_frames(proc, clip.width, clip.height):
-            if idx % stride == 0:
+            if idx % span == 0 and got < want:
                 import cv2
                 yuv = _pack_yuv420p(y, u, v)
                 sampled_bgr.append(cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420))
                 sampled_idx.append(idx)
+                sampled_clip.append(clip.clip_id)
                 got += 1
-                if got >= want:
-                    break
             idx += 1
         if proc.stdout is not None:
             proc.stdout.close()
@@ -1018,6 +1048,22 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
         proc.wait()
         if len(sampled_bgr) >= cfg.probe_frames:
             break
+
+    if not sampled_bgr:
+        # Fail CLOSED, for the same reason check_fill_integrity() and
+        # check_yunet() do. A decoder that dies produces zero frames, the
+        # detector is never called, and every count below is 0 — which came
+        # back worded as "probe found ZERO detections", indistinguishable
+        # from footage that genuinely has no faces. That is not theoretical:
+        # ffmpeg 4.4 rejected -fps_mode, emitted nothing at all, and this
+        # function reported it as a finding about the video.
+        raise RuntimeError(
+            f"probe sampled ZERO frames from {len(clips)} clip(s) — the "
+            f"decoder produced no output at all, so nothing was detected on "
+            f"and nothing here is a statement about your footage. See "
+            f"{cfg.output_dir / 'logs'}/probe_*.stderr.log for what ffmpeg "
+            f"actually said."
+        )
 
     # Run the probe through the SAME batch size production uses. Passing all
     # --probe-frames (default 600) as one batch meant ~3.7 GB of BGR frames,
@@ -1030,10 +1076,15 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
     lp_dets: list[Detection] = []
     for i in range(0, len(sampled_bgr), DETECT_BATCH):
         chunk = sampled_bgr[i:i + DETECT_BATCH]
-        chunk_idx = sampled_idx[i:i + DETECT_BATCH]
-        face_dets.extend(face_det.detect_batch(chunk, chunk_idx))
+        # POSITIONS into sampled_bgr, not clip-local frame numbers. Every
+        # clip has a frame 0, so clip-local indices collide across clips —
+        # which merged different clips' detections under one key and drew
+        # one clip's boxes onto another clip's image in the probe dump.
+        # _write_probe_frames maps positions back to (clip_id, frame_idx).
+        chunk_pos = list(range(i, i + len(chunk)))
+        face_dets.extend(face_det.detect_batch(chunk, chunk_pos))
         if lp_det is not None:
-            lp_dets.extend(lp_det.detect_batch(chunk, chunk_idx))
+            lp_dets.extend(lp_det.detect_batch(chunk, chunk_pos))
     detect_s = time.monotonic() - t0
     ms_per_frame = 1000 * detect_s / max(1, len(sampled_bgr))
 
@@ -1044,7 +1095,8 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
     # actually sitting there to look at them (--probe-only).
     if cfg.probe_only:
         _write_probe_frames(cfg.probe_frames_dir, sampled_bgr, sampled_idx,
-                             face_dets + lp_dets)
+                             sampled_clip, face_dets + lp_dets,
+                             {"face": cfg.face_threshold, "lp": cfg.lp_threshold})
         log.warning(
             "wrote %d UNREDACTED probe frames to %s — original faces, outside "
             "the output dir on purpose. Do NOT sync or publish this directory; "
@@ -1065,10 +1117,27 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
     est_hours = detect_hours + est_encode_hours + est_verify_hours + 0.5
     est_usd = est_hours * cfg.gpu_rate_usd_per_hr
 
+    # Raw counts are at the SWEEP FLOOR (0.10 by default), so most of them
+    # are deliberately-collected noise that never gets redacted — reading
+    # "424 face detections" as "424 faces" is wrong in the alarming
+    # direction, and reading a big license-plate count on indoor footage as
+    # a bug is wrong in the other (printed text on packaging scores ~0.2).
+    # The above-threshold counts are the ones that answer "would this run
+    # actually redact anything", so report both, side by side, always.
+    n_face_hot = sum(1 for d in face_dets if d.score > cfg.face_threshold)
+    n_lp_hot = sum(1 for d in lp_dets if d.score > cfg.lp_threshold)
+
     report = {
         "sampled_frames": len(sampled_bgr),
         "n_face_detections": len(face_dets),
         "n_lp_detections": len(lp_dets),
+        "n_face_above_threshold": n_face_hot,
+        "n_lp_above_threshold": n_lp_hot,
+        "max_face_score": max((d.score for d in face_dets), default=0.0),
+        "max_lp_score": max((d.score for d in lp_dets), default=0.0),
+        "face_threshold": cfg.face_threshold,
+        "lp_threshold": cfg.lp_threshold,
+        "sweep_threshold": cfg.sweep_threshold,
         "ms_per_frame_detect_both_models": ms_per_frame,
         "stride": stride,
         "total_detect_frames": total_detect_frames,
@@ -1124,23 +1193,70 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
 
 
 def _write_probe_frames(out_dir: Path, frames_bgr: list, frame_idxs: list[int],
-                         detections: list[Detection], max_images: int = 20) -> None:
+                         clip_ids: list[str], detections: list[Detection],
+                         operating: dict, max_images: int = 20) -> None:
+    """Annotated sample frames for a human to eyeball.
+
+    WHICH frames get written is the entire value of this function, and
+    taking the first N in order — what this used to do — is the worst
+    available choice. Samples are collected in order, so the reviewer got
+    frames 0, 3, 6 ... 57: twenty near-identical images of the first two
+    seconds of the first clip. That cannot answer "does the detector find
+    faces in this footage", which is the only question the probe exists to
+    answer. So the budget is split: half on the highest-scoring detections
+    ("is it right when it fires"), half on an even spread across the whole
+    sample ("what did it walk past").
+
+    Detections carry a POSITION into frames_bgr in .frame_idx, not a
+    clip-local frame number — every clip has a frame 0, so clip-local
+    indices collided across clips and drew one clip's boxes on another's
+    image. clip_ids/frame_idxs map positions back for the filename.
+
+    Boxes above the operating threshold are drawn thick and starred;
+    everything else is hairline. The detectors run at the sweep floor
+    (0.10), so most of what they return is deliberately sub-threshold and
+    never redacted — drawing it all identically makes a healthy probe look
+    alarming and buries the handful of boxes that would actually be burned
+    into the video.
+    """
     import cv2
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    by_idx: dict[int, list[Detection]] = {}
+    if not frames_bgr:
+        return
+    by_pos: dict[int, list[Detection]] = {}
     for d in detections:
-        by_idx.setdefault(d.frame_idx, []).append(d)
+        by_pos.setdefault(d.frame_idx, []).append(d)
 
-    for idx, bgr in list(zip(frame_idxs, frames_bgr, strict=True))[:max_images]:
-        img = bgr.copy()
-        for d in by_idx.get(idx, []):
+    # Highest-scoring first — a detection that would actually be redacted
+    # outranks one that wouldn't, so a real face always beats sweep noise
+    # even when the noise is numerically close.
+    ranked = sorted(
+        by_pos,
+        key=lambda p: -max((d.score + (1.0 if d.score > operating.get(d.cls, 1.0) else 0.0))
+                            for d in by_pos[p]),
+    )
+    chosen: list[int] = ranked[:max_images // 2]
+
+    step = max(1, len(frames_bgr) // max(1, max_images - len(chosen)))
+    for p in range(0, len(frames_bgr), step):
+        if len(chosen) >= max_images:
+            break
+        if p not in chosen:
+            chosen.append(p)
+
+    for pos in sorted(set(chosen))[:max_images]:
+        img = frames_bgr[pos].copy()
+        for d in by_pos.get(pos, []):
             x1, y1, x2, y2 = (int(v) for v in d.box)
+            hot = d.score > operating.get(d.cls, 1.0)
             color = (0, 255, 0) if d.cls == "face" else (0, 165, 255)
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(img, f"{d.cls} {d.score:.2f}", (x1, max(0, y1 - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        cv2.imwrite(str(out_dir / f"frame_{idx:08d}.jpg"), img)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 3 if hot else 1)
+            cv2.putText(img, f"{d.cls} {d.score:.2f}{'*REDACTED' if hot else ''}",
+                        (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        color, 2 if hot else 1)
+        cv2.imwrite(
+            str(out_dir / f"{clip_ids[pos]}_frame_{frame_idxs[pos]:08d}.jpg"), img)
 
 
 def _pack_yuv420p(y, u, v):

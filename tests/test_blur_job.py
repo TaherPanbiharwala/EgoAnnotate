@@ -8,9 +8,15 @@ directly.
 
 Deliberately NOT covered, because a mock would only pin the mock:
 Gen2Detector/Gen1Detector.detect_batch (need real weights and a GPU; the
-module docstring lists the specific unverified assumptions), probe_and_budget
-(its whole job is measuring real hardware), and arm_watchdog/shutdown_pod
-(need runpodctl and a live pod).
+module docstring lists the specific unverified assumptions), probe_and_budget's
+TIMING (its whole job there is measuring real hardware), and
+arm_watchdog/shutdown_pod (need runpodctl and a live pod).
+
+probe_and_budget's frame SELECTION is covered, and was not always: this file
+used to exempt the whole function on the "measures real hardware" argument,
+which quietly extended an honest exemption for the timing math to the pure
+logic sitting next to it. Four real bugs lived in that gap until the job was
+run against actual footage — see the probe section at the bottom.
 """
 
 from __future__ import annotations
@@ -734,3 +740,137 @@ def test_zero_coverage_reason_distinguishes_corroborated_from_unexplained(blur_j
                for r in corroborated["status_reasons"])
     assert any("nothing corroborates that" in r
                for r in unexplained["status_reasons"])
+
+
+# ---------------------------------------------------------------------------
+# Probe frame selection. This had NO coverage at all, and four real bugs
+# lived in it — found only by running it against real footage on a pod:
+#   1. _write_probe_frames took [:max_images] from a list built in order, so
+#      the 20 images a human reviews were frames 0,3,6..57 — the first TWO
+#      SECONDS of the first clip.
+#   2. probe_and_budget broke out of the decode loop the moment it had
+#      enough samples, so it only ever looked at the first 60 seconds of a
+#      4.5-minute clip. "The probe found no faces" was a claim about the
+#      opening minute.
+#   3. Detections were keyed by clip-local frame index, which collides
+#      across clips (every clip has a frame 0) — one clip's boxes were drawn
+#      onto another clip's image, and same-named files overwrote each other.
+#   4. Zero sampled frames was reported as "found zero detections" rather
+#      than raised, so a dead decoder read as a fact about the footage.
+# ---------------------------------------------------------------------------
+
+
+class _ProbeProc:
+    """probe_and_budget touches .stdout and .terminate(); _Proc does not."""
+
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+        self.stdout = None
+
+    def terminate(self):
+        pass
+
+    def wait(self):
+        return self.returncode
+
+
+class _FakeDetector:
+    """Emits a detection at chosen POSITIONS in the sampled list."""
+
+    def __init__(self, blur_job, cls, scores_by_pos=None):
+        self._blur_job = blur_job
+        self.cls = cls
+        self.scores_by_pos = scores_by_pos or {}
+        self.seen = []
+
+    def detect_batch(self, frames_bgr, frame_idxs):
+        self.seen.extend(frame_idxs)
+        return [
+            self._blur_job.Detection(frame_idx=p, cls=self.cls,
+                                     box=(1.0, 1.0, 20.0, 20.0),
+                                     score=self.scores_by_pos[p])
+            for p in frame_idxs if p in self.scores_by_pos
+        ]
+
+
+def _probe_setup(blur_job, monkeypatch, tmp_path, n_frames=100, probe_frames=20):
+    cfg = blur_job.parse_args(
+        ["--input-dir", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+         "--run-id", "r", "--probe-only", "--probe-frames", str(probe_frames)])
+    clip = _clip(blur_job, n_frames=n_frames)
+    frames = [_planes() for _ in range(n_frames)]
+    monkeypatch.setattr(blur_job, "open_decoder", lambda *a, **k: _ProbeProc())
+    monkeypatch.setattr(blur_job, "read_frames", lambda p, w, h: iter(frames))
+    return cfg, clip
+
+
+def test_probe_samples_span_the_whole_clip_not_just_the_opening(
+        blur_job, monkeypatch, tmp_path):
+    """Bug 2. With 100 frames and 20 wanted, the old code sampled at the
+    detection stride (3) and broke at 20 — reaching frame 57 and never
+    looking at the back two thirds of the clip."""
+    cfg, clip = _probe_setup(blur_job, monkeypatch, tmp_path)
+    seen = {}
+    monkeypatch.setattr(blur_job, "_write_probe_frames",
+                        lambda *a, **k: seen.update(idxs=list(a[2])))
+    blur_job.probe_and_budget(cfg, [clip], _FakeDetector(blur_job, "face"), None, "ffmpeg")
+    assert max(seen["idxs"]) > 0.8 * clip.n_frames, (
+        f"probe only reached frame {max(seen['idxs'])} of {clip.n_frames} — "
+        f"it is drawing conclusions from the opening of the clip only")
+
+
+def test_probe_fails_closed_when_the_decoder_yields_nothing(
+        blur_job, monkeypatch, tmp_path):
+    """Bug 4. ffmpeg 4.4 rejected -fps_mode and emitted zero bytes; this
+    function reported that as 'probe found ZERO detections'."""
+    cfg, clip = _probe_setup(blur_job, monkeypatch, tmp_path)
+    monkeypatch.setattr(blur_job, "read_frames", lambda p, w, h: iter([]))
+    with pytest.raises(RuntimeError, match="ZERO frames"):
+        blur_job.probe_and_budget(cfg, [clip], _FakeDetector(blur_job, "face"),
+                                   None, "ffmpeg")
+
+
+def test_probe_writes_the_highest_scoring_frames_not_the_first_ones(
+        blur_job, tmp_path):
+    """Bug 1. The one real detection sits at the END of the sample; taking
+    the first N images would miss it entirely."""
+    frames = [np.full((64, 64, 3), i % 256, np.uint8) for i in range(40)]
+    idxs = list(range(0, 400, 10))
+    clip_ids = ["c"] * 40
+    hot = blur_job.Detection(frame_idx=39, cls="face", box=(1.0, 1.0, 20.0, 20.0),
+                              score=0.95)
+    noise = [blur_job.Detection(frame_idx=i, cls="lp", box=(1.0, 1.0, 9.0, 9.0),
+                                 score=0.12) for i in range(5)]
+    out = tmp_path / "probe"
+    blur_job._write_probe_frames(out, frames, idxs, clip_ids, [hot, *noise],
+                                  {"face": 0.30, "lp": 0.40})
+    written = sorted(p.name for p in out.glob("*.jpg"))
+    assert any("00000390" in n for n in written), (
+        f"the only above-threshold detection (frame 390) was not written; "
+        f"got {written}")
+
+
+def test_probe_frames_from_two_clips_do_not_overwrite_each_other(
+        blur_job, tmp_path):
+    """Bug 3. Both clips have a frame 0; the filename was frame_{idx}.jpg."""
+    frames = [np.zeros((64, 64, 3), np.uint8) for _ in range(2)]
+    out = tmp_path / "probe"
+    blur_job._write_probe_frames(out, frames, [0, 0], ["clipA", "clipB"], [],
+                                  {"face": 0.30, "lp": 0.40})
+    assert len(list(out.glob("*.jpg"))) == 2, (
+        "two clips' frame 0 collapsed onto one filename")
+
+
+def test_probe_reports_above_threshold_counts_separately(
+        blur_job, monkeypatch, tmp_path):
+    """Raw counts are at the 0.10 sweep floor and are mostly deliberate
+    noise; the number that answers 'would this redact anything' is the
+    above-threshold one, and it must be reported in its own right."""
+    cfg, clip = _probe_setup(blur_job, monkeypatch, tmp_path)
+    # One real face, three pieces of sub-threshold sweep noise.
+    det = _FakeDetector(blur_job, "face", {0: 0.92, 1: 0.12, 2: 0.15, 3: 0.11})
+    monkeypatch.setattr(blur_job, "_write_probe_frames", lambda *a, **k: None)
+    rep = blur_job.probe_and_budget(cfg, [clip], det, None, "ffmpeg")
+    assert rep["n_face_detections"] == 4
+    assert rep["n_face_above_threshold"] == 1
+    assert rep["max_face_score"] == pytest.approx(0.92)
