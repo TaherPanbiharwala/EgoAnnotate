@@ -63,6 +63,38 @@ else
     }
 fi
 
+# --- ffprobe ------------------------------------------------------------
+# A SEPARATE binary from ffmpeg, and the two do not always ship together.
+# imageio-ffmpeg's wheel embeds ffmpeg only — the branch above never put
+# ffprobe on PATH. The first pod this script ran on happened to already
+# have an old system ffprobe (Ubuntu 22.04's package), so this went
+# unnoticed; a different base image with neither ffmpeg nor ffprobe
+# preinstalled hit "ffprobe: command not found" the moment the job's
+# preflight ran. ffprobe's VERSION does not matter for what this job asks
+# of it (see open_decoder's docstring — only ancient, stable options), so
+# try the cheapest source first and fall back to a source that needs
+# nothing but curl+tar, since we don't know what this base image ships.
+if command -v ffprobe >/dev/null 2>&1; then
+    echo ">> ffprobe already present"
+elif command -v apt-get >/dev/null 2>&1; then
+    echo ">> installing ffprobe via apt (its ffmpeg build is irrelevant — $BIN/ffmpeg wins on PATH)"
+    apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null
+else
+    echo ">> no apt-get on this image — pulling ffprobe from the same static-build"
+    echo "   source imageio-ffmpeg vendors, directly"
+    tmp="$(mktemp -d)"
+    curl -LsSf https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+        -o "$tmp/ffmpeg-static.tar.xz"
+    tar -xf "$tmp/ffmpeg-static.tar.xz" -C "$tmp"
+    cp "$tmp"/ffmpeg-*-amd64-static/ffprobe "$BIN/ffprobe"
+    chmod +x "$BIN/ffprobe"
+    rm -rf "$tmp"
+fi
+command -v ffprobe >/dev/null 2>&1 || {
+    echo "FATAL: still no ffprobe on PATH after both install paths" >&2
+    exit 1
+}
+
 echo
 echo "--- ready ---"
 echo "uv      : $(command -v uv) — $(uv --version)"
