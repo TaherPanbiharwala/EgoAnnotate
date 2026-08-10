@@ -711,3 +711,26 @@ def test_gen2_requires_only_face_weights(blur_job, tmp_path):
     cfg = blur_job.parse_args([*BASE_ARGS, "--gen", "2",
                                 "--face-weights-gen2", str(face)])
     assert cfg.face_weights_gen2 == face and cfg.lp_weights_gen2 is None
+
+
+def test_zero_coverage_reason_distinguishes_corroborated_from_unexplained(blur_job):
+    """Most of this project's footage is faceless kitchen video, so the
+    zero-coverage flag fires constantly. If every case reads identically the
+    reviewer stops reading it — so an independent detector agreeing there is
+    nothing here must be stated, while an uncorroborated zero stays alarming."""
+    corroborated = blur_job.build_audit(
+        _clip(blur_job), {"n_frames_with_fill": 0},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 0},
+        {"n_candidate_misses": 0}, {"n_yunet_uncovered": 0}, "2")
+    unexplained = blur_job.build_audit(
+        _clip(blur_job), {"n_frames_with_fill": 0},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 0},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2")
+
+    # Both still require a human — "we redacted nothing" never auto-passes.
+    assert corroborated["status"] == "NEEDS_REVIEW"
+    assert unexplained["status"] == "NEEDS_REVIEW"
+    assert any("YuNet independently found no faces" in r
+               for r in corroborated["status_reasons"])
+    assert any("nothing corroborates that" in r
+               for r in unexplained["status_reasons"])

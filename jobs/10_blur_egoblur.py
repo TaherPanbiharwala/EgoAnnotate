@@ -986,26 +986,38 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
     wheel source, but never executed against a real GPU) this is the
     cheapest available check that the detector is finding plausible faces
     at all, not silently returning garbage from a dtype/shape mismatch."""
-    biggest = max(clips, key=lambda c: c.n_frames)
-    stride = max(1, round(biggest.fps / cfg.detect_hz))
-    n_sample = min(cfg.probe_frames, biggest.n_frames // stride) or 1
-
-    proc = open_decoder(ffmpeg, biggest.path, cfg.output_dir / "logs" / "probe_decode.stderr.log")
-    sampled_bgr, sampled_idx = [], []
-    idx = 0
-    for y, u, v in read_frames(proc, biggest.width, biggest.height):
-        if idx % stride == 0:
-            import cv2
-            yuv = _pack_yuv420p(y, u, v)
-            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-            sampled_bgr.append(bgr)
-            sampled_idx.append(idx)
-            if len(sampled_bgr) >= n_sample:
-                break
-        idx += 1
-    proc.stdout.close()
-    proc.terminate()
-    proc.wait()
+    # Sample round-robin across EVERY clip, not just the largest one. The
+    # probe's conclusions ("is the detector alive", "what will this cost")
+    # are claims about the whole batch, so drawing them from one clip is
+    # unsound — and if that clip happens to be faceless, a batch-wide abort
+    # fires on evidence from a single file.
+    per_clip = max(1, cfg.probe_frames // len(clips))
+    sampled_bgr: list = []
+    sampled_idx: list[int] = []
+    stride = max(1, round(clips[0].fps / cfg.detect_hz))
+    for clip in clips:
+        stride = max(1, round(clip.fps / cfg.detect_hz))
+        want = min(per_clip, max(1, clip.n_frames // stride))
+        proc = open_decoder(ffmpeg, clip.path,
+                            cfg.output_dir / "logs" / f"probe_{clip.clip_id}.stderr.log")
+        got = 0
+        idx = 0
+        for y, u, v in read_frames(proc, clip.width, clip.height):
+            if idx % stride == 0:
+                import cv2
+                yuv = _pack_yuv420p(y, u, v)
+                sampled_bgr.append(cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420))
+                sampled_idx.append(idx)
+                got += 1
+                if got >= want:
+                    break
+            idx += 1
+        if proc.stdout is not None:
+            proc.stdout.close()
+        proc.terminate()
+        proc.wait()
+        if len(sampled_bgr) >= cfg.probe_frames:
+            break
 
     # Run the probe through the SAME batch size production uses. Passing all
     # --probe-frames (default 600) as one batch meant ~3.7 GB of BGR frames,
@@ -1070,21 +1082,25 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
         "watchdog_hours": None if cfg.no_watchdog else cfg.watchdog_hours,
     }
     log.info("probe: %s", json.dumps(report, indent=2))
-    if len(face_dets) == 0 and len(lp_dets) == 0 and not cfg.force:
-        raise RuntimeError(
-            f"probe found ZERO detections of either class across "
-            f"{len(sampled_bgr)} sampled frames. That is either genuinely "
-            f"empty footage or — more likely — the unverified Gen2 "
-            f".inference() bypass path silently returning nothing (see the "
-            f"module docstring's list of unverified assumptions). Refusing "
-            f"to spend GPU hours producing a run that redacts nothing. "
-            f"Re-run with --probe-only and inspect the written frames, or "
-            f"pass --force if the footage really is empty."
-        )
     if len(face_dets) == 0 and len(lp_dets) == 0:
-        log.warning("probe found zero detections but --force was passed — "
-                     "continuing. Nothing will be redacted unless the rest of "
-                     "the footage differs from the probe sample.")
+        # A WARNING, not an abort. Zero detections has two very different
+        # causes and the probe cannot tell them apart: a broken detector, or
+        # footage that genuinely contains no faces and no plates. Egocentric
+        # indoor footage is frequently the latter, so aborting the batch here
+        # would refuse to process perfectly valid material. The per-clip
+        # zero-coverage canary in build_audit() is the right place for this:
+        # it forces a human look at the specific clips that redacted nothing,
+        # instead of blocking everything up front on one ambiguous signal.
+        log.warning(
+            "probe found ZERO detections across %d frames sampled from %d "
+            "clip(s). If this footage should contain faces, STOP and check "
+            "the detector with --probe-only before spending GPU time — the "
+            "Gen2 .inference() path is unverified (see module docstring). If "
+            "the footage genuinely has no faces, this is expected; every "
+            "clip that redacts nothing will still come back NEEDS_REVIEW so "
+            "you confirm it by eye.",
+            len(sampled_bgr), len(clips),
+        )
 
     if not cfg.force and est_usd > cfg.budget_usd:
         raise RuntimeError(
@@ -1945,7 +1961,21 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
     if not integrity_ran:
         reasons.append(f"integrity check did not run ({integrity.get('integrity_skipped')})")
     if fill_stats.get("n_frames_with_fill", 0) == 0 and clip.n_frames > 0:
-        reasons.append("ZERO frames were redacted — detection produced nothing")
+        # Still always a human look — "we redacted nothing" must never
+        # auto-pass. But say WHY it is suspicious, because on footage that
+        # genuinely contains no faces this will fire on most clips, and a
+        # reviewer who sees the same undifferentiated alarm every time stops
+        # reading it. An independent detector agreeing there is nothing here
+        # is real corroborating evidence and is worth saying out loud.
+        if yunet_ran and yunet.get("n_yunet_uncovered", 0) == 0:
+            reasons.append(
+                "ZERO frames were redacted — but YuNet independently found no "
+                "faces either, so this is consistent with genuinely faceless "
+                "footage. Confirm by eye (the timelapse is enough).")
+        else:
+            reasons.append(
+                "ZERO frames were redacted and nothing corroborates that — "
+                "detection may have failed silently. Check before shipping.")
     if integrity_ran and integrity.get("fill_integrity_checked", 0) == 0 \
             and fill_stats.get("n_frames_with_fill", 0) > 0:
         reasons.append("integrity verified zero boxes despite a non-empty fill_map")
