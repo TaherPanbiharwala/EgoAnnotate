@@ -1072,3 +1072,24 @@ def test_audit_summary_states_the_reason_for_needs_review(blur_job, tmp_path):
     assert "min-box-px" in text, (
         "the only stated cause of NEEDS_REVIEW is missing from the summary a "
         f"human actually reads:\n{text}")
+
+
+def test_changing_gen2_resize_px_discards_the_checkpoint(blur_job, monkeypatch, tmp_path):
+    """Inference scale changes what a score means, so cached rows from the
+    other scale are not reusable — same reasoning as gen and weights."""
+    cfg_a = _ckpt_cfg(blur_job, tmp_path)
+    d1 = _CountingDetector(blur_job)
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg_a, d1, None, "2")
+    cfg_b = _ckpt_cfg(blur_job, tmp_path, **{"--gen2-resize-px": 1200})
+    d2 = _CountingDetector(blur_job)
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg_b, d2, None, "2")
+    assert d2.calls > 0, "boxes from a different inference scale were reused"
+
+
+def test_gen2_resize_px_defaults_to_native(blur_job):
+    assert blur_job.parse_args(BASE_ARGS).gen2_resize_px is None
+
+
+def test_absurd_gen2_resize_px_is_rejected(blur_job):
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--gen2-resize-px", "8"])

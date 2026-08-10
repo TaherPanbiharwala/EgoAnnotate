@@ -228,6 +228,7 @@ class Config:
     skip_shutdown: bool
     force_reprocess: bool
     probe_frames_dir: Path
+    gen2_resize_px: int | None
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
@@ -269,6 +270,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
                     help="redo clips that already have a manifest.json from a prior run "
                          "(default: skip them — a restart after a crash on clip N must not "
                          "silently re-burn GPU/CPU cost and re-clobber clips 1..N-1)")
+    p.add_argument("--gen2-resize-px", type=int, default=None,
+                    help="Gen2 only: resize the short AND long side to this many "
+                         "pixels before inference. Omit for native resolution (the "
+                         "default). Upstream uses 1200; native keeps small distant "
+                         "faces at full size but runs the model at a scale it was "
+                         "never evaluated at. A/B the two with --probe-only before "
+                         "trusting either operating point.")
     p.add_argument("--probe-frames-dir", type=Path, default=None,
                     help="where --probe-only writes annotated sample frames. These are "
                          "UNREDACTED originals, so this deliberately defaults OUTSIDE "
@@ -288,6 +296,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error(f"--detect-hz {a.detect_hz} must be > 0 (it divides fps to pick a stride).")
     if a.hold_frames < 0:
         p.error(f"--hold-frames {a.hold_frames} is negative — disables track association.")
+    if a.gen2_resize_px is not None and a.gen2_resize_px < 64:
+        p.error(f"--gen2-resize-px {a.gen2_resize_px} is implausibly small.")
     if a.min_box_px < 0:
         p.error(f"--min-box-px {a.min_box_px} is negative.")
     for name, val in (("--face-threshold", a.face_threshold),
@@ -357,6 +367,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         skip_shutdown=a.skip_shutdown,
         force_reprocess=a.force_reprocess,
         probe_frames_dir=a.probe_frames_dir,
+        gen2_resize_px=a.gen2_resize_px,
     )
 
 
@@ -684,7 +695,7 @@ class Gen2Detector:
     verified about this path."""
 
     def __init__(self, weights_path: Path, cls: str, device: str, score_threshold: float,
-                 nms_iou: float):
+                 nms_iou: float, resize_px: int | None = None):
         from gen2.script.predictor import ClassID, EgoblurDetector
 
         self.cls = cls
@@ -692,17 +703,29 @@ class Gen2Detector:
         self.nms_iou = nms_iou
         self.device = device
         class_id = ClassID.FACE if cls == "face" else ClassID.LICENSE_PLATE
+        # resize_px=None (the default) runs at NATIVE resolution: small and
+        # distant bystander faces keep full linear size instead of losing
+        # 37.5% to the 1200px short side that both upstream entry points
+        # use. That is a deliberate recall bias, not an oversight, and no
+        # rescale-back step is needed since input and inference resolution
+        # are then identical.
+        #
+        # It is also UNMEASURED. Running 1080x1920 instead of 675x1200 puts
+        # every object 1.6x larger in linear size than the scales the model
+        # was evaluated at, which is exactly the kind of shift that moves a
+        # score distribution — and FACE_THRESHOLD_DEFAULT is calibrated
+        # against nothing but judgement. --gen2-resize-px exists so the two
+        # can be A/B'd on the same frames with --probe-only, cheaply,
+        # instead of arguing about it. Compare n_face_above_threshold and
+        # max_face_score between the two runs before trusting either.
         self._detector = EgoblurDetector(
             model_path=str(weights_path),
             device=device,
             detection_class=class_id,
             score_threshold=score_threshold,
             nms_iou_threshold=nms_iou,
-            resize_aug=None,  # native resolution — see module docstring on
-            # why: small/distant bystander faces keep full linear size
-            # instead of losing 37.5% to the trained 1200px operating
-            # point. No rescale-back step needed since input and
-            # inference resolution are then identical.
+            resize_aug=(None if resize_px is None
+                        else {"min_size_test": resize_px, "max_size_test": resize_px}),
         )
         self._class_value = int(class_id.value)
 
@@ -858,11 +881,11 @@ def build_detectors(cfg: Config) -> tuple[str, Any, Any]:
     if use_gen2:
         log.info("using Gen2 detector (batched), detecting down to %.2f", cfg.sweep_threshold)
         face = Gen2Detector(cfg.face_weights_gen2, "face", cfg.device,
-                             cfg.sweep_threshold, cfg.nms_iou)
+                             cfg.sweep_threshold, cfg.nms_iou, cfg.gen2_resize_px)
         lp = None
         if cfg.lp_weights_gen2 is not None:
             lp = Gen2Detector(cfg.lp_weights_gen2, "lp", cfg.device,
-                               cfg.sweep_threshold, cfg.nms_iou)
+                               cfg.sweep_threshold, cfg.nms_iou, cfg.gen2_resize_px)
         else:
             log.warning("no --lp-weights-gen2: LICENSE PLATES WILL NOT BE "
                          "DETECTED OR REDACTED in this run. Recorded in the "
@@ -1346,6 +1369,7 @@ def checkpoint_fingerprint(cfg: Config, gen: str, lp_present: bool) -> dict:
         "sweep_threshold": cfg.sweep_threshold,
         "nms_iou": cfg.nms_iou,
         "detect_hz": cfg.detect_hz,
+        "gen2_resize_px": cfg.gen2_resize_px,
     }
 
 
@@ -2356,6 +2380,10 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             "lp_checked": cfg.lp_weights_gen2 is not None or cfg.lp_weights_gen1 is not None,
             "dilate_scale": cfg.dilate_scale, "motion_margin_px": cfg.motion_margin_px,
             "hold_frames": cfg.hold_frames, "min_box_px": cfg.min_box_px,
+            # None = native resolution. Recorded because it changes the scale
+            # the model runs at, and therefore what a score MEANS — two runs
+            # at different values are not comparable.
+            "gen2_resize_px": cfg.gen2_resize_px,
         },
         "env": {
             "torch": torch.__version__,
