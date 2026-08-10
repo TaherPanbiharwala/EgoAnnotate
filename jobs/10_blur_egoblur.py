@@ -1035,9 +1035,7 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
         idx = 0
         for y, u, v in read_frames(proc, clip.width, clip.height):
             if idx % span == 0 and got < want:
-                import cv2
-                yuv = _pack_yuv420p(y, u, v)
-                sampled_bgr.append(cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420))
+                sampled_bgr.append(yuv_to_bgr(y, u, v, clip.color_range == "pc"))
                 sampled_idx.append(idx)
                 sampled_clip.append(clip.clip_id)
                 got += 1
@@ -1259,6 +1257,43 @@ def _write_probe_frames(out_dir: Path, frames_bgr: list, frame_idxs: list[int],
             str(out_dir / f"{clip_ids[pos]}_frame_{frame_idxs[pos]:08d}.jpg"), img)
 
 
+def yuv_to_bgr(y, u, v, full_range: bool):
+    """YUV planes -> BGR for the DETECTORS. Never for the encoder.
+
+    cv2.COLOR_YUV2BGR_I420 hardcodes the BT.601 LIMITED-range inverse,
+    clip(1.164 * (Y - 16)). GoPro writes yuvj420p / color_range=pc — FULL
+    range — and the raw yuv420p pipe preserves that faithfully (verified:
+    a lossless pc clip round-trips [0,8,16,64,128,180,235,247,255]
+    unchanged). Handing those samples to COLOR_YUV2BGR_I420 destroys both
+    ends of the scale: the same probe comes out [0,0,0,56,130,191,255,255,
+    255]. Everything below Y=16 collapses to black and everything above
+    Y=235 to white, with a 16.4% contrast stretch in between.
+
+    That is a detection-input defect, not an output one — the encoder is
+    fed the untouched planes and the published video is unaffected. It
+    still matters more than it looks: EgoBlur, YuNet and the --probe-only
+    JPEGs all convert through here, so the "independent second detector"
+    is handed the identically corrupted image and its misses become
+    CORRELATED with EgoBlur's. The audit's power comes from those two
+    failing differently.
+
+    Pre-compressing to limited range exactly inverts what OpenCV is about
+    to do, and measurably round-trips to the identity.
+
+    DO NOT apply this to the planes headed for open_encoder. Those must
+    stay in their native range: converting there is the pixel-rewriting
+    bug fixed earlier, and FILL_VALUE=128 is defined in plane space.
+    """
+    import cv2
+    import numpy as np
+
+    if full_range:
+        y = (16.0 + y.astype(np.float32) * (219.0 / 255.0)).round().astype(np.uint8)
+        u = (16.0 + u.astype(np.float32) * (224.0 / 255.0)).round().astype(np.uint8)
+        v = (16.0 + v.astype(np.float32) * (224.0 / 255.0)).round().astype(np.uint8)
+    return cv2.cvtColor(_pack_yuv420p(y, u, v), cv2.COLOR_YUV2BGR_I420)
+
+
 def _pack_yuv420p(y, u, v):
     """cv2.cvtColor(..., COLOR_YUV2BGR_I420) wants one interleaved I420
     buffer, not three separate planes — repack for the conversion only;
@@ -1275,8 +1310,47 @@ def _pack_yuv420p(y, u, v):
 # =============================================================================
 
 
+def checkpoint_fingerprint(cfg: Config, gen: str, lp_present: bool) -> dict:
+    """Everything that changes what a checkpointed detection row MEANS.
+
+    A resume that reuses rows produced under a different configuration is
+    not a resume, it is a lie: detection_pass skips every frame already in
+    done_frames, so a rerun with a different detector calls the model ZERO
+    times, inherits the previous run's boxes, and write_manifest then
+    records the NEW configuration over them. Two confirmed fail-open cases:
+    adding --lp-weights-gen2 on a second pass yields a manifest claiming
+    lp_checked=true for a clip no plate detector ever saw, and switching
+    --gen ships one generation's boxes under the other's provenance.
+
+    Weights are identified by name+size+mtime rather than sha256 — hashing
+    420 MB twice per clip to guard a resume is not worth it, and a swapped
+    file changes all three.
+    """
+    def wid(p: Path | None) -> str | None:
+        if p is None:
+            return None
+        try:
+            st = p.stat()
+            return f"{p.name}:{st.st_size}:{int(st.st_mtime)}"
+        except OSError:
+            return str(p)
+
+    face = cfg.face_weights_gen2 if gen == "2" else cfg.face_weights_gen1
+    lp = cfg.lp_weights_gen2 if gen == "2" else cfg.lp_weights_gen1
+    return {
+        "_fingerprint": 1,
+        "gen": gen,
+        "face_weights": wid(face),
+        "lp_weights": wid(lp) if lp_present else None,
+        "lp_present": lp_present,
+        "sweep_threshold": cfg.sweep_threshold,
+        "nms_iou": cfg.nms_iou,
+        "detect_hz": cfg.detect_hz,
+    }
+
+
 def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
-                    checkpoint_dir: Path) -> list[Detection]:
+                    checkpoint_dir: Path, gen: str = "2") -> list[Detection]:
     """Checkpoint format: ONE JSONL line per ATTEMPTED sampled frame —
     `{"frame_idx": i, "detections": [...]}`, empty list included — not one
     line per detection. This is deliberate, fixing two real bugs a
@@ -1299,8 +1373,41 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
     # own progress format, not an output contract — the manifest and the
     # redacted video are what downstream consumes.
     jsonl_path = checkpoint_dir / f"{clip.clip_id}.detections.jsonl"
+    fingerprint = checkpoint_fingerprint(cfg, gen, lp_det is not None)
+
     if jsonl_path.exists():
         lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        # Line 0 is the config fingerprint. Anything else — a mismatch, a
+        # checkpoint from before fingerprints existed, an empty file — means
+        # these rows cannot be trusted to describe this configuration, and
+        # reusing them would skip inference entirely while the manifest
+        # claimed the new config. Discard and re-detect; that costs GPU
+        # time, which is the cheap half of this trade.
+        head = None
+        if lines:
+            try:
+                head = json.loads(lines[0])
+            except json.JSONDecodeError:
+                head = None
+        if not (isinstance(head, dict) and head.get("_fingerprint")):
+            log.warning("%s: checkpoint has no config fingerprint — discarding "
+                         "and re-detecting", clip.clip_id)
+            jsonl_path.unlink()
+            lines = []
+        elif head != fingerprint:
+            differing = sorted(
+                k for k in set(head) | set(fingerprint)
+                if head.get(k) != fingerprint.get(k))
+            log.warning(
+                "%s: checkpoint was produced under a DIFFERENT configuration "
+                "(%s changed) — discarding it. Reusing it would skip inference "
+                "entirely and record the new config over the old boxes.",
+                clip.clip_id, ", ".join(differing))
+            jsonl_path.unlink()
+            lines = []
+        else:
+            lines = lines[1:]
+
         for i, line in enumerate(lines):
             if not line.strip():
                 continue
@@ -1326,6 +1433,17 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
                     box=tuple(d["box"]), score=d["score"],
                 ))
         log.info("%s: resuming, %d detection-frames already attempted", clip.clip_id, len(done_frames))
+
+    if not jsonl_path.exists():
+        # Fingerprint FIRST, fsynced, before a single detection row exists —
+        # otherwise a crash between the first flush() and the header leaves
+        # rows with no provenance, which the resume path above (correctly)
+        # throws away.
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with jsonl_path.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(fingerprint) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     stderr_log = cfg.output_dir / "logs" / f"{clip.clip_id}.detect_decode.stderr.log"
     proc = open_decoder(ffmpeg, clip.path, stderr_log)
@@ -1361,10 +1479,7 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
     idx = 0
     for y, u, v in read_frames(proc, clip.width, clip.height):
         if idx % stride == 0 and idx not in done_frames:
-            import cv2
-            yuv = _pack_yuv420p(y, u, v)
-            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-            batch_bgr.append(bgr)
+            batch_bgr.append(yuv_to_bgr(y, u, v, clip.color_range == "pc"))
             batch_idx.append(idx)
             if len(batch_bgr) >= DETECT_BATCH:
                 flush()
@@ -1944,21 +2059,51 @@ def check_low_threshold_sweep(detections: list[Detection], fill_map: dict,
         covered = _box_is_covered(d.box, boxes)
         if not covered:
             candidates.append(d)
-    ranked = sorted(candidates, key=lambda d: -d.score)
+    # Rank WITHIN a class by how close the score came to that class's own
+    # operating threshold, then round-robin across classes into the cap.
+    #
+    # A single absolute-score sort across both classes is wrong in the
+    # privacy direction and silently so: the face band is [sweep, 0.30) and
+    # the plate band is [sweep, 0.40), so EVERY plate candidate scoring 0.30
+    # or better outranks EVERY face candidate that can possibly exist. On
+    # egocentric footage where the plate model fires on printed packaging
+    # text, that filled all 200 slots with cardboard and handed the reviewer
+    # not one face to look at — while n_candidate_misses honestly reported
+    # thousands. Round-robin guarantees faces half the sample whenever any
+    # exist, and costs plates nothing when they don't.
+    by_cls: dict[str, list[Detection]] = {}
+    for d in candidates:
+        by_cls.setdefault(d.cls, []).append(d)
+    for cls, pool in by_cls.items():
+        op = operating_thresholds.get(cls, 0.5) or 1.0
+        pool.sort(key=lambda d: -(d.score / op))
+
+    ranked: list[Detection] = []
+    pools = [by_cls.get("face", []), by_cls.get("lp", [])]
+    depth = 0
+    while len(ranked) < AUDIT_MAX_ITEMS and any(len(p) > depth for p in pools):
+        for pool in pools:
+            if depth < len(pool) and len(ranked) < AUDIT_MAX_ITEMS:
+                ranked.append(pool[depth])
+        depth += 1
+
     return {
         "n_candidate_misses": len(candidates),
+        "n_candidate_misses_face": len(by_cls.get("face", [])),
+        "n_candidate_misses_lp": len(by_cls.get("lp", [])),
         "n_frames_with_candidate_miss": len({d.frame_idx for d in candidates}),
         # The embedded list is capped, the COUNT above is not. The review
         # page reads the list; without an explicit truncation marker it
         # would show 200 and call it the total, hiding the rest from the
         # only human who looks.
-        "candidates": [dataclasses.asdict(d) for d in ranked[:AUDIT_MAX_ITEMS]],
+        "candidates": [dataclasses.asdict(d) for d in ranked],
         "candidates_truncated": max(0, len(candidates) - AUDIT_MAX_ITEMS),
     }
 
 
 def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
-                 fill_map: dict, detect_hz: float, fps: float, n_frames: int) -> dict:
+                 fill_map: dict, detect_hz: float, fps: float, n_frames: int,
+                 full_range: bool = False) -> dict:
     """Second, independent detector — different training distribution
     (WIDER FACE, not egocentric) and inductive biases from EgoBlur, so it
     catches a different slice of misses. MIT-licensed, ships inside
@@ -1998,8 +2143,7 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
         frames_seen = idx + 1
         if idx % stride != 0:
             continue
-        yuv = _pack_yuv420p(y, u, v)
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+        bgr = yuv_to_bgr(y, u, v, full_range)
         _n, faces = detector.detect(bgr)
         if faces is None:
             continue
@@ -2041,7 +2185,7 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
 
 def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
                  yunet: dict, gen: str, n_dropped_small: int = 0,
-                 lp_checked: bool = True) -> dict:
+                 lp_checked: bool = True, n_face_fill_frames: int | None = None) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -2076,7 +2220,13 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         reasons.append("YuNet found uncovered faces")
     if not integrity_ran:
         reasons.append(f"integrity check did not run ({integrity.get('integrity_skipped')})")
-    if fill_stats.get("n_frames_with_fill", 0) == 0 and clip.n_frames > 0:
+    # Class-aware when the caller supplies it. n_frames_with_fill counts
+    # frames where ANY box landed, so on footage where the plate model fires
+    # on printed packaging a single lp box silenced this canary for the whole
+    # clip — while the face model could have returned nothing at all.
+    n_redacted = (fill_stats.get("n_frames_with_fill", 0) if n_face_fill_frames is None
+                  else n_face_fill_frames)
+    if n_redacted == 0 and clip.n_frames > 0:
         # Still always a human look — "we redacted nothing" must never
         # auto-pass. But say WHY it is suspicious, because on footage that
         # genuinely contains no faces this will fire on most clips, and a
@@ -2085,13 +2235,14 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # is real corroborating evidence and is worth saying out loud.
         if yunet_ran and yunet.get("n_yunet_uncovered", 0) == 0:
             reasons.append(
-                "ZERO frames were redacted — but YuNet independently found no "
-                "faces either, so this is consistent with genuinely faceless "
-                "footage. Confirm by eye (the timelapse is enough).")
+                "ZERO frames had a FACE redacted — but YuNet independently "
+                "found no faces either, so this is consistent with genuinely "
+                "faceless footage. Confirm by eye (the timelapse is enough).")
         else:
             reasons.append(
-                "ZERO frames were redacted and nothing corroborates that — "
-                "detection may have failed silently. Check before shipping.")
+                "ZERO frames had a FACE redacted and nothing corroborates "
+                "that — detection may have failed silently. Check before "
+                "shipping.")
     if integrity_ran and integrity.get("fill_integrity_checked", 0) == 0 \
             and fill_stats.get("n_frames_with_fill", 0) > 0:
         reasons.append("integrity verified zero boxes despite a non-empty fill_map")
@@ -2117,6 +2268,11 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         "yunet_ran": yunet_ran,
         "integrity_ran": integrity_ran,
         "n_dropped_small": n_dropped_small,
+        # Frames with a FACE box specifically, as distinct from
+        # n_frames_with_fill which counts any class. None when the caller
+        # did not compute it (the canary then falls back to the any-class
+        # count, which is weaker — see above).
+        "n_face_fill_frames": n_face_fill_frames,
         # False means no plate detector ran at all. Recorded so a face-only
         # run is never later read as "this clip has no license plates".
         "lp_checked": lp_checked,
@@ -2141,9 +2297,21 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
 
 
 def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
+    # status_reasons FIRST, before the metrics. build_audit has gate reasons
+    # that no printed metric backs (n_dropped_small, "integrity verified zero
+    # boxes despite a non-empty fill_map"), so a NEEDS_REVIEW clip could show
+    # an all-clean metric block and give the reviewer nothing to act on —
+    # which teaches them the status line is noise.
+    reasons = audit.get("status_reasons") or []
     lines = [
         f"# {clip.clip_id} — {audit['status']}",
         "",
+    ]
+    if reasons:
+        lines += ["## Why this needs a look", ""]
+        lines += [f"{i}. {r}" for i, r in enumerate(reasons, 1)]
+        lines += [""]
+    lines += [
         f"frames {clip.n_frames}  fps {clip.fps:.2f}  gen {audit['gen']}",
         f"frames_with_fill: {audit.get('n_frames_with_fill', 0)} "
         f"({audit.get('frames_with_fill_frac', 0) * 100:.1f}%)",
@@ -2249,7 +2417,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     t0 = time.monotonic()
     log.info("=== %s ===", clip.clip_id)
 
-    detections = detection_pass(cfg, clip, face_det, lp_det, ffmpeg, checkpoint_dir)
+    detections = detection_pass(cfg, clip, face_det, lp_det, ffmpeg,
+                                 checkpoint_dir, gen)
     t_detect = time.monotonic()
 
     # Detectors ran down to cfg.sweep_threshold (see build_detectors). Only
@@ -2270,6 +2439,14 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                            dropped_small=dropped_small)
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
+    # Count FACE-covered frames separately before the tracks go away.
+    # tracks_to_fill_map() discards Track.cls, and the zero-redaction canary
+    # in build_audit() keys off n_frames_with_fill, which counts frames where
+    # ANY box was burned in. On footage like this — where the plate model
+    # fires on printed packaging text — a single above-threshold lp box
+    # anywhere in 8134 frames silences the only structural defence against
+    # "the FACE model returned nothing at all" for the entire clip.
+    n_face_fill_frames = len({f for tr in tracks if tr.cls == "face" for f in tr.frames})
     del tracks  # ~260 MB of per-frame entries; nothing below reads it again
 
     if cfg.forced_boxes is not None:
@@ -2290,13 +2467,20 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     sweep = check_low_threshold_sweep(
         detections, fill_map, cfg.sweep_threshold, operating,
     )
+    # The output was encoded with the source's own colour_range, so a pc
+    # source yields a pc output — YuNet needs the same range handling the
+    # primary detector gets, or the "independent" check runs on a crushed
+    # image and its misses correlate with EgoBlur's instead of being
+    # independent evidence.
     yunet = check_yunet(cfg, ffmpeg, out_path, clip.width, clip.height,
-                         fill_map, cfg.detect_hz, clip.fps, clip.n_frames)
+                         fill_map, cfg.detect_hz, clip.fps, clip.n_frames,
+                         full_range=clip.color_range == "pc")
     t_verify = time.monotonic()
 
     audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen,
                          n_dropped_small=len(dropped_small),
-                         lp_checked=lp_det is not None)
+                         lp_checked=lp_det is not None,
+                         n_face_fill_frames=n_face_fill_frames)
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {
@@ -2347,6 +2531,19 @@ def main(argv: list[str] | None = None) -> int:
                 log.exception("%s: failed — continuing with remaining clips", c.clip_id)
                 failed_clip_ids.append(c.clip_id)
                 audits.append({"clip_id": c.clip_id, "status": "FAILED"})
+                # redact_and_encode() writes the .blurred.mp4 into the publish
+                # directory BEFORE verification runs, so a clip that fails
+                # check_fill_integrity or check_yunet leaves a file that is
+                # indistinguishable by name from a verified one — with no
+                # manifest beside it to say otherwise. Rename it to something
+                # no publish glob will match, rather than delete it: the file
+                # is the evidence for whatever went wrong.
+                orphan = cfg.output_dir / f"{c.clip_id}.blurred.mp4"
+                if orphan.exists():
+                    quarantined = orphan.with_suffix(".mp4.FAILED-DO-NOT-SHIP")
+                    orphan.replace(quarantined)
+                    log.warning("%s: quarantined unverified output as %s",
+                                 c.clip_id, quarantined.name)
 
         pass_statuses = {"PASS_AUTOMATED", "PASS_AUTOMATED_NO_YUNET"}
         n_pass = sum(1 for a in audits if a["status"] in pass_statuses)

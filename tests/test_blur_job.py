@@ -874,3 +874,201 @@ def test_probe_reports_above_threshold_counts_separately(
     assert rep["n_face_detections"] == 4
     assert rep["n_face_above_threshold"] == 1
     assert rep["max_face_score"] == pytest.approx(0.92)
+
+
+# ---------------------------------------------------------------------------
+# Full-range (yuvj420p / color_range=pc) handling. GoPro writes pc, and
+# cv2.COLOR_YUV2BGR_I420 hardcodes the LIMITED-range inverse — so every
+# detector was handed an image with both ends of the luma scale clipped
+# flat. Measured on a real pc clip: [0,8,16,64,128,180,235,247,255] arrived
+# at the detector as [0,0,0,56,130,191,255,255,255].
+# ---------------------------------------------------------------------------
+
+_RAMP = [0, 8, 16, 64, 128, 180, 235, 247, 255]
+
+
+def _ramp_planes(vals=_RAMP, w=72, h=8):
+    y = np.zeros((h, w), np.uint8)
+    for i, v in enumerate(vals):
+        y[:, i * 8:(i + 1) * 8] = v
+    c = np.full((h // 2, w // 2), 128, np.uint8)
+    return y, c, c
+
+
+def test_full_range_luma_survives_the_bgr_conversion(blur_job):
+    """The blocking regression. Without the pre-compression, Y=8 and Y=16
+    both land on 0 and Y=235/247/255 all land on 255 — the detector cannot
+    distinguish a face in shadow from black."""
+    y, u, v = _ramp_planes()
+    bgr = blur_job.yuv_to_bgr(y, u, v, True)
+    got = [int(bgr[4, i * 8 + 4, 1]) for i in range(len(_RAMP))]
+    assert got == _RAMP, f"full-range luma was altered: {_RAMP} -> {got}"
+
+
+def test_full_range_conversion_does_not_clip_either_end(blur_job):
+    y, u, v = _ramp_planes()
+    bgr = blur_job.yuv_to_bgr(y, u, v, True)
+    got = [int(bgr[4, i * 8 + 4, 1]) for i in range(len(_RAMP))]
+    assert len(set(got)) == len(_RAMP), (
+        f"distinct luma levels collapsed onto each other: {got}")
+
+
+def test_limited_range_input_is_left_alone(blur_job):
+    """tv-range footage must NOT be double-compressed."""
+    y, u, v = _ramp_planes()
+    plain = blur_job.yuv_to_bgr(y, u, v, False)
+    import cv2
+    expect = cv2.cvtColor(blur_job._pack_yuv420p(y, u, v), cv2.COLOR_YUV2BGR_I420)
+    assert np.array_equal(plain, expect)
+
+
+# ---------------------------------------------------------------------------
+# Zero-redaction canary was class-blind: n_frames_with_fill counts ANY box,
+# and tracks_to_fill_map discards Track.cls, so one above-threshold licence
+# plate silenced the only structural defence against "the FACE model
+# returned nothing at all" for a whole clip.
+# ---------------------------------------------------------------------------
+
+
+def test_a_licence_plate_fill_does_not_silence_the_zero_face_canary(blur_job):
+    clip = _clip(blur_job, n_frames=8134)
+    # Thousands of frames were filled — every one of them a licence plate.
+    fill_stats = {"n_frames_with_fill": 5000, "frames_with_fill_frac": 0.6,
+                  "max_fill_area_frac": 0.01}
+    audit = blur_job.build_audit(
+        clip, fill_stats, {"fill_integrity_violations": 0, "fill_integrity_checked": 10},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=0)
+    assert audit["status"] == "NEEDS_REVIEW"
+    assert any("ZERO frames had a FACE redacted" in r for r in audit["status_reasons"]), \
+        f"canary stayed silent; reasons were {audit['status_reasons']}"
+
+
+def test_face_fills_do_not_trip_the_zero_face_canary(blur_job):
+    clip = _clip(blur_job, n_frames=100)
+    fill_stats = {"n_frames_with_fill": 40, "frames_with_fill_frac": 0.4,
+                  "max_fill_area_frac": 0.01}
+    audit = blur_job.build_audit(
+        clip, fill_stats, {"fill_integrity_violations": 0, "fill_integrity_checked": 40},
+        {"n_candidate_misses": 0}, {"n_yunet_uncovered": 0}, "2",
+        n_face_fill_frames=40)
+    assert not any("ZERO frames" in r for r in audit["status_reasons"])
+
+
+# ---------------------------------------------------------------------------
+# Sweep candidate ranking. Face band is [sweep, 0.30), plate band is
+# [sweep, 0.40) — a single absolute-score sort meant every plate >= 0.30
+# outranked every face that could exist, so 200 slots filled with cardboard.
+# ---------------------------------------------------------------------------
+
+
+def test_plate_noise_cannot_evict_every_face_from_the_audit_sample(blur_job):
+    d = blur_job.Detection
+    # 400 plates all scoring above the entire face band, 5 real face candidates.
+    plates = [d(frame_idx=i, cls="lp", box=(0.0, 0.0, 9.0, 9.0), score=0.39)
+              for i in range(400)]
+    faces = [d(frame_idx=9000 + i, cls="face", box=(0.0, 0.0, 9.0, 9.0), score=0.29)
+             for i in range(5)]
+    out = blur_job.check_low_threshold_sweep(
+        plates + faces, {}, 0.10, {"face": 0.30, "lp": 0.40})
+    shown = {c["cls"] for c in out["candidates"]}
+    assert "face" in shown, (
+        "every face candidate was evicted from the sample by plate noise")
+    assert out["n_candidate_misses_face"] == 5
+    assert out["n_candidate_misses_lp"] == 400
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint config fingerprint. A resume that reuses rows from a different
+# detector config performs ZERO inference and records the new config over
+# the old boxes.
+# ---------------------------------------------------------------------------
+
+
+def _ckpt_cfg(blur_job, tmp_path, **over):
+    args = ["--input-dir", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+            "--run-id", "r"]
+    for k, v in over.items():
+        args += [k, str(v)]
+    return blur_job.parse_args(args)
+
+
+class _CountingDetector:
+    def __init__(self, blur_job, cls="face"):
+        self._b, self.cls, self.calls = blur_job, cls, 0
+
+    def detect_batch(self, frames, idxs):
+        self.calls += len(idxs)
+        return []
+
+
+def _run_detection(blur_job, monkeypatch, tmp_path, cfg, det, lp, gen, n=12):
+    clip = _clip(blur_job, n_frames=n, fps=30.0)
+    monkeypatch.setattr(blur_job, "open_decoder", lambda *a, **k: _ProbeProc())
+    monkeypatch.setattr(blur_job, "read_frames",
+                        lambda p, w, h: iter([_planes() for _ in range(n)]))
+    ck = tmp_path / "ck"
+    ck.mkdir(exist_ok=True)
+    return blur_job.detection_pass(cfg, clip, det, lp, "ffmpeg", ck, gen), ck
+
+
+def test_checkpoint_from_a_different_config_is_discarded_not_reused(
+        blur_job, monkeypatch, tmp_path):
+    """The confirmed fail-open: run 1 face-only, run 2 adds the plate
+    detector. Reusing run 1's rows means the plate model never executes
+    while the manifest reports lp_checked=true."""
+    cfg = _ckpt_cfg(blur_job, tmp_path)
+    d1 = _CountingDetector(blur_job)
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg, d1, None, "2")
+    assert d1.calls > 0
+
+    # Same clip, same everything — except an LP detector now exists.
+    d2, lp2 = _CountingDetector(blur_job), _CountingDetector(blur_job, "lp")
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg, d2, lp2, "2")
+    assert d2.calls > 0, (
+        "detector was never called — stale face-only rows were reused for a "
+        "run that claims plates were checked")
+    assert lp2.calls > 0
+
+
+def test_checkpoint_with_a_matching_config_still_resumes(
+        blur_job, monkeypatch, tmp_path):
+    """The fingerprint must not defeat resumption, which is the whole point
+    of the checkpoint."""
+    cfg = _ckpt_cfg(blur_job, tmp_path)
+    d1 = _CountingDetector(blur_job)
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg, d1, None, "2")
+    d2 = _CountingDetector(blur_job)
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg, d2, None, "2")
+    assert d2.calls == 0, "identical config should have resumed, not re-detected"
+
+
+def test_switching_gen_discards_the_checkpoint(blur_job, monkeypatch, tmp_path):
+    cfg = _ckpt_cfg(blur_job, tmp_path)
+    d1 = _CountingDetector(blur_job)
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg, d1, None, "2")
+    d2 = _CountingDetector(blur_job)
+    _run_detection(blur_job, monkeypatch, tmp_path, cfg, d2, None, "1")
+    assert d2.calls > 0, "gen 1 run inherited gen 2 boxes under gen 1 provenance"
+
+
+# ---------------------------------------------------------------------------
+# audit_summary.md must state WHY a clip needs review. Two of build_audit's
+# gate reasons are backed by no printed metric.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_summary_states_the_reason_for_needs_review(blur_job, tmp_path):
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_dropped_small=7, n_face_fill_frames=5)
+    p = tmp_path / "s.md"
+    blur_job.write_audit_summary(audit, clip, p)
+    text = p.read_text()
+    assert "NEEDS_REVIEW" in text
+    assert "min-box-px" in text, (
+        "the only stated cause of NEEDS_REVIEW is missing from the summary a "
+        f"human actually reads:\n{text}")

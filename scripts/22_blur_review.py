@@ -65,6 +65,33 @@ def find_manifests(target: Path) -> list[Path]:
     sys.exit(f"error: {target} does not exist")
 
 
+def flag_accounting(audit: dict, n_collected: int, limit: int) -> dict:
+    """How many findings exist, how many this page will show, how many are hidden.
+
+    Findings are truncated TWICE and only one of the cuts used to be counted.
+    The job caps its embedded lists at AUDIT_MAX_ITEMS and records the
+    remainder in candidates_truncated / yunet_truncated — those findings are
+    not in the manifest at all. This page then applies its own --limit on top.
+    Counting only the second cut meant a clip with ~5,500 sweep candidates
+    rendered "200 shown of 200 flagged" with no warning at the default limit,
+    telling the reviewer by omission that they had seen everything.
+
+    Kept as a separate function because it is the honesty of the page in one
+    place, and because inline arithmetic inside review_clip could only be
+    tested by standing up a manifest, a video and an ffmpeg.
+    """
+    withheld_by_job = (int(audit.get("candidates_truncated", 0) or 0)
+                       + int(audit.get("yunet_truncated", 0) or 0))
+    n_flagged = n_collected + withheld_by_job
+    n_shown = min(n_collected, limit) if limit else n_collected
+    return {
+        "n_flagged": n_flagged,
+        "n_shown": n_shown,
+        "n_truncated": n_flagged - n_shown,
+        "withheld_by_job": withheld_by_job,
+    }
+
+
 def collect_flags(audit: dict) -> list[dict]:
     """Merge both flag sources into one list sorted by descending score.
 
@@ -74,24 +101,30 @@ def collect_flags(audit: dict) -> list[dict]:
     EgoBlur's own sub-threshold guess. Review those first.
     """
     flags = []
-    # .get with defaults on score, not [...]: one malformed entry must not
-    # kill the whole review run for a clip that has real findings in it.
-    for c in audit.get("candidates", []):
-        flags.append({
-            "origin": "sweep",
-            "frame_idx": int(c["frame_idx"]),
-            "box": [float(v) for v in c["box"]],
-            "score": float(c.get("score") or 0.0),
-            "cls": c.get("cls", "face"),
-        })
-    for y in audit.get("yunet_uncovered", []):
-        flags.append({
-            "origin": "yunet",
-            "frame_idx": int(y["frame_idx"]),
-            "box": [float(v) for v in y["box"]],
-            "score": float(y.get("score") or 0.0),
-            "cls": "face",
-        })
+    malformed = 0
+    # One malformed entry must not kill the whole review run for a clip that
+    # has real findings in it. That was the stated intent, but only `score`
+    # and `cls` used .get — `frame_idx` and `box` were hard-indexed, so a
+    # single bad entry raised KeyError and (before main() grew a try) took
+    # every remaining clip's review down with it.
+    for origin, key, default_cls in (("sweep", "candidates", "face"),
+                                      ("yunet", "yunet_uncovered", "face")):
+        for e in audit.get(key, []):
+            try:
+                flags.append({
+                    "origin": origin,
+                    "frame_idx": int(e["frame_idx"]),
+                    "box": [float(v) for v in e["box"]],
+                    "score": float(e.get("score") or 0.0),
+                    "cls": e.get("cls", default_cls),
+                })
+            except (KeyError, TypeError, ValueError):
+                malformed += 1
+    if malformed:
+        # Counted and announced, never silently dropped: an unrenderable
+        # finding is still a finding, and this page is the last gate.
+        print(f"  WARNING: {malformed} malformed audit entr(ies) could not be "
+              f"rendered and are NOT shown below — inspect the manifest by hand.")
     # YuNet first at equal score — an independent detector agreeing that
     # something is a face outranks EgoBlur's own low-confidence guess.
     flags.sort(key=lambda f: (f["origin"] != "yunet", -f["score"]))
@@ -375,13 +408,15 @@ def review_clip(manifest_path: Path, ffmpeg: str, out_root: Path,
         return {"clip_id": clip_id, "skipped": "bad geometry"}
 
     flags = collect_flags(audit)
-    n_flagged = len(flags)
-    n_truncated = 0
-    if limit and n_flagged > limit:
-        n_truncated = n_flagged - limit
-        print(f"  {n_flagged} flagged regions, showing the top {limit} by score "
-              f"({n_truncated} not shown — use --limit 0 for all)")
-        flags = flags[:limit]
+    acct = flag_accounting(audit, len(flags), limit)
+    n_flagged, n_truncated = acct["n_flagged"], acct["n_truncated"]
+    if acct["withheld_by_job"]:
+        print(f"  NOTE: the job itself withheld {acct['withheld_by_job']} finding(s) "
+              f"beyond its audit cap; they are not in the manifest at all.")
+    if n_truncated:
+        print(f"  {n_flagged} flagged regions, showing {acct['n_shown']} "
+              f"({n_truncated} not shown — use --limit 0 for the rest of the manifest)")
+    flags = flags[:acct["n_shown"]]
 
     out_dir = out_root / clip_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -463,10 +498,26 @@ def main() -> int:
         except json.JSONDecodeError:
             print(f"skip: {m} is not valid JSON")
             continue
-        if not a.all and status.startswith("PASS"):
+        # PASS_AUTOMATED_NO_YUNET is NOT a clip you can skip by default.
+        # startswith("PASS") swept it in with PASS_AUTOMATED, so on a run
+        # without --yunet-model — the configuration the job itself says has
+        # the least power against a missed face — the review tool refused to
+        # build a page for any clean clip. The weakest verification produced
+        # the least human attention, which is exactly backwards.
+        if not a.all and status == "PASS_AUTOMATED":
             print(f"== {m.stem} — {status}, skipping (pass --all to review anyway) ==")
             continue
-        results.append(review_clip(m, ffmpeg, out_root, a.timelapse, a.limit))
+        if not a.all and status == "PASS_AUTOMATED_NO_YUNET":
+            print(f"== {m.stem} — {status}: no independent detector ran, so this "
+                  f"pass is the weaker claim. Reviewing it. ==")
+        try:
+            results.append(review_clip(m, ffmpeg, out_root, a.timelapse, a.limit))
+        except Exception as e:
+            # One malformed manifest must not abort the review of every
+            # remaining clip — this is the last gate before publication, and
+            # a partial pass that LOOKS complete is the dangerous outcome.
+            print(f"  ERROR reviewing {m.stem}: {type(e).__name__}: {e}")
+            results.append({"clip_id": m.stem, "skipped": f"error: {e}"})
 
     reviewed = [r for r in results if "index" in r]
     print()

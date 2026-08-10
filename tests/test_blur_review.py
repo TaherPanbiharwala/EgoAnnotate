@@ -242,3 +242,49 @@ def test_unusable_geometry_is_skipped(blur_review, tmp_path):
     p.write_text(json.dumps(m))
     out = blur_review.review_clip(p, "ffmpeg", tmp_path / "review", False, 200)
     assert out["skipped"] == "bad geometry"
+
+
+# ---------------------------------------------------------------------------
+# The job caps its embedded finding lists at AUDIT_MAX_ITEMS and records
+# candidates_truncated/yunet_truncated so this page cannot present a capped
+# sample as the whole truth. Nothing read those keys.
+# ---------------------------------------------------------------------------
+
+
+def test_the_jobs_own_truncation_is_counted_in_the_flag_total(blur_review):
+    """~5,500 candidates -> manifest holds 200 + candidates_truncated=5300.
+    At the DEFAULT limit of 200 the page used to read "200 of 200 flagged"
+    with no warning at all, because len(flags) > limit was false."""
+    audit = {"candidates_truncated": 5300, "yunet_truncated": 0}
+    acct = blur_review.flag_accounting(audit, n_collected=200, limit=200)
+    assert acct["n_flagged"] == 5500, "the 5,300 findings the job withheld vanished"
+    assert acct["n_shown"] == 200
+    assert acct["n_truncated"] == 5300
+
+
+def test_limit_zero_still_reports_what_the_job_withheld(blur_review):
+    """--limit 0 is the flag the page itself tells the reviewer to use to
+    "see all of them" — it cannot show findings that are not in the manifest,
+    so it must still say so."""
+    acct = blur_review.flag_accounting({"candidates_truncated": 5300}, 200, 0)
+    assert acct["n_shown"] == 200
+    assert acct["n_truncated"] == 5300
+
+
+def test_accounting_is_exact_when_nothing_was_withheld(blur_review):
+    acct = blur_review.flag_accounting({}, n_collected=7, limit=200)
+    assert (acct["n_flagged"], acct["n_shown"], acct["n_truncated"]) == (7, 7, 0)
+
+
+def test_a_malformed_audit_entry_does_not_lose_the_good_ones(blur_review, capsys):
+    """The docstring promised this; only score/cls actually had .get."""
+    audit = {"candidates": [
+        {"frame_idx": 1, "box": [0, 0, 9, 9], "score": 0.2, "cls": "face"},
+        {"box": [0, 0, 9, 9], "score": 0.9},          # no frame_idx
+        {"frame_idx": 3, "score": 0.4, "cls": "face"},  # no box
+        {"frame_idx": 4, "box": [0, 0, 9, 9], "score": 0.3, "cls": "face"},
+    ]}
+    flags = blur_review.collect_flags(audit)
+    assert [f["frame_idx"] for f in flags] == [4, 1]
+    assert "2 malformed" in capsys.readouterr().out, \
+        "malformed entries were dropped without telling the reviewer"
