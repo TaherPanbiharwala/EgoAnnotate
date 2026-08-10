@@ -1093,3 +1093,52 @@ def test_gen2_resize_px_defaults_to_native(blur_job):
 def test_absurd_gen2_resize_px_is_rejected(blur_job):
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--gen2-resize-px", "8"])
+
+
+# ---------------------------------------------------------------------------
+# --detect-batch. Added when the 5090 this job was tuned against became
+# unavailable (RunPod Community Cloud released it back to the host pool on
+# pod stop) and a smaller/shared GPU was the alternative — the hardcoded
+# batch of 8 at native 1080p was sized for 32GB and had no way to turn down.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_batch_defaults_to_the_module_constant(blur_job):
+    assert blur_job.parse_args(BASE_ARGS).detect_batch == blur_job.DETECT_BATCH
+
+
+def test_detect_batch_is_overridable(blur_job):
+    cfg = blur_job.parse_args([*BASE_ARGS, "--detect-batch", "2"])
+    assert cfg.detect_batch == 2
+
+
+def test_detect_batch_below_one_is_rejected(blur_job):
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--detect-batch", "0"])
+
+
+def test_probe_actually_honours_detect_batch_not_the_module_constant(
+        blur_job, monkeypatch, tmp_path):
+    """The real regression risk with a new config knob: probe_and_budget or
+    detection_pass reading the module constant instead of cfg.detect_batch,
+    which would make the flag a no-op that LOOKS wired up."""
+    cfg = blur_job.parse_args(
+        ["--input-dir", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+         "--run-id", "r", "--probe-only", "--probe-frames", "9",
+         "--detect-batch", "3"])
+    clip = _clip(blur_job, n_frames=90, fps=30.0)
+    monkeypatch.setattr(blur_job, "open_decoder", lambda *a, **k: _ProbeProc())
+    monkeypatch.setattr(blur_job, "read_frames",
+                        lambda p, w, h: iter([_planes() for _ in range(90)]))
+    sizes = []
+    det = _FakeDetector(blur_job, "face")
+    real_detect = det.detect_batch
+
+    def spy(frames, idxs):
+        sizes.append(len(idxs))
+        return real_detect(frames, idxs)
+    det.detect_batch = spy
+    monkeypatch.setattr(blur_job, "_write_probe_frames", lambda *a, **k: None)
+    blur_job.probe_and_budget(cfg, [clip], det, None, "ffmpeg")
+    assert sizes and max(sizes) == 3, (
+        f"probe batched at {sizes}, not --detect-batch=3 — the flag is a no-op")

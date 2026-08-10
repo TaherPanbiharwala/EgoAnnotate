@@ -144,9 +144,12 @@ TRACK_IOU_DEFAULT = 0.2
 # are always reported; this only bounds the embedded sample.
 AUDIT_MAX_ITEMS = 200
 
-# Frames per detector call. Used by BOTH the real detection pass and the
-# probe — the probe previously batched all --probe-frames at once, which
-# OOM'd the GPU before the run began.
+# Default frames per detector call — override with --detect-batch. Used by
+# BOTH the real detection pass and the probe; the probe previously batched
+# all --probe-frames at once, which OOM'd the GPU before the run began. 8 at
+# native 1080p fit comfortably on a 32GB 5090; a smaller/shared GPU needs a
+# lower value, and a CUDA OOM here is a hard crash mid-batch, not a clean
+# refusal — pass --detect-batch conservatively rather than finding out.
 DETECT_BATCH = 8
 
 # Cost-model assumptions for the budget gate. These are ASSUMPTIONS, not
@@ -229,6 +232,7 @@ class Config:
     force_reprocess: bool
     probe_frames_dir: Path
     gen2_resize_px: int | None
+    detect_batch: int
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
@@ -277,6 +281,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
                          "faces at full size but runs the model at a scale it was "
                          "never evaluated at. A/B the two with --probe-only before "
                          "trusting either operating point.")
+    p.add_argument("--detect-batch", type=int, default=DETECT_BATCH,
+                    help=f"frames per detector call, both the real pass and the "
+                         f"probe (default {DETECT_BATCH}, sized for a 32GB 5090 at "
+                         f"native 1080p resolution). Lower this on a smaller GPU — "
+                         f"an OOM here is a CUDA error mid-batch, not a clean "
+                         f"refusal, so guess conservatively rather than finding out "
+                         f"the hard way.")
     p.add_argument("--probe-frames-dir", type=Path, default=None,
                     help="where --probe-only writes annotated sample frames. These are "
                          "UNREDACTED originals, so this deliberately defaults OUTSIDE "
@@ -296,6 +307,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error(f"--detect-hz {a.detect_hz} must be > 0 (it divides fps to pick a stride).")
     if a.hold_frames < 0:
         p.error(f"--hold-frames {a.hold_frames} is negative — disables track association.")
+    if a.detect_batch < 1:
+        p.error(f"--detect-batch {a.detect_batch} must be >= 1.")
     if a.gen2_resize_px is not None and a.gen2_resize_px < 64:
         p.error(f"--gen2-resize-px {a.gen2_resize_px} is implausibly small.")
     if a.min_box_px < 0:
@@ -368,6 +381,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         force_reprocess=a.force_reprocess,
         probe_frames_dir=a.probe_frames_dir,
         gen2_resize_px=a.gen2_resize_px,
+        detect_batch=a.detect_batch,
     )
 
 
@@ -1086,17 +1100,18 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
             f"actually said."
         )
 
-    # Run the probe through the SAME batch size production uses. Passing all
-    # --probe-frames (default 600) as one batch meant ~3.7 GB of BGR frames,
-    # doubled by np.stack's contiguous copy, then a 600-image GPU batch — 75x
-    # the production BATCH — which OOMs any rentable card. The failure path
+    # Run the probe through the SAME batch size production uses (now
+    # --detect-batch, default 8). Passing all --probe-frames (default 600)
+    # as one batch meant ~3.7 GB of BGR frames, doubled by np.stack's
+    # contiguous copy, then a 600-image GPU batch — 75x the production
+    # batch — which OOMs any rentable card. The failure path
     # deliberately leaves the pod up for debugging, so that OOM burned the
     # full watchdog window for zero output.
     t0 = time.monotonic()
     face_dets: list[Detection] = []
     lp_dets: list[Detection] = []
-    for i in range(0, len(sampled_bgr), DETECT_BATCH):
-        chunk = sampled_bgr[i:i + DETECT_BATCH]
+    for i in range(0, len(sampled_bgr), cfg.detect_batch):
+        chunk = sampled_bgr[i:i + cfg.detect_batch]
         # POSITIONS into sampled_bgr, not clip-local frame numbers. Every
         # clip has a frame 0, so clip-local indices collide across clips —
         # which merged different clips' detections under one key and drew
@@ -1505,7 +1520,7 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
         if idx % stride == 0 and idx not in done_frames:
             batch_bgr.append(yuv_to_bgr(y, u, v, clip.color_range == "pc"))
             batch_idx.append(idx)
-            if len(batch_bgr) >= DETECT_BATCH:
+            if len(batch_bgr) >= cfg.detect_batch:
                 flush()
         idx += 1
         frames_read += 1
@@ -2384,6 +2399,10 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             # the model runs at, and therefore what a score MEANS — two runs
             # at different values are not comparable.
             "gen2_resize_px": cfg.gen2_resize_px,
+            # Batching only affects throughput, not results — NOT in the
+            # checkpoint fingerprint on purpose, so resuming across a GPU
+            # swap (this pod's whole situation right now) still works.
+            "detect_batch": cfg.detect_batch,
         },
         "env": {
             "torch": torch.__version__,
