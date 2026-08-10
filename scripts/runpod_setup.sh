@@ -95,11 +95,46 @@ command -v ffprobe >/dev/null 2>&1 || {
     exit 1
 }
 
+# --- rclone (optional; skip with EGOANNOTE_SKIP_RCLONE=1) --------------------
+# For pulling footage straight from Google Drive to the pod, which runs at
+# datacenter speed instead of being capped by a home uplink.
+#
+# NOT installed via the official `curl https://rclone.org/install.sh | bash`:
+# that needs unzip/7z/busybox (absent on minimal images) and installs into
+# /usr/bin, which is CONTAINER disk — so it would silently disappear on the
+# next pod restart, exactly like uv and ffmpeg did. Python is already here
+# via uv, and its zipfile module needs no system packages at all.
+if [ "${EGOANNOTE_SKIP_RCLONE:-0}" = "1" ]; then
+    echo ">> skipping rclone (EGOANNOTE_SKIP_RCLONE=1)"
+elif [ -x "$BIN/rclone" ]; then
+    echo ">> rclone already present: $("$BIN/rclone" version | head -1)"
+else
+    echo ">> installing rclone into $BIN"
+    tmp="$(mktemp -d)"
+    curl -LsS https://downloads.rclone.org/rclone-current-linux-amd64.zip \
+        -o "$tmp/rclone.zip"
+    uv run --no-project python - "$tmp/rclone.zip" "$BIN/rclone" <<'PY'
+import shutil, sys, zipfile
+src, dst = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as z:
+    inner = [n for n in z.namelist() if n.endswith("/rclone")]
+    if len(inner) != 1:
+        raise SystemExit(f"expected one rclone binary in the archive, found {inner}")
+    with z.open(inner[0]) as f, open(dst, "wb") as out:
+        shutil.copyfileobj(f, out)
+PY
+    chmod +x "$BIN/rclone"
+    rm -rf "$tmp"
+fi
+
 echo
 echo "--- ready ---"
 echo "uv      : $(command -v uv) — $(uv --version)"
 echo "ffmpeg  : $(command -v ffmpeg) — $(ffmpeg -version | head -1)"
 echo "ffprobe : $(command -v ffprobe) — $(ffprobe -version | head -1)"
+if [ -x "$BIN/rclone" ]; then
+    echo "rclone  : $BIN/rclone — $("$BIN/rclone" version | head -1)"
+fi
 echo
 echo "Run this in your shell (a script cannot set its parent's PATH):"
 echo "  export PATH=\"$BIN:\$PATH\"; export UV_CACHE_DIR=$UV_CACHE_DIR"
