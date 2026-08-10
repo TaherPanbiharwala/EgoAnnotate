@@ -795,31 +795,34 @@ def build_detectors(cfg: Config) -> tuple[str, Any, Any]:
     detectors partway through a clip would mean two different recall
     profiles inside one manifest, which defeats the point of recording
     egoblur.gen in provenance at all."""
-    have_gen2 = cfg.face_weights_gen2 is not None and cfg.lp_weights_gen2 is not None
-    have_gen1 = cfg.face_weights_gen1 is not None and cfg.lp_weights_gen1 is not None
+    # FACE weights are mandatory; LICENSE-PLATE weights are optional.
+    # Indoor egocentric footage contains no plates, and running the LP
+    # detector there doubles GPU cost to find nothing. Skipping it is a
+    # legitimate configuration — but it is NOT free: the manifest and the
+    # audit both record that plates were never checked, so a clip processed
+    # without LP weights can never be mistaken later for one that was
+    # cleared of plates. Never infer "no plates present" from "no plate
+    # detector ran".
+    have_gen2 = cfg.face_weights_gen2 is not None
+    have_gen1 = cfg.face_weights_gen1 is not None
 
     if cfg.gen == "2":
         use_gen2 = True
         if not have_gen2:
-            raise RuntimeError("--gen 2 requires BOTH --face-weights-gen2 and --lp-weights-gen2")
+            raise RuntimeError("--gen 2 requires --face-weights-gen2")
     elif cfg.gen == "1":
         use_gen2 = False
         if not have_gen1:
-            raise RuntimeError("--gen 1 requires BOTH --face-weights-gen1 and --lp-weights-gen1")
-    else:  # auto — requires a COMPLETE pair, not just one weight file present.
-        # A partial gen2 pair (e.g. only --face-weights-gen2 set, a likely
-        # typo) must fall through to gen1 or a clear error, not silently
-        # resolve to gen2 and then fail with an error that names --gen 2
-        # explicitly when the user never asked for it.
+            raise RuntimeError("--gen 1 requires --face-weights-gen1")
+    else:  # auto
         if have_gen2:
             use_gen2 = True
         elif have_gen1:
             use_gen2 = False
         else:
             raise RuntimeError(
-                "--gen auto found neither a complete Gen2 weight pair "
-                "(--face-weights-gen2 + --lp-weights-gen2) nor a complete "
-                "Gen1 pair (--face-weights-gen1 + --lp-weights-gen1)."
+                "--gen auto found no face weights. Pass --face-weights-gen2 "
+                "(preferred) or --face-weights-gen1."
             )
 
     # Detectors run at the SWEEP floor, not the operating threshold. This is
@@ -834,16 +837,28 @@ def build_detectors(cfg: Config) -> tuple[str, Any, Any]:
         log.info("using Gen2 detector (batched), detecting down to %.2f", cfg.sweep_threshold)
         face = Gen2Detector(cfg.face_weights_gen2, "face", cfg.device,
                              cfg.sweep_threshold, cfg.nms_iou)
-        lp = Gen2Detector(cfg.lp_weights_gen2, "lp", cfg.device,
-                           cfg.sweep_threshold, cfg.nms_iou)
+        lp = None
+        if cfg.lp_weights_gen2 is not None:
+            lp = Gen2Detector(cfg.lp_weights_gen2, "lp", cfg.device,
+                               cfg.sweep_threshold, cfg.nms_iou)
+        else:
+            log.warning("no --lp-weights-gen2: LICENSE PLATES WILL NOT BE "
+                         "DETECTED OR REDACTED in this run. Recorded in the "
+                         "manifest as lp_checked=false.")
         return "2", face, lp
 
     log.info("using Gen1 detector (single-image, no batching — see module docstring), "
               "detecting down to %.2f", cfg.sweep_threshold)
     face = Gen1Detector(cfg.face_weights_gen1, "face", cfg.device,
                          cfg.sweep_threshold, cfg.nms_iou)
-    lp = Gen1Detector(cfg.lp_weights_gen1, "lp", cfg.device,
-                       cfg.sweep_threshold, cfg.nms_iou)
+    lp = None
+    if cfg.lp_weights_gen1 is not None:
+        lp = Gen1Detector(cfg.lp_weights_gen1, "lp", cfg.device,
+                           cfg.sweep_threshold, cfg.nms_iou)
+    else:
+        log.warning("no --lp-weights-gen1: LICENSE PLATES WILL NOT BE "
+                     "DETECTED OR REDACTED in this run. Recorded in the "
+                     "manifest as lp_checked=false.")
     return "1", face, lp
 
 
@@ -1005,7 +1020,8 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
         chunk = sampled_bgr[i:i + DETECT_BATCH]
         chunk_idx = sampled_idx[i:i + DETECT_BATCH]
         face_dets.extend(face_det.detect_batch(chunk, chunk_idx))
-        lp_dets.extend(lp_det.detect_batch(chunk, chunk_idx))
+        if lp_det is not None:
+            lp_dets.extend(lp_det.detect_batch(chunk, chunk_idx))
     detect_s = time.monotonic() - t0
     ms_per_frame = 1000 * detect_s / max(1, len(sampled_bgr))
 
@@ -1188,7 +1204,9 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
         nonlocal detections
         if not batch_bgr:
             return
-        new_dets = face_det.detect_batch(batch_bgr, batch_idx) + lp_det.detect_batch(batch_bgr, batch_idx)
+        new_dets = face_det.detect_batch(batch_bgr, batch_idx)
+        if lp_det is not None:
+            new_dets = new_dets + lp_det.detect_batch(batch_bgr, batch_idx)
         detections.extend(new_dets)
         by_frame: dict[int, list[Detection]] = {i: [] for i in batch_idx}
         for d in new_dets:
@@ -1890,7 +1908,8 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
 
 
 def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
-                 yunet: dict, gen: str, n_dropped_small: int = 0) -> dict:
+                 yunet: dict, gen: str, n_dropped_small: int = 0,
+                 lp_checked: bool = True) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -1952,6 +1971,9 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         "yunet_ran": yunet_ran,
         "integrity_ran": integrity_ran,
         "n_dropped_small": n_dropped_small,
+        # False means no plate detector ran at all. Recorded so a face-only
+        # run is never later read as "this clip has no license plates".
+        "lp_checked": lp_checked,
         "gen": gen,
         "note": (
             "Re-running the detector on the redacted output cannot find a "
@@ -2017,6 +2039,7 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             "face_threshold": cfg.face_threshold, "lp_threshold": cfg.lp_threshold,
             "sweep_threshold": cfg.sweep_threshold, "nms_iou": cfg.nms_iou,
             "detect_hz": cfg.detect_hz, "redaction": cfg.redaction,
+            "lp_checked": cfg.lp_weights_gen2 is not None or cfg.lp_weights_gen1 is not None,
             "dilate_scale": cfg.dilate_scale, "motion_margin_px": cfg.motion_margin_px,
             "hold_frames": cfg.hold_frames, "min_box_px": cfg.min_box_px,
         },
@@ -2126,7 +2149,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     t_verify = time.monotonic()
 
     audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen,
-                         n_dropped_small=len(dropped_small))
+                         n_dropped_small=len(dropped_small),
+                         lp_checked=lp_det is not None)
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {

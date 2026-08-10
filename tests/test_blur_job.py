@@ -688,3 +688,26 @@ def test_yunet_without_a_model_is_labelled_skipped_not_clean(blur_job, tmp_path)
                                 {}, 10.0, 30.0, 1)
     assert "yunet_skipped" in out
     assert "n_yunet_uncovered" not in out
+
+
+def test_face_only_run_is_allowed_but_records_that_plates_were_not_checked(blur_job):
+    """Indoor egocentric footage has no plates, and running the LP detector
+    there doubles GPU cost to find nothing — so face-only is a legitimate
+    configuration. It must never be silently indistinguishable from a run
+    that actually cleared plates."""
+    a = blur_job.build_audit(
+        _clip(blur_job), {"n_frames_with_fill": 10},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"n_yunet_uncovered": 0}, "2",
+        lp_checked=False)
+    assert a["lp_checked"] is False
+    assert a["status"] == "PASS_AUTOMATED"  # face-only is valid, not a failure
+
+
+def test_gen2_requires_only_face_weights(blur_job, tmp_path):
+    """LP weights optional; face weights are not."""
+    face = tmp_path / "f.jit"
+    face.write_bytes(b"x")
+    cfg = blur_job.parse_args([*BASE_ARGS, "--gen", "2",
+                                "--face-weights-gen2", str(face)])
+    assert cfg.face_weights_gen2 == face and cfg.lp_weights_gen2 is None
