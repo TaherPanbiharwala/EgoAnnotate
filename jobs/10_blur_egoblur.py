@@ -162,6 +162,26 @@ ASSUMED_YUNET_MS = 35.0     # per sampled frame, CPU
 # privacy claim, so "mostly covered" is a miss, not a pass.
 COVERAGE_MIN_FRAC = 0.98
 
+# How far a redacted pixel may drift from FILL_VALUE and still count as
+# redacted. Not zero, because the output is lossily encoded: a flat block
+# still moves by a couple of levels through H.264. Measured on a real
+# CRF-18 encode, the eroded interior of a filled box lands at |dev| <= 3
+# with std ~0.1, so these are tight-but-real, not arbitrary.
+FILL_MAX_DEVIATION = 3
+FILL_MAX_STD = 2
+
+# Erosion before checking, in each plane's own samples. These are measured,
+# not guessed: on a real CRF-18 encode of a filled 100x100 box, deviation
+# from FILL_VALUE against erosion depth came out as
+#   chroma samples eroded: 0 -> 4, 1 -> 4, 2 -> 4, 3 -> 2, 4 -> 2
+# so ringing from the box's sharp edge reaches ~3 chroma samples (6 luma
+# px) inward. The original 2-luma-px erosion is only ONE chroma sample, so
+# every correctly-redacted large box was reported as a violation — 30/30
+# frames — which would have made every clip NEEDS_REVIEW and trained the
+# reviewer to ignore the gate entirely.
+LUMA_ERODE_PX = 2
+CHROMA_ERODE_SAMPLES = 3
+
 FILL_VALUE = 128  # mid-gray. Exact value matters: check_fill_integrity()
 # treats deviation from this as a hard invariant, not a heuristic.
 
@@ -286,8 +306,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
             f"otherwise the audit's low-confidence band is empty and the "
             f"candidate-miss check can never fire."
         )
+    od = a.output_dir.expanduser().resolve()
     if a.probe_frames_dir is None:
-        a.probe_frames_dir = a.output_dir.parent / f"{a.output_dir.name}-probe-DO-NOT-SHIP"
+        # resolve() first: with --output-dir "." or ".." the unresolved name
+        # is empty, and the "sibling" landed INSIDE the publish tree —
+        # putting unredacted originals back exactly where this defends.
+        a.probe_frames_dir = od.parent / f"{od.name}-probe-DO-NOT-SHIP"
+    pfd = a.probe_frames_dir.expanduser().resolve()
+    if pfd == od or od in pfd.parents:
+        p.error(
+            f"--probe-frames-dir {pfd} is inside --output-dir {od}. Probe frames'"
+            f" are UNREDACTED originals and must never sit in the tree that gets"
+            f" synced off the pod and published."
+        )
+    a.probe_frames_dir = pfd
 
     return Config(
         input_dir=a.input_dir,
@@ -472,6 +504,13 @@ class ClipInfo:
     duration_s: float
     rotation: int
     sha256: str
+    # Source color tags, propagated verbatim into the encode. Hardcoding
+    # bt709/tv here and only on the output side rewrote every pixel; see
+    # open_encoder's docstring.
+    color_primaries: str = "bt709"
+    color_trc: str = "bt709"
+    colorspace: str = "bt709"
+    color_range: str = "tv"
 
 
 def ffprobe_json(ffprobe: str, path: Path) -> dict:
@@ -480,7 +519,8 @@ def ffprobe_json(ffprobe: str, path: Path) -> dict:
         "-select_streams", "v:0",
         "-show_entries",
         "stream=width,height,r_frame_rate,avg_frame_rate,nb_read_packets,"
-        "duration,rotation,codec_name,pix_fmt",
+        "duration,rotation,codec_name,pix_fmt,"
+        "color_primaries,color_transfer,color_space,color_range",
         "-show_entries", "stream_tags=rotate",
         "-of", "json",
         "-count_packets",
@@ -567,6 +607,10 @@ def discover_clips(input_dir: Path, ffprobe: str) -> list[ClipInfo]:
             duration_s=float(stream.get("duration", 0.0)),
             rotation=rotation,
             sha256=sha256_file(path),
+            color_primaries=stream.get("color_primaries") or "bt709",
+            color_trc=stream.get("color_transfer") or "bt709",
+            colorspace=stream.get("color_space") or "bt709",
+            color_range=stream.get("color_range") or "tv",
         ))
     log.info("discovered %d clip(s)", len(clips))
     return clips
@@ -864,28 +908,42 @@ def read_frames(proc: subprocess.Popen, w: int, h: int) -> Iterator[tuple]:
 
 
 def open_encoder(ffmpeg: str, w: int, h: int, fps: float, out_path: Path,
-                  preset: str, crf: int, stderr_log: Path) -> subprocess.Popen:
+                  preset: str, crf: int, stderr_log: Path, *,
+                  color_primaries: str = "bt709", color_trc: str = "bt709",
+                  colorspace: str = "bt709", color_range: str = "tv") -> subprocess.Popen:
     """Raw yuv420p in, never bgr24: a BGR round trip costs real quality on
     EVERY pixel (measured 45.5 dB PSNR), not just the redacted ones, and
     this file becomes the single source of truth for hand tracking, VLM
-    captioning, and the public release. -color_* flags are needed because
-    raw pipes carry no color metadata at all — without them the output is
-    tagged as unspecified colorspace, which some players render washed
-    out. -an -sn -dn strips audio/subtitles/data unconditionally: voices
-    are biometric and GPMF timed metadata can carry GPS, both defeating
-    the point of this whole job.
+    captioning, and the public release. -an -sn -dn strips
+    audio/subtitles/data unconditionally: voices are biometric and GPMF
+    timed metadata can carry GPS, both defeating the point of this job.
+
+    COLOR TAGS MUST BE SET ON THE INPUT AS WELL AS THE OUTPUT. Raw pipes
+    carry no color metadata, so ffmpeg treats an output-only
+    `-color_range tv` as a CONVERSION request from assumed-full to limited
+    range — it does not just tag, it rewrites every pixel. Measured on a
+    plain re-encode with no redaction at all: mean |Y| drift 13.8, max 33,
+    75.6% of pixels altered, versus 0.09 / 5 / 0.0% with the flags on both
+    sides. That is a systematic degradation of the published master, and
+    it was introduced by adding these flags to prevent washed-out playback
+    — which is the same defect, worse. Declaring the input identical makes
+    the conversion an identity and leaves the tag doing only its job.
 
     stderr to a file, same reasoning as open_decoder — the failure path in
     redact_and_encode() reads this file back on a nonzero exit instead of
     proc.stderr, so nothing is lost."""
     stderr_log.parent.mkdir(parents=True, exist_ok=True)
+    color = [
+        "-color_primaries", color_primaries, "-color_trc", color_trc,
+        "-colorspace", colorspace, "-color_range", color_range,
+    ]
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}", "-r", f"{fps}",
+        *color,          # INPUT side: describes the bytes we are piping in
         "-i", "-",
         "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
-        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-        "-color_range", "tv",
+        *color,          # OUTPUT side: same values, so the convert is a no-op
         "-an", "-sn", "-dn", "-map_metadata", "-1", "-movflags", "+faststart",
         str(out_path),
     ]
@@ -996,7 +1054,7 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
         "watchdog_hours": None if cfg.no_watchdog else cfg.watchdog_hours,
     }
     log.info("probe: %s", json.dumps(report, indent=2))
-    if len(face_dets) == 0 and len(lp_dets) == 0:
+    if len(face_dets) == 0 and len(lp_dets) == 0 and not cfg.force:
         raise RuntimeError(
             f"probe found ZERO detections of either class across "
             f"{len(sampled_bgr)} sampled frames. That is either genuinely "
@@ -1007,6 +1065,10 @@ def probe_and_budget(cfg: Config, clips: list[ClipInfo], face_det, lp_det,
             f"Re-run with --probe-only and inspect the written frames, or "
             f"pass --force if the footage really is empty."
         )
+    if len(face_dets) == 0 and len(lp_dets) == 0:
+        log.warning("probe found zero detections but --force was passed — "
+                     "continuing. Nothing will be redacted unless the rest of "
+                     "the footage differs from the probe sample.")
 
     if not cfg.force and est_usd > cfg.budget_usd:
         raise RuntimeError(
@@ -1256,7 +1318,9 @@ def _box_is_covered(box: tuple, fill_boxes: list[tuple]) -> bool:
     return _covered_fraction(box, fill_boxes) >= COVERAGE_MIN_FRAC
 
 
-def _apply_forced_boxes(path: Path, clip: ClipInfo, fill_map: dict) -> int:
+def _apply_forced_boxes(path: Path, clip: ClipInfo, fill_map: dict, *,
+                         hold_frames: int, back_hold_frames: int,
+                         dilate_scale: float, motion_margin_px: int) -> int:
     """Merge human-supplied "you missed this face" boxes into fill_map.
 
     Every failure here is loud, because this is the remediation path: the
@@ -1287,29 +1351,59 @@ def _apply_forced_boxes(path: Path, clip: ClipInfo, fill_map: dict) -> int:
         )
         return 0
 
-    n = 0
+    forced_dets: list[Detection] = []
     for entry in forced[clip.clip_id]:
+        frame_idx = int(entry["frame_idx"])
+        if not 0 <= frame_idx < clip.n_frames:
+            # Loud, not a warning: an out-of-range index used to be a silent
+            # no-op that still counted toward "applied N forced boxes", so a
+            # typo'd frame number reported success and republished the face.
+            raise RuntimeError(
+                f"--forced-boxes frame_idx {frame_idx} is outside "
+                f"{clip.clip_id}'s range 0..{clip.n_frames - 1}."
+            )
         x1, y1, x2, y2 = (float(v) for v in entry["box"])
         cx1, cy1 = max(0.0, min(x1, x2)), max(0.0, min(y1, y2))
         cx2 = min(float(clip.width), max(x1, x2))
         cy2 = min(float(clip.height), max(y1, y2))
         if cx2 <= cx1 or cy2 <= cy1:
             log.warning("%s: forced box %s on frame %s is empty after clamping — skipped",
-                         clip.clip_id, entry["box"], entry["frame_idx"])
+                         clip.clip_id, entry["box"], frame_idx)
             continue
-        fill_map.setdefault(int(entry["frame_idx"]), []).append((cx1, cy1, cx2, cy2))
-        n += 1
-    if n == 0:
+        forced_dets.append(Detection(frame_idx=frame_idx, cls="face",
+                                      box=(cx1, cy1, cx2, cy2), score=1.0))
+
+    if not forced_dets:
         raise RuntimeError(
             f"--forced-boxes listed {clip.clip_id} but no usable box survived "
             f"clamping to {clip.width}x{clip.height}. Refusing to report a "
             f"remediation run that redacted nothing new."
         )
-    return n
+
+    # Forced boxes go through the SAME temporal machinery as detections.
+    # Writing each one to its single listed frame was the critical hole: the
+    # review page hands out one entry per flagged frame, and flagged frames
+    # sit on the detection stride grid — so the reviewer covered frames
+    # 90, 93, 96... and every frame between them still shipped the face.
+    # Both checks that could have noticed sample that same stride grid, so
+    # the clip then flipped NEEDS_REVIEW -> PASS_AUTOMATED with the face
+    # visible on two thirds of its frames. Interpolation joins consecutive
+    # forced boxes; the holds cover the ends.
+    tracks = build_tracks(forced_dets, min_box_px=0, iou_thresh=TRACK_IOU_DEFAULT,
+                           hold_frames=hold_frames, back_hold_frames=back_hold_frames)
+    forced_map = tracks_to_fill_map(tracks, clip.width, clip.height,
+                                     dilate_scale, motion_margin_px)
+    for frame_idx, boxes in forced_map.items():
+        fill_map.setdefault(frame_idx, []).extend(boxes)
+
+    log.info("%s: %d forced box(es) expanded to %d covered frame(s)",
+              clip.clip_id, len(forced_dets), len(forced_map))
+    return len(forced_dets)
 
 
 def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float,
-                  hold_frames: int, back_hold_frames: int = 0) -> list[Track]:
+                  hold_frames: int, back_hold_frames: int = 0,
+                  dropped_small: list | None = None) -> list[Track]:
     """Greedy nearest-IoU association across consecutive DETECTION frames
     (not every video frame — detections are already sparse at detect_hz),
     then linear interpolation across the gap between consecutive detection
@@ -1322,11 +1416,19 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
 
     Pass back_hold_frames=stride so the frames between a face appearing and
     its first detection sample are covered too (see the hold loop below)."""
+    if dropped_small is None:
+        dropped_small = []
     by_frame: dict[int, list[Detection]] = {}
     for d in detections:
         w = d.box[2] - d.box[0]
         h = d.box[3] - d.box[1]
         if w < min_box_px or h < min_box_px:
+            # Dropped here means never redacted AND never audited: the sweep
+            # only inspects the sub-operating-threshold band, and integrity
+            # only inspects boxes already in the fill_map. A confident
+            # detection of a small or edge-truncated face would vanish
+            # silently, so the caller is handed the count to gate on.
+            dropped_small.append(d)
             continue
         by_frame.setdefault(d.frame_idx, []).append(d)
 
@@ -1515,7 +1617,9 @@ def redact_and_encode(cfg: Config, clip: ClipInfo, fill_map: dict, ffmpeg: str,
     enc_log = cfg.output_dir / "logs" / f"{clip.clip_id}.encode.stderr.log"
     dec = open_decoder(ffmpeg, clip.path, dec_log)
     enc = open_encoder(ffmpeg, clip.width, clip.height, clip.fps, out_path,
-                        cfg.encode_preset, cfg.encode_crf, enc_log)
+                        cfg.encode_preset, cfg.encode_crf, enc_log,
+                        color_primaries=clip.color_primaries, color_trc=clip.color_trc,
+                        colorspace=clip.colorspace, color_range=clip.color_range)
     assert enc.stdin is not None
     n_frames_with_fill = 0
     max_area_frac = 0.0
@@ -1598,6 +1702,7 @@ def check_fill_integrity(ffmpeg: str, out_path: Path, w: int, h: int,
     violations = 0
     checked = 0
     unverifiable = 0
+    chroma_unverifiable = 0
     frames_seen = 0
     for idx, (y, u, v) in enumerate(read_frames(proc, w, h)):
         frames_seen = idx + 1
@@ -1613,21 +1718,38 @@ def check_fill_integrity(ffmpeg: str, out_path: Path, w: int, h: int,
             # FAILED clip on the human remediation path.
             ix1, iy1 = max(0, int(x1)), max(0, int(y1))
             ix2, iy2 = min(w, int(x2)), min(h, int(y2))
-            eix1, eiy1, eix2, eiy2 = ix1 + 2, iy1 + 2, ix2 - 2, iy2 - 2
+            eix1, eiy1 = ix1 + LUMA_ERODE_PX, iy1 + LUMA_ERODE_PX
+            eix2, eiy2 = ix2 - LUMA_ERODE_PX, iy2 - LUMA_ERODE_PX
             if eix2 <= eix1 or eiy2 <= eiy1:
-                eix1, eiy1, eix2, eiy2 = ix1, iy1, ix2, iy2  # too small to erode — check raw
+                eix1, eiy1, eix2, eiy2 = ix1, iy1, ix2, iy2  # too small to erode
             if eix2 <= eix1 or eiy2 <= eiy1:
                 unverifiable += 1  # genuinely zero-area box; nothing to check
                 continue
             y_region = y[eiy1:eiy2, eix1:eix2].astype(np.int16)
-            cy1, cx1 = eiy1 // 2, eix1 // 2
-            cy2, cx2 = max(cy1 + 1, (eiy2 + 1) // 2), max(cx1 + 1, (eix2 + 1) // 2)
-            u_region = u[cy1:cy2, cx1:cx2].astype(np.int16)
-            v_region = v[cy1:cy2, cx1:cx2].astype(np.int16)
+
+            # Chroma is eroded in its OWN samples, by a measured amount (see
+            # CHROMA_ERODE_SAMPLES). Deriving the chroma window from the
+            # luma-eroded box instead only buys one chroma sample of margin,
+            # which is a third of the ringing depth — that is what made every
+            # correctly-redacted large box report a violation. A box too
+            # small to erode this far has no trustworthy chroma interior at
+            # all, so its chroma is left unchecked and counted, never faked.
+            cx1 = ix1 // 2 + CHROMA_ERODE_SAMPLES
+            cy1 = iy1 // 2 + CHROMA_ERODE_SAMPLES
+            cx2 = ix2 // 2 - CHROMA_ERODE_SAMPLES
+            cy2 = iy2 // 2 - CHROMA_ERODE_SAMPLES
+            if cx2 > cx1 and cy2 > cy1:
+                u_region = u[cy1:cy2, cx1:cx2].astype(np.int16)
+                v_region = v[cy1:cy2, cx1:cx2].astype(np.int16)
+            else:
+                u_region = v_region = None
+                chroma_unverifiable += 1
             checked += 1
             planes_ok = all(
-                np.max(np.abs(region - FILL_VALUE)) <= 3 and np.std(region) <= 2
+                np.max(np.abs(region - FILL_VALUE)) <= FILL_MAX_DEVIATION
+                and np.std(region) <= FILL_MAX_STD
                 for region in (y_region, u_region, v_region)
+                if region is not None and region.size
             )
             if not planes_ok:
                 violations += 1
@@ -1652,6 +1774,7 @@ def check_fill_integrity(ffmpeg: str, out_path: Path, w: int, h: int,
         "fill_integrity_checked": checked,
         "fill_integrity_violations": violations,
         "fill_integrity_unverifiable": unverifiable,
+        "fill_integrity_chroma_unverifiable": chroma_unverifiable,
         "fill_integrity_frames": frames_seen,
     }
 
@@ -1671,11 +1794,16 @@ def check_low_threshold_sweep(detections: list[Detection], fill_map: dict,
         covered = _box_is_covered(d.box, boxes)
         if not covered:
             candidates.append(d)
+    ranked = sorted(candidates, key=lambda d: -d.score)
     return {
         "n_candidate_misses": len(candidates),
         "n_frames_with_candidate_miss": len({d.frame_idx for d in candidates}),
-        "candidates": [dataclasses.asdict(d) for d in
-                        sorted(candidates, key=lambda d: -d.score)[:200]],
+        # The embedded list is capped, the COUNT above is not. The review
+        # page reads the list; without an explicit truncation marker it
+        # would show 200 and call it the total, hiding the rest from the
+        # only human who looks.
+        "candidates": [dataclasses.asdict(d) for d in ranked[:AUDIT_MAX_ITEMS]],
+        "candidates_truncated": max(0, len(candidates) - AUDIT_MAX_ITEMS),
     }
 
 
@@ -1699,7 +1827,18 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
         return {"yunet_skipped": "no --yunet-model provided"}
     import cv2
 
-    detector = cv2.FaceDetectorYN.create(str(cfg.yunet_model), "", (w, h))
+    # score_threshold MUST be passed. OpenCV defaults it to 0.9, so the
+    # YUNET_SCORE_MIN filter below never gated anything and the check ran
+    # far stricter than intended — silently missing exactly the
+    # low-confidence second-opinion hits it exists to surface.
+    detector = cv2.FaceDetectorYN.create(
+        str(cfg.yunet_model), "", (w, h), YUNET_SCORE_MIN, cfg.nms_iou)
+    if abs(detector.getScoreThreshold() - YUNET_SCORE_MIN) > 1e-6:
+        raise RuntimeError(
+            f"YuNet score threshold is {detector.getScoreThreshold()}, expected "
+            f"{YUNET_SCORE_MIN} — refusing to run a check whose sensitivity is "
+            f"not what the audit reports."
+        )
     stride = max(1, round(fps / detect_hz))
     stderr_log = cfg.output_dir / "logs" / f"{out_path.stem}.yunet_decode.stderr.log"
     proc = open_decoder(ffmpeg, out_path, stderr_log)
@@ -1745,12 +1884,13 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
     return {
         "n_yunet_uncovered": len(uncovered),
         "yunet_uncovered": uncovered[:AUDIT_MAX_ITEMS],
+        "yunet_truncated": max(0, len(uncovered) - AUDIT_MAX_ITEMS),
         "yunet_frames": frames_seen,
     }
 
 
 def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
-                 yunet: dict, gen: str) -> dict:
+                 yunet: dict, gen: str, n_dropped_small: int = 0) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -1790,6 +1930,14 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
     if integrity_ran and integrity.get("fill_integrity_checked", 0) == 0 \
             and fill_stats.get("n_frames_with_fill", 0) > 0:
         reasons.append("integrity verified zero boxes despite a non-empty fill_map")
+    if n_dropped_small > 0:
+        # Above the operating threshold but below --min-box-px: the detector
+        # was confident and we redacted nothing, and no other check can see
+        # it. Small/edge-truncated faces are the dominant miss case in
+        # egocentric footage, so this is a human decision, not a silent drop.
+        reasons.append(
+            f"{n_dropped_small} confident detection(s) discarded by --min-box-px "
+            f"and never redacted or audited")
 
     status = "NEEDS_REVIEW" if reasons else "PASS_AUTOMATED"
     if status == "PASS_AUTOMATED" and not yunet_ran:
@@ -1803,6 +1951,7 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # flattened into this dict.
         "yunet_ran": yunet_ran,
         "integrity_ran": integrity_ran,
+        "n_dropped_small": n_dropped_small,
         "gen": gen,
         "note": (
             "Re-running the detector on the redacted output cannot find a "
@@ -1946,14 +2095,19 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
 
     hold_frames = cfg.hold_frames or round(clip.fps)
     stride = max(1, round(clip.fps / cfg.detect_hz))
+    dropped_small: list[Detection] = []
     tracks = build_tracks(redact_dets, cfg.min_box_px, iou_thresh=TRACK_IOU_DEFAULT,
-                           hold_frames=hold_frames, back_hold_frames=stride)
+                           hold_frames=hold_frames, back_hold_frames=stride,
+                           dropped_small=dropped_small)
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
     del tracks  # ~260 MB of per-frame entries; nothing below reads it again
 
     if cfg.forced_boxes is not None:
-        n_forced = _apply_forced_boxes(cfg.forced_boxes, clip, fill_map)
+        n_forced = _apply_forced_boxes(
+            cfg.forced_boxes, clip, fill_map,
+            hold_frames=hold_frames, back_hold_frames=stride,
+            dilate_scale=cfg.dilate_scale, motion_margin_px=cfg.motion_margin_px)
         log.info("%s: applied %d forced boxes from human review", clip.clip_id, n_forced)
 
     out_path = cfg.output_dir / f"{clip.clip_id}.blurred.mp4"
@@ -1971,7 +2125,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                          fill_map, cfg.detect_hz, clip.fps, clip.n_frames)
     t_verify = time.monotonic()
 
-    audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen)
+    audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen,
+                         n_dropped_small=len(dropped_small))
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {

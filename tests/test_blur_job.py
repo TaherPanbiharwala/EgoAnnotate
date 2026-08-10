@@ -446,36 +446,83 @@ def test_integrity_skipped_in_blur_mode_is_labelled_not_zeroed(blur_job, tmp_pat
 # ---------------------------------------------------------------------------
 
 
-def test_missing_forced_boxes_file_raises(blur_job, tmp_path):
-    with pytest.raises(RuntimeError, match="does not exist"):
-        blur_job._apply_forced_boxes(tmp_path / "nope.json", _clip(blur_job), {})
-
-
-def test_forced_boxes_with_no_matching_clip_id_warns_and_applies_nothing(blur_job, tmp_path, caplog):
+def _forced(blur_job, tmp_path, payload, clip=None, fill_map=None, **kw):
     import json
     p = tmp_path / "f.json"
-    p.write_text(json.dumps({"OTHER": [{"frame_idx": 5, "box": [0, 0, 10, 10]}]}))
+    p.write_text(json.dumps(payload))
+    opts = dict(hold_frames=30, back_hold_frames=3, dilate_scale=1.3, motion_margin_px=8)
+    opts.update(kw)
+    return blur_job._apply_forced_boxes(
+        p, clip or _clip(blur_job, n_frames=200, width=640, height=480),
+        fill_map if fill_map is not None else {}, **opts)
+
+
+def test_missing_forced_boxes_file_raises(blur_job, tmp_path):
+    with pytest.raises(RuntimeError, match="does not exist"):
+        blur_job._apply_forced_boxes(
+            tmp_path / "nope.json", _clip(blur_job), {},
+            hold_frames=30, back_hold_frames=3, dilate_scale=1.3, motion_margin_px=8)
+
+
+def test_forced_boxes_with_no_matching_clip_id_warns_and_applies_nothing(
+        blur_job, tmp_path, caplog):
     fill_map = {}
-    assert blur_job._apply_forced_boxes(p, _clip(blur_job), fill_map) == 0
-    assert fill_map == {}
+    n = _forced(blur_job, tmp_path,
+                {"OTHER": [{"frame_idx": 5, "box": [0, 0, 10, 10]}]},
+                fill_map=fill_map)
+    assert n == 0 and fill_map == {}
     assert any("no entry for this clip" in r.message for r in caplog.records)
 
 
-def test_forced_boxes_are_clamped_to_the_frame(blur_job, tmp_path):
-    import json
-    p = tmp_path / "f.json"
-    p.write_text(json.dumps({"x": [{"frame_idx": 0, "box": [-10, -10, 40, 40]}]}))
-    fill_map = {}
-    assert blur_job._apply_forced_boxes(p, _clip(blur_job), fill_map) == 1
-    assert fill_map[0] == [(0.0, 0.0, 40.0, 40.0)]
-
-
 def test_forced_boxes_that_all_clamp_away_raise(blur_job, tmp_path):
-    import json
-    p = tmp_path / "f.json"
-    p.write_text(json.dumps({"x": [{"frame_idx": 0, "box": [-50, -50, -10, -10]}]}))
     with pytest.raises(RuntimeError, match="no usable box"):
-        blur_job._apply_forced_boxes(p, _clip(blur_job), {})
+        _forced(blur_job, tmp_path,
+                {"x": [{"frame_idx": 0, "box": [-50, -50, -10, -10]}]})
+
+
+def test_forced_box_frame_index_out_of_range_raises(blur_job, tmp_path):
+    """A typo'd frame number used to be a silent no-op that still counted
+    toward 'applied N forced boxes' — reporting success while republishing
+    the face."""
+    with pytest.raises(RuntimeError, match="outside"):
+        _forced(blur_job, tmp_path,
+                {"x": [{"frame_idx": 9999, "box": [10, 10, 40, 40]}]})
+
+
+def test_forced_box_covers_frames_around_the_one_listed(blur_job, tmp_path):
+    """THE critical fix. A forced box written only to its listed frame left
+    the face visible on every frame between the reviewer's entries — and
+    both audit checks sample that same stride grid, so the clip then flipped
+    NEEDS_REVIEW -> PASS_AUTOMATED with the face still shipping."""
+    fill_map = {}
+    _forced(blur_job, tmp_path,
+            {"x": [{"frame_idx": 90, "box": [100, 100, 140, 140]}]},
+            fill_map=fill_map, hold_frames=30, back_hold_frames=3)
+    assert 90 in fill_map
+    assert 91 in fill_map and 100 in fill_map, "forward hold"
+    assert 88 in fill_map, "backward hold"
+
+
+def test_forced_boxes_interpolate_between_consecutive_entries(blur_job, tmp_path):
+    """The documented remediation loop emits one entry per flagged frame, and
+    flagged frames sit on the detection stride. Every frame in between must
+    be covered."""
+    fill_map = {}
+    entries = [{"frame_idx": f, "box": [100, 100, 140, 140]} for f in range(90, 121, 3)]
+    _forced(blur_job, tmp_path, {"x": entries}, fill_map=fill_map,
+            hold_frames=30, back_hold_frames=3)
+    missing = [f for f in range(90, 121) if f not in fill_map]
+    assert not missing, f"frames still unredacted between forced boxes: {missing}"
+
+
+def test_forced_boxes_are_clamped_to_the_frame(blur_job, tmp_path):
+    fill_map = {}
+    _forced(blur_job, tmp_path,
+            {"x": [{"frame_idx": 0, "box": [-10, -10, 40, 40]}]},
+            clip=_clip(blur_job, n_frames=200), fill_map=fill_map)
+    x1, y1, x2, y2 = fill_map[0][0]
+    assert x1 >= 0 and y1 >= 0, "negative coords must not reach the redactor"
+    assert x2 <= 64 and y2 <= 64, "must stay inside the frame"
 
 
 # ---------------------------------------------------------------------------
@@ -543,3 +590,101 @@ def test_assert_cfr_accepts_ntsc_rates(blur_job):
     blur_job.assert_cfr(
         {"streams": [{"r_frame_rate": "30000/1001", "avg_frame_rate": "30000/1001"}]},
         Path("x.mp4"))
+
+
+# ---------------------------------------------------------------------------
+# check_yunet — the independent second opinion. Previously had NO tests, and
+# a mutation reverting its score threshold survived the whole suite.
+# ---------------------------------------------------------------------------
+
+
+def _yunet_row(x, y, w, h, score, right_eye_x=523.0):
+    """cv2.FaceDetectorYN.detect -> [n, 15]: 0-1 bbox xy, 2-3 wh, 4-5 RIGHT
+    EYE xy, 6-7 left eye, 8-9 nose, 10-13 mouth, 14 face score."""
+    return np.array([x, y, w, h, right_eye_x, 118.0, 540.0, 118.0, 530.0,
+                     130.0, 520.0, 140.0, 545.0, 140.0, score], np.float32)
+
+
+def _patch_yunet(monkeypatch, blur_job, rows, frames, returncode=0, capture=None):
+    import cv2
+
+    class _Det:
+        def __init__(self, thresh):
+            self._t = thresh
+
+        def getScoreThreshold(self):
+            return self._t
+
+        def detect(self, bgr):
+            return len(rows), (np.array(rows) if rows else None)
+
+    def _create(model, cfg_, size, score_threshold=0.9, nms=0.3, *a, **k):
+        if capture is not None:
+            capture["score_threshold"] = score_threshold
+        return _Det(score_threshold)
+
+    monkeypatch.setattr(cv2.FaceDetectorYN, "create", staticmethod(_create))
+    monkeypatch.setattr(blur_job, "open_decoder", lambda *a, **k: _Proc(returncode))
+    monkeypatch.setattr(blur_job, "read_frames", lambda p, w, h: iter(frames))
+
+
+def _yunet_cfg(blur_job, tmp_path):
+    return blur_job.parse_args(["--input-dir", str(tmp_path), "--output-dir",
+                                 str(tmp_path), "--run-id", "t",
+                                 "--yunet-model", str(tmp_path / "y.onnx")])
+
+
+def test_yunet_is_created_with_our_score_threshold(blur_job, monkeypatch, tmp_path):
+    """OpenCV defaults score_threshold to 0.9. Leaving it unset made
+    YUNET_SCORE_MIN dead code and ran the check far stricter than the audit
+    claimed — silently dropping the low-confidence second opinions it exists
+    to surface."""
+    cap = {}
+    _patch_yunet(monkeypatch, blur_job, [], [_planes()], capture=cap)
+    blur_job.check_yunet(_yunet_cfg(blur_job, tmp_path), "ffmpeg",
+                          tmp_path / "o.mp4", 64, 64, {}, 10.0, 30.0, 1)
+    assert cap["score_threshold"] == blur_job.YUNET_SCORE_MIN
+
+
+def test_yunet_reads_the_score_from_column_14_not_column_4(blur_job, monkeypatch, tmp_path):
+    """f[4] is the right-eye x in PIXELS, so reading it as the score compared
+    ~523 against 0.5 — the gate never fired and a coordinate was recorded and
+    displayed as a confidence all the way into the review page."""
+    row = _yunet_row(10, 10, 20, 20, score=0.92, right_eye_x=523.0)
+    _patch_yunet(monkeypatch, blur_job, [row], [_planes()])
+    out = blur_job.check_yunet(_yunet_cfg(blur_job, tmp_path), "ffmpeg",
+                                tmp_path / "o.mp4", 64, 64, {}, 10.0, 30.0, 1)
+    assert out["n_yunet_uncovered"] == 1
+    assert out["yunet_uncovered"][0]["score"] == pytest.approx(0.92)
+
+
+def test_yunet_covered_face_is_not_flagged(blur_job, monkeypatch, tmp_path):
+    row = _yunet_row(10, 10, 20, 20, score=0.92)
+    _patch_yunet(monkeypatch, blur_job, [row], [_planes()])
+    out = blur_job.check_yunet(_yunet_cfg(blur_job, tmp_path), "ffmpeg",
+                                tmp_path / "o.mp4", 64, 64,
+                                {0: [(0.0, 0.0, 64.0, 64.0)]}, 10.0, 30.0, 1)
+    assert out["n_yunet_uncovered"] == 0
+
+
+def test_yunet_fails_closed_on_a_short_decode(blur_job, monkeypatch, tmp_path):
+    _patch_yunet(monkeypatch, blur_job, [], [_planes()])
+    with pytest.raises(RuntimeError, match="expected 99"):
+        blur_job.check_yunet(_yunet_cfg(blur_job, tmp_path), "ffmpeg",
+                              tmp_path / "o.mp4", 64, 64, {}, 10.0, 30.0, 99)
+
+
+def test_yunet_fails_closed_on_a_nonzero_decoder_exit(blur_job, monkeypatch, tmp_path):
+    _patch_yunet(monkeypatch, blur_job, [], [_planes()], returncode=1)
+    with pytest.raises(RuntimeError, match="exited 1"):
+        blur_job.check_yunet(_yunet_cfg(blur_job, tmp_path), "ffmpeg",
+                              tmp_path / "o.mp4", 64, 64, {}, 10.0, 30.0, 1)
+
+
+def test_yunet_without_a_model_is_labelled_skipped_not_clean(blur_job, tmp_path):
+    cfg = blur_job.parse_args(["--input-dir", str(tmp_path), "--output-dir",
+                                str(tmp_path), "--run-id", "t"])
+    out = blur_job.check_yunet(cfg, "ffmpeg", tmp_path / "o.mp4", 64, 64,
+                                {}, 10.0, 30.0, 1)
+    assert "yunet_skipped" in out
+    assert "n_yunet_uncovered" not in out

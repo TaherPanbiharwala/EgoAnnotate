@@ -18,7 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+# imageio-ffmpeg ships a self-contained static ffmpeg. The integrity check
+# can only be tested honestly against a REAL lossy encode — mocked decoders
+# hid a bug that failed 100% of correctly-redacted boxes — and the system
+# ffmpeg is not guaranteed present or working on a contributor's machine.
+test = ["pytest>=8.0", "imageio-ffmpeg>=0.5"]
 dev = ["ruff>=0.7"]
 
 [build-system]
