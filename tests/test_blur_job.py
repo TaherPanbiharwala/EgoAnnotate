@@ -1409,8 +1409,16 @@ def test_hysteresis_off_by_default_reproduces_old_behaviour(blur_job):
     dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18)]
     plain = blur_job.build_tracks(dets, 8, blur_job.TRACK_IOU_DEFAULT, 30, 30,
                                    stride=3)
-    # With no thresholds supplied every detection may seed, as before.
-    assert len(plain) == 1 and 3 in plain[0].frames
+    assert len(plain) == 1
+    # NOT `3 in frames` -- the forward hold fills frames 1..30 regardless, and
+    # "det_low" would satisfy it too. Only the SOURCE TAG separates the three
+    # cases (associated normally / absorbed by hysteresis / merely held).
+    # Mutation-verified: the membership assertion passed even when hysteresis
+    # was forced ON by default, i.e. it tested nothing.
+    assert plain[0].frames[3][1] == "det", (
+        f"with no thresholds supplied the 0.18 detection must associate as a "
+        f"PLAIN detection; got {plain[0].frames[3][1]!r} -- hysteresis is not off")
+    assert plain[0].last_frame == 3
 
 
 def test_min_box_px_drop_only_counts_seedable_detections(blur_job):
@@ -1454,3 +1462,106 @@ def test_continue_threshold_is_not_in_the_checkpoint_fingerprint(blur_job):
     hyst = blur_job.parse_args([*BASE_ARGS, "--continue-threshold", "0.15"])
     assert (blur_job.checkpoint_fingerprint(base, "2", False)
             == blur_job.checkpoint_fingerprint(hyst, "2", False))
+
+
+# ---------------------------------------------------------------------------
+# Hysteresis must never REDUCE coverage. The first version let an absorbed
+# low box REPLACE the track's position: a 0.18 blob offset 40px from a 100px
+# face still associated (IoU 0.220 > TRACK_IOU_DEFAULT 0.20), dragged the
+# track off the real face, and the forward hold perpetuated the wrong
+# position. Measured: the real face went from 11 uncovered frames to 40 while
+# n_candidate_misses fell 1 -> 0, because the blob was now "covered" by
+# itself. NEEDS_REVIEW -> PASS with the face MORE exposed.
+# ---------------------------------------------------------------------------
+
+_REAL_FACE = (100.0, 100.0, 200.0, 200.0)
+_WEAK_BLOB = (140.0, 140.0, 240.0, 240.0)   # IoU 0.220 against _REAL_FACE
+
+
+def _coverage_and_gate(blur_job, hysteresis: bool):
+    dets = [blur_job.Detection(0, "face", _REAL_FACE, 0.90),
+            blur_job.Detection(3, "face", _REAL_FACE, 0.90),
+            blur_job.Detection(6, "face", _WEAK_BLOB, 0.18)]
+    kw = (dict(start_thresh={"face": 0.30, "lp": 0.40},
+               cont_thresh={"face": 0.15, "lp": 0.15}) if hysteresis else {})
+    inp = dets if hysteresis else [d for d in dets if d.score > 0.30]
+    tracks = blur_job.build_tracks(inp, 8, blur_job.TRACK_IOU_DEFAULT,
+                                    30, 30, stride=3, **kw)
+    fm = blur_job.tracks_to_fill_map(tracks, 640, 640, 1.3, 8)
+    uncovered = sum(
+        1 for f in range(45)
+        if blur_job._covered_fraction(_REAL_FACE, fm.get(f, []))
+        < blur_job.COVERAGE_MIN_FRAC)
+    sweep = blur_job.check_low_threshold_sweep(
+        dets, fm, 0.10, {"face": 0.30, "lp": 0.40})
+    return uncovered, sweep["n_candidate_misses"]
+
+
+def test_hysteresis_never_reduces_coverage_of_a_confirmed_face(blur_job):
+    assert blur_job._iou(_REAL_FACE, _WEAK_BLOB) > blur_job.TRACK_IOU_DEFAULT, (
+        "fixture invalid: the blob must ASSOCIATE under the confident gate, "
+        "otherwise this cannot exercise the regression at all")
+    off, _ = _coverage_and_gate(blur_job, hysteresis=False)
+    on, _ = _coverage_and_gate(blur_job, hysteresis=True)
+    assert on <= off, (
+        f"hysteresis left the real face uncovered on {on} frames vs {off} "
+        f"without it -- an absorbed low box displaced the track")
+
+
+def test_hysteresis_does_not_silence_the_sweep_gate(blur_job):
+    _, off_gate = _coverage_and_gate(blur_job, hysteresis=False)
+    _, on_gate = _coverage_and_gate(blur_job, hysteresis=True)
+    assert on_gate >= off_gate, (
+        f"candidate_misses fell {off_gate} -> {on_gate}: hysteresis silenced "
+        f"the one gate that would have flagged the displaced coverage")
+
+
+def test_a_low_detection_needs_stronger_overlap_than_a_confident_one(blur_job):
+    """Weak evidence must clear a higher spatial bar. IoU 0.220 is enough for
+    a confident detection and must NOT be enough for a 0.18 one."""
+    assert blur_job.LOW_ASSOC_IOU_DEFAULT > blur_job.TRACK_IOU_DEFAULT
+    dets = [blur_job.Detection(0, "face", _REAL_FACE, 0.90),
+            blur_job.Detection(3, "face", _WEAK_BLOB, 0.18)]
+    absorbed = []
+    _tracks(blur_job, dets, low_absorbed=absorbed)
+    assert absorbed == [], (
+        "a 0.18 detection at IoU 0.220 was absorbed; low associations must "
+        "clear LOW_ASSOC_IOU_DEFAULT, not TRACK_IOU_DEFAULT")
+
+
+def test_an_absorbed_low_box_is_unioned_not_substituted(blur_job):
+    """Coverage must be monotone: absorbing can add area, never move it."""
+    near = (110.0, 110.0, 210.0, 210.0)   # IoU ~0.68, clears the low gate
+    dets = [blur_job.Detection(0, "face", _REAL_FACE, 0.90),
+            blur_job.Detection(3, "face", near, 0.18)]
+    tracks = _tracks(blur_job, dets)
+    box = tracks[0].frames[3][0]
+    assert tracks[0].frames[3][1] == "det_low", "fixture did not absorb"
+    assert blur_job._covered_fraction(_REAL_FACE, [box]) >= 0.999, (
+        f"the absorbed box {box} does not still cover the confirmed face "
+        f"{_REAL_FACE} -- it replaced rather than unioned")
+
+
+# --- the wiring itself (mutation-verified as previously untested) -----------
+
+def test_hysteresis_wiring_hands_the_tracker_the_low_band(blur_job):
+    """Making this return redact_dets makes the whole feature inert while the
+    manifest still records continue_threshold. Verified by mutation that no
+    other test caught it."""
+    cfg = blur_job.parse_args([*BASE_ARGS, "--continue-threshold", "0.15"])
+    operating = {"face": cfg.face_threshold, "lp": cfg.lp_threshold}
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18)]
+    redact = [d for d in dets if d.score > operating[d.cls]]
+    ti, st, ct = blur_job.resolve_hysteresis(cfg, dets, redact, operating)
+    assert len(ti) == 2, "low band filtered out before tracking -- feature inert"
+    assert st == operating
+    assert ct == {"face": 0.15, "lp": 0.15}
+
+
+def test_default_wiring_passes_only_above_threshold_detections(blur_job):
+    cfg = blur_job.parse_args([*BASE_ARGS])
+    operating = {"face": cfg.face_threshold, "lp": cfg.lp_threshold}
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18)]
+    redact = [d for d in dets if d.score > operating[d.cls]]
+    ti, st, ct = blur_job.resolve_hysteresis(cfg, dets, redact, operating)
+    assert ti == redact and st is None and ct is None

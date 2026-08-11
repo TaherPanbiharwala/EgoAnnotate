@@ -143,6 +143,18 @@ YUNET_SCORE_MIN = 0.5
 # the error past the end of the chain.
 MAX_LOW_RUN_DEFAULT = 4
 
+# A LOW-confidence detection must agree with the track's last position far
+# more strongly than a confident one before it is allowed to extend it.
+# Confidence and spatial agreement are two forms of evidence; when one is
+# weak, demand more of the other. At TRACK_IOU_DEFAULT (0.20) a 0.18 blob
+# offset 40px from a 100px face still associates (IoU 0.220) and — before
+# this was added — DRAGGED the track off the real face, which the forward
+# hold then perpetuated. Measured on that exact case: the real face went
+# from 11 uncovered frames to 40, while n_candidate_misses fell 1 -> 0
+# because the blob was now "covered" by itself. NEEDS_REVIEW -> PASS with
+# the face MORE exposed. See build_tracks.
+LOW_ASSOC_IOU_DEFAULT = 0.50
+
 # Track association IoU. Deliberately looser than --nms-iou: NMS decides
 # "are these the same detection in one frame", this decides "is this the
 # same face one detection-frame later", after it has moved.
@@ -1769,7 +1781,8 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                   cont_thresh: dict | None = None,
                   max_low_run: int = MAX_LOW_RUN_DEFAULT,
                   low_absorbed: list | None = None,
-                  stride: int = 1) -> list[Track]:
+                  stride: int = 1,
+                  low_assoc_iou: float = LOW_ASSOC_IOU_DEFAULT) -> list[Track]:
     """Greedy nearest-IoU association across consecutive DETECTION frames
     (not every video frame — detections are already sparse at detect_hz),
     then linear interpolation across the gap between consecutive detection
@@ -1808,6 +1821,19 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
     Hysteresis at 0.15 absorbed 119 and seeded ZERO, because a low-score
     blob must overlap an already-confirmed track (IoU >= iou_thresh) to be
     accepted, and hand noise has no face track to attach to.
+
+    TWO invariants keep an absorbed low box from making coverage WORSE, and
+    both are load-bearing. Neither was present in the first version, which
+    measurably regressed a real face from 11 uncovered frames to 40 while
+    dropping n_candidate_misses 1 -> 0:
+
+      1. A low detection must clear `low_assoc_iou` (much stricter than
+         iou_thresh), not merely the confident-association gate.
+      2. An absorbed low box is UNIONED with the track's previous box
+         rather than replacing it, so coverage is monotone — absorbing can
+         only ever add area, never move it off the subject. The forward
+         hold then extends a box that still contains the last confident
+         position instead of one that has drifted away from it.
 
     max_low_run bounds the drift this can cause: a track may not be carried
     on low-confidence evidence alone for more than this many consecutive
@@ -1909,9 +1935,14 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                     iou = _iou(last_box, d.box)
                     if iou > best_iou:
                         best_iou, best_j = iou, j
-                if best_iou >= iou_thresh:
+                if best_j >= 0:
                     d = cur_dets[best_j]
                     is_low = hysteresis and d.score <= start_thresh.get(cls, 0.0)
+                    # Weak evidence needs strong spatial agreement.
+                    required_iou = low_assoc_iou if is_low else iou_thresh
+                else:
+                    required_iou = iou_thresh
+                if best_j >= 0 and best_iou >= required_iou:
                     # Bounded drift: refuse to keep a track alive on
                     # low-confidence evidence indefinitely. Without this a
                     # track could ride a chain of 0.15s off the subject
@@ -1919,12 +1950,22 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                     if is_low and tr.low_run >= max_low_run:
                         continue
                     used.add(best_j)
+                    # UNION for a low box: coverage must be monotone. Writing
+                    # d.box alone let a barely-associating weak detection
+                    # RELOCATE the track off the confirmed face, and the
+                    # forward hold then perpetuated the wrong position.
+                    box = d.box
+                    if is_low:
+                        box = (min(last_box[0], d.box[0]), min(last_box[1], d.box[1]),
+                               max(last_box[2], d.box[2]), max(last_box[3], d.box[3]))
+                    # Interpolate toward the SAME box that gets written, or
+                    # the intermediate frames aim somewhere the endpoint isn't.
                     if frame_idx > last_frame + 1:
-                        _interpolate(tr, last_frame, last_box, frame_idx, d.box)
+                        _interpolate(tr, last_frame, last_box, frame_idx, box)
                     # Source tag distinguishes a low-band extension from a
                     # confident detection, so a reviewer reading a track can
                     # see which frames rest on weak evidence.
-                    tr.frames[frame_idx] = (d.box, "det_low" if is_low else "det")
+                    tr.frames[frame_idx] = (box, "det_low" if is_low else "det")
                     tr.last_frame = frame_idx
                     if is_low:
                         tr.low_run += 1
@@ -2615,6 +2656,25 @@ def resolve_holds(cfg: Config, fps: float) -> tuple[int, int]:
     return forward, backward
 
 
+def resolve_hysteresis(cfg: Config, detections: list, redact_dets: list,
+                       operating: dict) -> tuple:
+    """(track_input, start_thresh, cont_thresh) for build_tracks.
+
+    A function, not two lines inside process_clip, for the same reason
+    resolve_holds() is: the branch is the ENTIRE wiring of the feature and
+    is otherwise untestable without a GPU, a decoder and a video. Verified
+    by mutation that it needed to be: swapping `detections` for
+    `redact_dets` here makes hysteresis completely inert — the low band is
+    filtered out before tracking ever sees it — while every test still
+    passed and the manifest still recorded continue_threshold: 0.15.
+    """
+    if not cfg.continue_threshold:
+        return redact_dets, None, None
+    # The FULL list, low band included. build_tracks does the filtering:
+    # above-operating seeds a track, above-continue merely extends one.
+    return detections, operating, {c: cfg.continue_threshold for c in operating}
+
+
 def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                   ffmpeg: str, checkpoint_dir: Path) -> dict:
     manifest_path = cfg.output_dir / f"{clip.clip_id}.manifest.json"
@@ -2662,17 +2722,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     stride = max(1, round(clip.fps / cfg.detect_hz))
     dropped_small: list[Detection] = []
     low_absorbed: list[Detection] = []
-    if cfg.continue_threshold:
-        # Hysteresis: hand the tracker the WHOLE list, low band included, and
-        # let it decide. Above-operating seeds a track, above-continue merely
-        # extends one. Passing redact_dets here instead would silently disable
-        # the feature — the low band would already be gone.
-        start_thresh = operating
-        cont_thresh = {c: cfg.continue_threshold for c in operating}
-        track_input = detections
-    else:
-        start_thresh = cont_thresh = None
-        track_input = redact_dets
+    track_input, start_thresh, cont_thresh = resolve_hysteresis(
+        cfg, detections, redact_dets, operating)
     tracks = build_tracks(track_input, cfg.min_box_px, iou_thresh=TRACK_IOU_DEFAULT,
                            hold_frames=hold_frames, back_hold_frames=back_hold,
                            dropped_small=dropped_small,
