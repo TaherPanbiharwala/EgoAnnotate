@@ -1830,13 +1830,16 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                 active[cls].append(tr)
 
     # Hold FORWARD past the last detection, and BACKWARD before the first.
-    # The backward hold is not symmetry for its own sake: detection only
-    # samples every `stride` video-frames, so a face that walks into shot
-    # between two samples is visible — and published unredacted — for up to
-    # stride-1 frames before its first detection. Nothing downstream can
-    # catch that: fill_integrity only inspects frames the fill_map already
-    # claims, and YuNet samples on the same stride, so it looks at the very
-    # frame that IS covered.
+    # The backward hold is not symmetry for its own sake: a face entering
+    # frame is visible — and published unredacted — from the moment it
+    # appears until the detector first scores it above threshold. That used
+    # to be modeled as one detection stride (the sampling gap only); measured
+    # against real footage the actual gap was 5-26 frames, because detection
+    # LATENCY (small/angled/partly-occluded face, not yet confident) matters
+    # far more than sampling gap. Nothing downstream can catch a miss here:
+    # fill_integrity only inspects frames the fill_map already claims, and
+    # YuNet samples on the same stride, so it looks at the very frame that
+    # IS covered.
     for tr in tracks:
         last_frame = max(tr.frames)
         last_box, _ = tr.frames[last_frame]
@@ -2387,7 +2390,17 @@ def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
 
 
 def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
-                    audit: dict, timing: dict, manifest_path: Path) -> None:
+                    audit: dict, timing: dict, manifest_path: Path, *,
+                    hold_frames: int, back_hold_frames: int) -> None:
+    """hold_frames/back_hold_frames are RESOLVED values (see resolve_holds),
+    not cfg.hold_frames/cfg.back_hold_frames directly. Both raw fields carry
+    a 0 = "auto" sentinel — cfg.back_hold_frames in particular defaults to
+    0 on every run that doesn't pass --back-hold-frames explicitly, which is
+    the common case since it exists to override the auto-symmetric default,
+    not to be set every time. Recording the raw cfg value here would print
+    back_hold_frames: 0 into every manifest whose track building actually
+    used a real, non-zero backward hold — silently contradicting the exact
+    parameter this field exists to make legible after the fact."""
     import torch
 
     manifest = {
@@ -2410,7 +2423,7 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             "detect_hz": cfg.detect_hz, "redaction": cfg.redaction,
             "lp_checked": cfg.lp_weights_gen2 is not None or cfg.lp_weights_gen1 is not None,
             "dilate_scale": cfg.dilate_scale, "motion_margin_px": cfg.motion_margin_px,
-            "hold_frames": cfg.hold_frames, "back_hold_frames": cfg.back_hold_frames,
+            "hold_frames": hold_frames, "back_hold_frames": back_hold_frames,
             "min_box_px": cfg.min_box_px,
             # None = native resolution. Recorded because it changes the scale
             # the model runs at, and therefore what a score MEANS — two runs
@@ -2572,7 +2585,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
         "total_s": t_verify - t0,
     }
     write_manifest(clip, gen, cfg, out_path, audit,
-                    timing, cfg.output_dir / f"{clip.clip_id}.manifest.json")
+                    timing, cfg.output_dir / f"{clip.clip_id}.manifest.json",
+                    hold_frames=hold_frames, back_hold_frames=back_hold)
 
     log.info("%s: %s (%.1fs)", clip.clip_id, audit["status"], timing["total_s"])
     return audit

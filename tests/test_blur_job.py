@@ -1205,3 +1205,64 @@ def test_back_hold_frames_is_explicitly_settable(blur_job):
 def test_negative_back_hold_is_rejected(blur_job):
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--back-hold-frames", "-1"])
+
+
+# ---------------------------------------------------------------------------
+# write_manifest must record the RESOLVED hold values, not the raw cfg
+# fields. cfg.back_hold_frames defaults to 0 ("auto") on every run that
+# doesn't pass --back-hold-frames explicitly -- the common case, since the
+# flag exists to OVERRIDE the auto-symmetric default. Recording the raw
+# field printed back_hold_frames: 0 into the manifest of every run whose
+# track building actually used a real, non-zero backward hold.
+# ---------------------------------------------------------------------------
+
+
+def _stub_torch(monkeypatch):
+    """write_manifest imports torch to record its version/cuda flag — a real
+    GPU dependency this test suite deliberately doesn't install (see
+    conftest.py). These tests are about hold-frame recording, not torch, so
+    stub the two attributes actually read rather than skip the coverage."""
+    import sys
+    import types
+    fake = types.ModuleType("torch")
+    fake.__version__ = "0.0.0-test"
+    fake.cuda = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+
+def test_manifest_records_resolved_hold_not_raw_cfg_default(blur_job, tmp_path, monkeypatch):
+    _stub_torch(monkeypatch)
+    cfg = blur_job.parse_args([*BASE_ARGS, "--hold-frames", "45"])
+    assert cfg.back_hold_frames == 0, "still the auto sentinel, as this run leaves it"
+    fwd, back = blur_job.resolve_holds(cfg, 29.97)
+    assert (fwd, back) == (45, 45), "sanity: resolution itself must be symmetric here"
+
+    path = tmp_path / "m.json"
+    out_video = tmp_path / "out.mp4"
+    out_video.write_bytes(b"not a real video, just needs to exist for sha256/stat")
+    blur_job.write_manifest(_clip(blur_job), "2", cfg, out_video,
+                            {"status": "PASS_AUTOMATED"}, {}, path,
+                            hold_frames=fwd, back_hold_frames=back)
+    import json
+    eb = json.loads(path.read_text())["egoblur"]
+    assert eb["back_hold_frames"] == 45, (
+        f"manifest says back_hold_frames={eb['back_hold_frames']!r}, but 45 frames "
+        f"were actually used to build every track's leading edge")
+    assert eb["hold_frames"] == 45
+
+
+def test_manifest_hold_fields_match_an_explicit_back_hold_override(blur_job, tmp_path, monkeypatch):
+    _stub_torch(monkeypatch)
+    cfg = blur_job.parse_args([*BASE_ARGS, "--hold-frames", "30",
+                               "--back-hold-frames", "90"])
+    fwd, back = blur_job.resolve_holds(cfg, 29.97)
+    assert (fwd, back) == (30, 90)
+    path = tmp_path / "m.json"
+    out_video = tmp_path / "out.mp4"
+    out_video.write_bytes(b"not a real video, just needs to exist for sha256/stat")
+    blur_job.write_manifest(_clip(blur_job), "2", cfg, out_video,
+                            {"status": "PASS_AUTOMATED"}, {}, path,
+                            hold_frames=fwd, back_hold_frames=back)
+    import json
+    eb = json.loads(path.read_text())["egoblur"]
+    assert (eb["hold_frames"], eb["back_hold_frames"]) == (30, 90)
