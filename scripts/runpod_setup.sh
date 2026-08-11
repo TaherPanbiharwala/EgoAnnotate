@@ -12,6 +12,7 @@
 # Usage, from anywhere on the pod:
 #     bash /workspace/egoannote/scripts/runpod_setup.sh
 #     export PATH="/workspace/bin:$PATH"; export UV_CACHE_DIR=/workspace/.uv-cache
+#     export RCLONE_CONFIG=/workspace/.rclone.conf
 #
 # The second line matters: a script cannot change its parent shell's PATH.
 set -euo pipefail
@@ -23,6 +24,11 @@ export PATH="$BIN:$PATH"
 # torch and the ~45-package job environment from scratch.
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.uv-cache}"
 mkdir -p "$UV_CACHE_DIR"
+# rclone defaults its config to /root/.config/rclone/rclone.conf — container
+# disk, so a pod stop silently discards the Google Drive OAuth token and the
+# whole copy-paste `rclone authorize` flow has to be repeated. Keep it on the
+# volume instead. The token is a credential: 0600, and never in the repo.
+export RCLONE_CONFIG="${RCLONE_CONFIG:-/workspace/.rclone.conf}"
 
 # --- uv ---------------------------------------------------------------------
 if command -v uv >/dev/null 2>&1; then
@@ -127,6 +133,14 @@ PY
     rm -rf "$tmp"
 fi
 
+# Rescue a config written before RCLONE_CONFIG was set, so an existing
+# authenticated remote is not thrown away on the next stop.
+if [ ! -f "$RCLONE_CONFIG" ] && [ -f /root/.config/rclone/rclone.conf ]; then
+    echo ">> migrating rclone config off the container disk onto the volume"
+    cp /root/.config/rclone/rclone.conf "$RCLONE_CONFIG"
+fi
+[ -f "$RCLONE_CONFIG" ] && chmod 600 "$RCLONE_CONFIG"
+
 echo
 echo "--- ready ---"
 echo "uv      : $(command -v uv) — $(uv --version)"
@@ -136,5 +150,11 @@ if [ -x "$BIN/rclone" ]; then
     echo "rclone  : $BIN/rclone — $("$BIN/rclone" version | head -1)"
 fi
 echo
+if [ -f "$RCLONE_CONFIG" ]; then
+    echo "rclone cfg: $RCLONE_CONFIG (persists across pod stops)"
+else
+    echo "rclone cfg: none yet — \`rclone config\` will write to $RCLONE_CONFIG"
+fi
+echo
 echo "Run this in your shell (a script cannot set its parent's PATH):"
-echo "  export PATH=\"$BIN:\$PATH\"; export UV_CACHE_DIR=$UV_CACHE_DIR"
+echo "  export PATH=\"$BIN:\$PATH\"; export UV_CACHE_DIR=$UV_CACHE_DIR; export RCLONE_CONFIG=$RCLONE_CONFIG"
