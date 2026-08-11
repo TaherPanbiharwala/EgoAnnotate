@@ -1266,3 +1266,191 @@ def test_manifest_hold_fields_match_an_explicit_back_hold_override(blur_job, tmp
     import json
     eb = json.loads(path.read_text())["egoblur"]
     assert (eb["hold_frames"], eb["back_hold_frames"]) == (30, 90)
+
+
+# ---------------------------------------------------------------------------
+# HYSTERESIS (--continue-threshold). A detection needs the operating
+# threshold to SEED a track but only the lower continue threshold to EXTEND
+# one -- ByteTrack's BYTE association, Canny's double-threshold edges.
+#
+# The whole safety argument rests on one property: a low-confidence blob can
+# never START a track, so face-shaped noise on the wearer's hands (which has
+# no confirmed track to continue) is still discarded. Measured on real
+# footage: flat 0.20 seeded 321 EXTRA tracks and ruined the clip; hysteresis
+# at 0.15 seeded ZERO.
+# ---------------------------------------------------------------------------
+
+_HYST_START = {"face": 0.30, "lp": 0.40}
+_HYST_CONT = {"face": 0.15, "lp": 0.15}
+
+
+def _d(blur_job, frame, score, box=(100.0, 100.0, 200.0, 200.0), cls="face"):
+    return blur_job.Detection(frame_idx=frame, cls=cls, box=box, score=score)
+
+
+def _tracks(blur_job, dets, **kw):
+    """hold_frames must exceed the detection stride or max_gap evicts every
+    track before its second detection -- that is what caught the missing
+    stride floor in max_gap."""
+    kw.setdefault("start_thresh", _HYST_START)
+    kw.setdefault("cont_thresh", _HYST_CONT)
+    return blur_job.build_tracks(dets, 8, blur_job.TRACK_IOU_DEFAULT,
+                                 hold_frames=30, back_hold_frames=30,
+                                 stride=3, **kw)
+
+
+def test_low_confidence_detection_cannot_seed_a_track(blur_job):
+    """THE load-bearing property. A 0.18 blob on a hand, alone in the world,
+    must produce nothing at all."""
+    tracks = _tracks(blur_job, [_d(blur_job, 0, 0.18)])
+    assert tracks == [], "low-confidence detection seeded a track on its own"
+
+
+def test_low_confidence_extends_a_confirmed_track(blur_job):
+    """A real face that turns away and drops to 0.18 must stay covered."""
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18)]
+    tracks = _tracks(blur_job, dets)
+    assert len(tracks) == 1
+    assert tracks[0].frames[3][1] == "det_low", (
+        "the low box did not extend the confirmed track as a real detection "
+        f"(got source {tracks[0].frames[3][1]!r} -- a plain 'hold' means it "
+        f"was NOT absorbed)")
+    assert tracks[0].last_frame == 3
+
+
+def test_hysteresis_absorbs_are_counted(blur_job):
+    absorbed = []
+    _tracks(blur_job, [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18)],
+            low_absorbed=absorbed)
+    assert len(absorbed) == 1 and absorbed[0].score == pytest.approx(0.18)
+
+
+def test_low_box_must_overlap_to_be_absorbed(blur_job):
+    """The mechanism that makes hand-noise safe: a low box somewhere ELSE in
+    the frame has nothing to continue, so it is dropped rather than becoming
+    its own grey rectangle."""
+    # Overlap must be SMALL BUT NONZERO. A box with zero overlap is not a
+    # test of the threshold at all: best_iou starts at 0.0 with a strict >,
+    # so best_j is never set and the box is rejected no matter what
+    # iou_thresh is. This one overlaps at IoU ~0.005, under the 0.2 gate.
+    dets = [_d(blur_job, 0, 0.90, box=(100.0, 100.0, 200.0, 200.0)),
+            _d(blur_job, 3, 0.18, box=(190.0, 190.0, 290.0, 290.0))]
+    assert 0.0 < blur_job._iou(dets[0].box, dets[1].box) < blur_job.TRACK_IOU_DEFAULT
+    absorbed = []
+    tracks = _tracks(blur_job, dets, low_absorbed=absorbed)
+    assert len(tracks) == 1, "the non-overlapping low box created a second track"
+    # Presence in .frames is NOT the test -- the forward hold fills those
+    # frames regardless. What matters is that nothing was ABSORBED.
+    assert absorbed == [], "a non-overlapping low box was absorbed"
+    assert not any(src == "det_low" for _b, src in tracks[0].frames.values())
+
+
+def test_below_continue_threshold_is_ignored_entirely(blur_job):
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.11)]  # 0.11 < cont 0.15
+    absorbed = []
+    tracks = _tracks(blur_job, dets, low_absorbed=absorbed)
+    assert absorbed == []
+    assert not any(src == "det_low" for _b, src in tracks[0].frames.values())
+
+
+def test_low_run_is_capped_so_a_track_cannot_drift_indefinitely(blur_job):
+    """An unbounded chain of weak detections could walk a track off its
+    subject, and the hold would then extend the error past the chain."""
+    dets = [_d(blur_job, 0, 0.90)] + [_d(blur_job, f, 0.18)
+                                       for f in (3, 6, 9, 12, 15, 18, 21)]
+    tracks = _tracks(blur_job, dets, max_low_run=4)
+    det_frames = [f for f, (_b, src) in tracks[0].frames.items() if src == "det_low"]
+    assert len(det_frames) == 4, (
+        f"expected the low chain capped at 4, got {len(det_frames)}: {det_frames}")
+
+
+def test_a_confident_detection_resets_the_low_run(blur_job):
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18), _d(blur_job, 6, 0.18),
+            _d(blur_job, 9, 0.95),  # resets
+            _d(blur_job, 12, 0.18), _d(blur_job, 15, 0.18), _d(blur_job, 18, 0.18)]
+    absorbed = []
+    tracks = _tracks(blur_job, dets, max_low_run=4, low_absorbed=absorbed)
+    # NOT `18 in frames` -- the forward hold fills it either way. The reset
+    # is observable only in how many low boxes were actually absorbed: 5
+    # with the reset (3,6 then 12,15,18), 4 without (the run caps at 18).
+    assert len(absorbed) == 5, (
+        f"expected 5 absorbed with the low-run reset, got {len(absorbed)}")
+    assert tracks[0].frames[18][1] == "det_low"
+
+
+def test_stride_is_a_floor_on_the_track_eviction_gap(blur_job):
+    """Regression: max_gap was max(hold, back_hold) and back_hold used to BE
+    the stride, so the floor existed by accident. Making the backward hold
+    symmetric removed it silently -- with --detect-hz 0.5 on 30fps (stride
+    60) against a 45-frame hold, every track is evicted before matching its
+    SECOND detection, interpolation never runs, and the frames between two
+    sightings of one stationary face ship unredacted under a PASS status.
+
+    Only observable when hold < stride, which is why the earlier version of
+    this test (hold 30, stride 3) could not see it."""
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 10, 0.90)]
+    joined = blur_job.build_tracks(dets, 8, blur_job.TRACK_IOU_DEFAULT,
+                                   hold_frames=2, back_hold_frames=2, stride=10)
+    assert len(joined) == 1, (
+        "the two detections did not associate: max_gap lost its stride floor")
+    assert joined[0].frames[5][1] == "interp", "gap was not interpolated"
+
+    # Same inputs with no stride floor: evicted, two separate tracks, and the
+    # frames between them go uncovered.
+    split = blur_job.build_tracks(dets, 8, blur_job.TRACK_IOU_DEFAULT,
+                                  hold_frames=2, back_hold_frames=2, stride=1)
+    assert len(split) == 2, "sanity: without the floor these must NOT associate"
+
+
+def test_hysteresis_off_by_default_reproduces_old_behaviour(blur_job):
+    """Default must be a no-op: --continue-threshold 0 means single-threshold."""
+    cfg = blur_job.parse_args([*BASE_ARGS])
+    assert cfg.continue_threshold == 0.0
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18)]
+    plain = blur_job.build_tracks(dets, 8, blur_job.TRACK_IOU_DEFAULT, 30, 30,
+                                   stride=3)
+    # With no thresholds supplied every detection may seed, as before.
+    assert len(plain) == 1 and 3 in plain[0].frames
+
+
+def test_min_box_px_drop_only_counts_seedable_detections(blur_job):
+    """Under hysteresis the caller passes the whole low band. Counting sub-
+    threshold noise as 'confident detection discarded by --min-box-px' would
+    push every clip to NEEDS_REVIEW with a reason that is untrue of it."""
+    tiny = (100.0, 100.0, 103.0, 103.0)   # 3px, below min_box_px=8
+    dropped = []
+    _tracks(blur_job, [_d(blur_job, 0, 0.90, box=tiny),
+                       _d(blur_job, 3, 0.18, box=tiny)], dropped_small=dropped)
+    assert len(dropped) == 1, f"expected only the confident one, got {len(dropped)}"
+    assert dropped[0].score == pytest.approx(0.90)
+
+
+# --- CLI guards -------------------------------------------------------------
+
+def test_continue_threshold_above_operating_is_rejected(blur_job):
+    """Hysteresis LOWERS the bar to continue; above it would raise it."""
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--continue-threshold", "0.35",
+                             "--face-threshold", "0.30"])
+
+
+def test_continue_threshold_below_sweep_floor_is_rejected(blur_job):
+    """Nothing was ever scored that low, so nothing could be absorbed."""
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--continue-threshold", "0.05",
+                             "--sweep-threshold", "0.10"])
+
+
+def test_valid_continue_threshold_is_accepted(blur_job):
+    cfg = blur_job.parse_args([*BASE_ARGS, "--continue-threshold", "0.15"])
+    assert cfg.continue_threshold == pytest.approx(0.15)
+
+
+def test_continue_threshold_is_not_in_the_checkpoint_fingerprint(blur_job):
+    """Like the operating thresholds, it is applied post-hoc to stored
+    detections — changing it must REUSE the checkpoint, not re-run 25
+    minutes of GPU."""
+    base = blur_job.parse_args([*BASE_ARGS])
+    hyst = blur_job.parse_args([*BASE_ARGS, "--continue-threshold", "0.15"])
+    assert (blur_job.checkpoint_fingerprint(base, "2", False)
+            == blur_job.checkpoint_fingerprint(hyst, "2", False))

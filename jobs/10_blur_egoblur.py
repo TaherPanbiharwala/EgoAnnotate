@@ -135,6 +135,14 @@ NMS_IOU_DEFAULT = 0.30
 YUNET_SCORE_COL = 14
 YUNET_SCORE_MIN = 0.5
 
+# Consecutive detection-frames a track may be carried on LOW-confidence
+# evidence alone under hysteresis before it is refused. Measured longest
+# natural run on real footage at continue=0.15 was 5, so this is close to
+# observed behaviour rather than permissive — an unbounded chain of weak
+# detections can walk a track off its subject, and the hold then extends
+# the error past the end of the chain.
+MAX_LOW_RUN_DEFAULT = 4
+
 # Track association IoU. Deliberately looser than --nms-iou: NMS decides
 # "are these the same detection in one frame", this decides "is this the
 # same face one detection-frame later", after it has moved.
@@ -231,6 +239,7 @@ class Config:
     skip_shutdown: bool
     force_reprocess: bool
     probe_frames_dir: Path
+    continue_threshold: float
     back_hold_frames: int
     gen2_resize_px: int | None
     detect_batch: int
@@ -258,6 +267,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--dilate-scale", type=float, default=1.3)
     p.add_argument("--motion-margin-px", type=int, default=8)
     p.add_argument("--hold-frames", type=int, default=0, help="0 = auto (1s of frames)")
+    p.add_argument("--continue-threshold", type=float, default=0.0,
+                    help="HYSTERESIS. Score needed to EXTEND an already-confirmed "
+                         "track, as opposed to --face-threshold which is needed to "
+                         "START one. 0 disables (single-threshold behaviour). A low "
+                         "detection must also overlap the existing track, so this "
+                         "does NOT behave like simply lowering --face-threshold: "
+                         "measured on real footage, flat 0.20 seeded 321 extra "
+                         "tracks over hands and cardboard, hysteresis at 0.15 seeded "
+                         "zero. Must sit in [--sweep-threshold, --face-threshold).")
     p.add_argument("--back-hold-frames", type=int, default=0,
                     help="frames to cover BEFORE a track's first detection. 0 = auto "
                          "(same as --hold-frames). Was hardcoded to one detection "
@@ -316,6 +334,22 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error(f"--hold-frames {a.hold_frames} is negative — disables track association.")
     if a.back_hold_frames < 0:
         p.error(f"--back-hold-frames {a.back_hold_frames} is negative.")
+    if a.continue_threshold:
+        # Above the operating threshold it would RAISE the bar to continue a
+        # track, the opposite of the intent. At or below the sweep floor it
+        # admits detections the detector never even scored, and collides with
+        # the sweep band the audit inspects.
+        if a.continue_threshold >= min(a.face_threshold, a.lp_threshold):
+            p.error(
+                f"--continue-threshold {a.continue_threshold} must be BELOW both "
+                f"--face-threshold {a.face_threshold} and --lp-threshold "
+                f"{a.lp_threshold}; hysteresis lowers the bar to continue a track, "
+                f"it does not raise it.")
+        if a.continue_threshold < a.sweep_threshold:
+            p.error(
+                f"--continue-threshold {a.continue_threshold} is below "
+                f"--sweep-threshold {a.sweep_threshold} — the detector never "
+                f"produced scores that low, so nothing would be absorbed.")
     if a.detect_batch < 1:
         p.error(f"--detect-batch {a.detect_batch} must be >= 1.")
     if a.gen2_resize_px is not None and a.gen2_resize_px < 64:
@@ -392,6 +426,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         probe_frames_dir=a.probe_frames_dir,
         gen2_resize_px=a.gen2_resize_px,
         detect_batch=a.detect_batch,
+        continue_threshold=a.continue_threshold,
     )
 
 
@@ -1395,6 +1430,9 @@ def checkpoint_fingerprint(cfg: Config, gen: str, lp_present: bool) -> dict:
         "nms_iou": cfg.nms_iou,
         "detect_hz": cfg.detect_hz,
         "gen2_resize_px": cfg.gen2_resize_px,
+        # NOT included, deliberately: face/lp/continue thresholds are
+        # applied post-hoc to stored detections, so changing them must
+        # reuse the checkpoint rather than re-run 25 minutes of GPU.
     }
 
 
@@ -1560,6 +1598,9 @@ class Track:
     cls: str
     # frame_idx -> (box, source) where source in {"det", "interp", "hold"}
     frames: dict = field(default_factory=dict)
+    # Consecutive low-confidence (hysteresis) extensions ending at
+    # last_frame. Reset to 0 by any above-start-threshold detection.
+    low_run: int = 0
     # Highest DETECTION frame index in `frames`. Kept as a field rather than
     # recomputed with max(tr.frames): interpolation grows that dict by one
     # entry per video frame, so scanning it once per detection frame is
@@ -1634,7 +1675,8 @@ def _box_is_covered(box: tuple, fill_boxes: list[tuple]) -> bool:
 
 def _apply_forced_boxes(path: Path, clip: ClipInfo, fill_map: dict, *,
                          hold_frames: int, back_hold_frames: int,
-                         dilate_scale: float, motion_margin_px: int) -> int:
+                         dilate_scale: float, motion_margin_px: int,
+                         stride: int = 1) -> int:
     """Merge human-supplied "you missed this face" boxes into fill_map.
 
     Every failure here is loud, because this is the remediation path: the
@@ -1703,8 +1745,13 @@ def _apply_forced_boxes(path: Path, clip: ClipInfo, fill_map: dict, *,
     # the clip then flipped NEEDS_REVIEW -> PASS_AUTOMATED with the face
     # visible on two thirds of its frames. Interpolation joins consecutive
     # forced boxes; the holds cover the ends.
+    # stride matters here too: the review page hands a human one entry per
+    # FLAGGED frame, and flagged frames sit on the detection stride grid, so
+    # consecutive forced boxes are typically `stride` apart and must be able
+    # to associate into one track for interpolation to join them.
     tracks = build_tracks(forced_dets, min_box_px=0, iou_thresh=TRACK_IOU_DEFAULT,
-                           hold_frames=hold_frames, back_hold_frames=back_hold_frames)
+                           hold_frames=hold_frames, back_hold_frames=back_hold_frames,
+                           stride=stride)
     forced_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                      dilate_scale, motion_margin_px)
     for frame_idx, boxes in forced_map.items():
@@ -1717,7 +1764,12 @@ def _apply_forced_boxes(path: Path, clip: ClipInfo, fill_map: dict, *,
 
 def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float,
                   hold_frames: int, back_hold_frames: int = 0,
-                  dropped_small: list | None = None) -> list[Track]:
+                  dropped_small: list | None = None,
+                  start_thresh: dict | None = None,
+                  cont_thresh: dict | None = None,
+                  max_low_run: int = MAX_LOW_RUN_DEFAULT,
+                  low_absorbed: list | None = None,
+                  stride: int = 1) -> list[Track]:
     """Greedy nearest-IoU association across consecutive DETECTION frames
     (not every video frame — detections are already sparse at detect_hz),
     then linear interpolation across the gap between consecutive detection
@@ -1735,9 +1787,37 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
     detector first scores it above threshold, which was 5-25 frames in 8 of
     13 inspected misses. Nothing downstream catches that: fill_integrity
     only inspects frames the map already claims, and YuNet samples the same
-    stride grid."""
+    stride grid.
+
+    HYSTERESIS (start_thresh / cont_thresh). When both are supplied, a
+    detection needs `start_thresh` to SEED a new track but only the lower
+    `cont_thresh` to EXTEND a confirmed one. Pass the FULL detection list,
+    low-confidence band included; this function does the filtering.
+
+    This is ByteTrack's BYTE association and Canny's double-threshold edge
+    hysteresis: a weak signal continuing a strong one is real, a weak signal
+    standing alone is noise. It matters here because a face that turns away,
+    blurs, or is briefly occluded has its score DROP while still being a
+    face, and a single flat threshold discards it.
+
+    It is specifically NOT the same as lowering the operating threshold,
+    which was measured on this footage and was a disaster: a flat 0.20
+    admitted 447 low-band detections and let them seed 321 EXTRA tracks
+    (742 vs 421) — grey boxes over the wearer's own hands and over
+    cardboard, ruining the footage for the downstream hand-tracking stage.
+    Hysteresis at 0.15 absorbed 119 and seeded ZERO, because a low-score
+    blob must overlap an already-confirmed track (IoU >= iou_thresh) to be
+    accepted, and hand noise has no face track to attach to.
+
+    max_low_run bounds the drift this can cause: a track may not be carried
+    on low-confidence evidence alone for more than this many consecutive
+    detection frames. Measured longest natural run at cont=0.15 was 5, so
+    the default is deliberately close to observed behaviour rather than
+    permissive. low_absorbed collects the accepted low-band detections so
+    the count is auditable instead of invisible."""
     if dropped_small is None:
         dropped_small = []
+    hysteresis = start_thresh is not None and cont_thresh is not None
     by_frame: dict[int, list[Detection]] = {}
     for d in detections:
         w = d.box[2] - d.box[0]
@@ -1748,7 +1828,15 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
             # only inspects boxes already in the fill_map. A confident
             # detection of a small or edge-truncated face would vanish
             # silently, so the caller is handed the count to gate on.
-            dropped_small.append(d)
+            #
+            # Under hysteresis the caller passes the WHOLE low-confidence
+            # band, so only count a drop the audit should actually care
+            # about: one that could have seeded a track. Counting sub-
+            # threshold noise here would inflate n_dropped_small into
+            # permanent NEEDS_REVIEW with a reason ("confident detection
+            # discarded by --min-box-px") that is simply untrue of it.
+            if not hysteresis or d.score > start_thresh.get(d.cls, 0.0):
+                dropped_small.append(d)
             continue
         by_frame.setdefault(d.frame_idx, []).append(d)
 
@@ -1794,7 +1882,16 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
             # it here and again below is quadratic in track lifetime — for
             # one subject visible through a 1.5h clip that measured out to
             # ~8.7e9 key visits, minutes of pure Python with the GPU idle.
-            max_gap = max(hold_frames, back_hold_frames)
+            # `stride` is a FLOOR, not decoration. This used to read
+            # max(hold_frames, back_hold_frames) and back_hold_frames was
+            # passed as the stride, so the floor was there by accident.
+            # Making the backward hold symmetric removed it silently: with
+            # --detect-hz 0.5 on 30fps (stride 60) and hold 45, every track
+            # is evicted before it can match its SECOND detection, so
+            # interpolation never runs and the frames between two sightings
+            # of the same stationary face go unredacted with a PASS status.
+            # Caught by a test that used hold_frames=0.
+            max_gap = max(hold_frames, back_hold_frames, stride)
             active[cls] = [tr for tr in active[cls]
                            if frame_idx - tr.last_frame <= max_gap]
 
@@ -1806,22 +1903,48 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                 for j, d in enumerate(cur_dets):
                     if j in used:
                         continue
+                    # Below the CONTINUE threshold it cannot extend anything.
+                    if hysteresis and d.score <= cont_thresh.get(cls, 0.0):
+                        continue
                     iou = _iou(last_box, d.box)
                     if iou > best_iou:
                         best_iou, best_j = iou, j
                 if best_iou >= iou_thresh:
                     d = cur_dets[best_j]
+                    is_low = hysteresis and d.score <= start_thresh.get(cls, 0.0)
+                    # Bounded drift: refuse to keep a track alive on
+                    # low-confidence evidence indefinitely. Without this a
+                    # track could ride a chain of 0.15s off the subject
+                    # entirely and the hold would then extend the error.
+                    if is_low and tr.low_run >= max_low_run:
+                        continue
                     used.add(best_j)
                     if frame_idx > last_frame + 1:
                         _interpolate(tr, last_frame, last_box, frame_idx, d.box)
-                    tr.frames[frame_idx] = (d.box, "det")
+                    # Source tag distinguishes a low-band extension from a
+                    # confident detection, so a reviewer reading a track can
+                    # see which frames rest on weak evidence.
+                    tr.frames[frame_idx] = (d.box, "det_low" if is_low else "det")
                     tr.last_frame = frame_idx
+                    if is_low:
+                        tr.low_run += 1
+                        if low_absorbed is not None:
+                            low_absorbed.append(d)
+                    else:
+                        tr.low_run = 0
                 # An unmatched track stays active until max_gap evicts it
                 # above; the previous rebuild-into-still_active was a no-op
                 # (both branches appended) and is gone.
 
             for j, d in enumerate(cur_dets):
                 if j in used:
+                    continue
+                # THE load-bearing line. A low-confidence detection can never
+                # SEED a track — only continue one. This is the entire reason
+                # hysteresis is safe where a flat low threshold was not: face-
+                # shaped noise on a hand has nothing to continue, so it is
+                # discarded here rather than becoming its own grey box.
+                if hysteresis and d.score <= start_thresh.get(cls, 0.0):
                     continue
                 tr = Track(track_id=next_id, cls=cls, last_frame=frame_idx)
                 next_id += 1
@@ -2243,7 +2366,8 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
 
 def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
                  yunet: dict, gen: str, n_dropped_small: int = 0,
-                 lp_checked: bool = True, n_face_fill_frames: int | None = None) -> dict:
+                 lp_checked: bool = True, n_face_fill_frames: int | None = None,
+                 n_low_absorbed: int = 0) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -2331,6 +2455,12 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # did not compute it (the canary then falls back to the any-class
         # count, which is weaker — see above).
         "n_face_fill_frames": n_face_fill_frames,
+        # Low-confidence detections that hysteresis attached to an existing
+        # track. Reported in its own right because it makes
+        # n_candidate_misses fall for a GOOD reason (those band detections
+        # are now genuinely covered) and a reviewer reading the manifest
+        # otherwise cannot distinguish that from "the detector found less".
+        "n_low_absorbed": n_low_absorbed,
         # False means no plate detector ran at all. Recorded so a face-only
         # run is never later read as "this clip has no license plates".
         "lp_checked": lp_checked,
@@ -2420,6 +2550,8 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             "gen": gen,
             "face_threshold": cfg.face_threshold, "lp_threshold": cfg.lp_threshold,
             "sweep_threshold": cfg.sweep_threshold, "nms_iou": cfg.nms_iou,
+            # 0.0 = hysteresis off (single-threshold tracking).
+            "continue_threshold": cfg.continue_threshold,
             "detect_hz": cfg.detect_hz, "redaction": cfg.redaction,
             "lp_checked": cfg.lp_weights_gen2 is not None or cfg.lp_weights_gen1 is not None,
             "dilate_scale": cfg.dilate_scale, "motion_margin_px": cfg.motion_margin_px,
@@ -2529,9 +2661,27 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     hold_frames, back_hold = resolve_holds(cfg, clip.fps)
     stride = max(1, round(clip.fps / cfg.detect_hz))
     dropped_small: list[Detection] = []
-    tracks = build_tracks(redact_dets, cfg.min_box_px, iou_thresh=TRACK_IOU_DEFAULT,
+    low_absorbed: list[Detection] = []
+    if cfg.continue_threshold:
+        # Hysteresis: hand the tracker the WHOLE list, low band included, and
+        # let it decide. Above-operating seeds a track, above-continue merely
+        # extends one. Passing redact_dets here instead would silently disable
+        # the feature — the low band would already be gone.
+        start_thresh = operating
+        cont_thresh = {c: cfg.continue_threshold for c in operating}
+        track_input = detections
+    else:
+        start_thresh = cont_thresh = None
+        track_input = redact_dets
+    tracks = build_tracks(track_input, cfg.min_box_px, iou_thresh=TRACK_IOU_DEFAULT,
                            hold_frames=hold_frames, back_hold_frames=back_hold,
-                           dropped_small=dropped_small)
+                           dropped_small=dropped_small,
+                           start_thresh=start_thresh, cont_thresh=cont_thresh,
+                           low_absorbed=low_absorbed, stride=stride)
+    if cfg.continue_threshold:
+        log.info("%s: hysteresis absorbed %d low-confidence detection(s) into "
+                  "existing tracks (continue>%.2f, start>%.2f)", clip.clip_id,
+                  len(low_absorbed), cfg.continue_threshold, cfg.face_threshold)
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
     # Count FACE-covered frames separately before the tracks go away.
@@ -2548,7 +2698,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
         n_forced = _apply_forced_boxes(
             cfg.forced_boxes, clip, fill_map,
             hold_frames=hold_frames, back_hold_frames=back_hold,
-            dilate_scale=cfg.dilate_scale, motion_margin_px=cfg.motion_margin_px)
+            dilate_scale=cfg.dilate_scale, motion_margin_px=cfg.motion_margin_px,
+            stride=stride)
         log.info("%s: applied %d forced boxes from human review", clip.clip_id, n_forced)
 
     out_path = cfg.output_dir / f"{clip.clip_id}.blurred.mp4"
@@ -2575,7 +2726,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen,
                          n_dropped_small=len(dropped_small),
                          lp_checked=lp_det is not None,
-                         n_face_fill_frames=n_face_fill_frames)
+                         n_face_fill_frames=n_face_fill_frames,
+                         n_low_absorbed=len(low_absorbed))
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {
