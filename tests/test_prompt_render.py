@@ -79,3 +79,51 @@ def test_no_hardcoded_frame_bound_remains_in_the_template() -> None:
     assert not re.search(r"0\.\.7\b", body)
     assert not re.search(r"INTEGERS 0-7\b", body)
     assert "end_frame=7." not in body
+
+
+def test_window_duration_is_templated_not_hardcoded():
+    """The prompt used to hardcode "6 seconds" while templating only the
+    frame counts, so a 3-frame trailing window was told it covered 6s when
+    it covers 2.25s — the exact bug _render_prompt exists to fix, one line
+    further down the same file."""
+    from egoannote.layers.caption import _load_prompt, _render_prompt
+    template, _ = _load_prompt()
+    assert "{window_seconds}" in template, "duration placeholder went missing"
+    assert "6 seconds" not in template, "duration is hardcoded again"
+
+    full = _render_prompt(template, 8)
+    partial = _render_prompt(template, 3)
+    assert "whole 6 seconds" in full
+    assert "whole 2.25 seconds" in partial, "partial window told the wrong duration"
+
+
+def test_no_placeholder_survives_rendering():
+    import re
+    from egoannote.layers.caption import _load_prompt, _render_prompt
+    template, _ = _load_prompt()
+    for n in (1, 3, 8):
+        left = re.findall(r"\{(n_frames|max_frame_idx|window_seconds)\}",
+                          _render_prompt(template, n))
+        assert not left, f"n_frames={n} left {left} unsubstituted"
+
+
+def test_prompt_does_not_bias_the_model_toward_a_single_action():
+    """The whole justification for non-overlapping windows is that the model
+    reports multiple actions WITHIN a window. The prompt used to say "most
+    clips will have ONE action" — its most directive sentence telling the
+    model to do the opposite, with nothing downstream able to tell a genuine
+    single action from a refusal to split."""
+    from egoannote.layers.caption import _load_prompt
+    template, _ = _load_prompt()
+    assert "most clips will have" not in template
+    assert "Do not force multiple actions" not in template
+
+
+def test_prompt_does_not_ask_for_cross_window_consistency():
+    """Each window is a stateless call with only its own frames — the model
+    cannot see the previous window's label, so asking it to reuse one was
+    literally unsatisfiable, at all 44 window seams per clip."""
+    from egoannote.layers.caption import _load_prompt
+    template, _ = _load_prompt()
+    assert "identical label again" not in template
+    assert "continues into the next" not in template

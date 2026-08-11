@@ -57,13 +57,25 @@ def _render_prompt(template: str, n_frames: int) -> str:
     never sent, and those indices then define segment boundaries. Found in
     review; the mismatch hits every video whose frame count isn't an exact
     multiple of the window size.
+
+    The DURATION needs the same treatment and originally didn't get it: the
+    prompt hardcoded "6 seconds" while only the frame counts were templated,
+    so a 3-frame trailing window was told it covered 6 seconds when it
+    covers 2.25. Exactly the bug this function was written to fix, one line
+    further down the same file.
     """
     if n_frames < 1:
         raise ValueError(f"cannot render a caption prompt for {n_frames} frames")
+    window_seconds = n_frames / float(config.VLM_FPS)
+    # "6" not "6.0" for the common whole-second case — the prompt reads as
+    # instructions to a model, not as a float dump.
+    seconds_str = (f"{window_seconds:g}" if window_seconds % 1 else
+                   str(int(window_seconds)))
     return (
         template
         .replace("{n_frames}", str(n_frames))
         .replace("{max_frame_idx}", str(n_frames - 1))
+        .replace("{window_seconds}", seconds_str)
     )
 
 

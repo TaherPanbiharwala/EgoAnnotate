@@ -3,7 +3,7 @@ Below are {n_frames} consecutive frames sampled from one clip, evenly spaced. Th
 camera is worn on the person's head or wrist -- you see what they see. Each frame is
 labeled "Frame N" (N = 0..{max_frame_idx}) immediately before the image.
 
-This clip may contain ONE action that spans the whole 6 seconds, or MULTIPLE distinct
+This clip may contain ONE action that spans the whole {window_seconds} seconds, or MULTIPLE distinct
 actions if the person changes what they are doing partway through (e.g. finishes
 rinsing something and starts chopping it). List every distinct action you see, IN
 ORDER, with the frame range it covers.
@@ -58,8 +58,9 @@ Field rules -- read carefully, these determine data quality:
 - contact_type is closed vocabulary. Use "none" only when visible=true but the hand is
   not in contact with anything (e.g., reaching).
 - task_step: snake_case, present-tense, verb-led ("rinse_carrot", "transfer_to_pan",
-  "open_drawer"). If the SAME task_step continues into the next 6-second clip, use the
-  identical label again -- do not invent a new one for a continuing action.
+  "open_drawer"). Choose the most obvious, generic verb_noun label you can. Other
+  clips from this video are labeled independently and you cannot see them, so a
+  predictable label is far more useful here than a distinctive one.
 - handover_event: true if and only if one hand visibly passes an object to the other
   during this action.
 - tool_in_use: list ONE primary tool. If multiple, pick the one being actively
@@ -81,5 +82,6 @@ Hard rules:
 - No long-horizon speculation ("to make tea", "to clean the kitchen"). Stay within
   each action's own frame range.
 - Do not invent objects that are off-frame.
-- Do not force multiple actions if there's really only one -- most clips will have
-  ONE action. Only split when you genuinely see a change in what the hands are doing.
+- Split whenever the hands visibly change what they are doing, and do NOT merge two
+  distinct actions just because they happen back to back. Equally, do not invent a
+  transition you cannot actually see in the frames.
