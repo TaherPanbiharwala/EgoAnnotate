@@ -1142,3 +1142,66 @@ def test_probe_actually_honours_detect_batch_not_the_module_constant(
     blur_job.probe_and_budget(cfg, [clip], det, None, "ffmpeg")
     assert sizes and max(sizes) == 3, (
         f"probe batched at {sizes}, not --detect-batch=3 — the flag is a no-op")
+
+
+# ---------------------------------------------------------------------------
+# Leading-edge coverage. back_hold_frames was hardcoded to one detection
+# stride — a tenth of the forward hold — so a face was unredacted from the
+# moment it entered frame until the detector first scored it. Measured on
+# real footage: 8 of 13 inspected misses were exactly this, with gaps of
+# 5-26 frames against a backward hold of 3.
+# ---------------------------------------------------------------------------
+
+
+def test_backward_hold_covers_a_face_entering_frame(blur_job):
+    """The real pattern: nothing, then a confident detection at frame 4614.
+    Frames 4585-4613 shipped the face."""
+    d = blur_job.Detection(frame_idx=4614, cls="face",
+                           box=(100.0, 100.0, 180.0, 190.0), score=0.40)
+    stride, hold = 3, 30
+
+    old = blur_job.build_tracks([d], 8, blur_job.TRACK_IOU_DEFAULT, hold,
+                                 back_hold_frames=stride)
+    new = blur_job.build_tracks([d], 8, blur_job.TRACK_IOU_DEFAULT, hold,
+                                 back_hold_frames=hold)
+    first_old, first_new = min(old[0].frames), min(new[0].frames)
+    assert first_old == 4614 - stride
+    assert first_new == 4614 - hold, "backward hold did not widen"
+    assert first_new < first_old, (
+        "a symmetric hold must reach further back than one stride")
+
+
+def test_back_hold_defaults_to_symmetric_with_forward_hold(blur_job):
+    """The DEFAULTING, not just the flag. An earlier version of this test
+    asserted `(cfg.back_hold_frames or hold) == hold`, which is a tautology
+    and passed happily when process_clip still used stride."""
+    cfg = blur_job.parse_args([*BASE_ARGS])
+    fwd, back = blur_job.resolve_holds(cfg, 29.97)
+    assert fwd == 30
+    assert back == fwd, (
+        f"backward hold {back} != forward {fwd}; an asymmetric default leaves "
+        f"a face entering frame unredacted until first detection")
+
+
+def test_back_hold_is_not_one_detection_stride(blur_job):
+    """The specific regression: stride at 29.97fps / 10Hz is 3 frames, a
+    tenth of the forward hold. Measured misses needed 5-26."""
+    cfg = blur_job.parse_args([*BASE_ARGS])
+    _fwd, back = blur_job.resolve_holds(cfg, 29.97)
+    assert back > 3, "backward hold fell back to one stride"
+
+
+def test_explicit_back_hold_overrides_the_symmetric_default(blur_job):
+    cfg = blur_job.parse_args([*BASE_ARGS, "--back-hold-frames", "45"])
+    fwd, back = blur_job.resolve_holds(cfg, 29.97)
+    assert (fwd, back) == (30, 45)
+
+
+def test_back_hold_frames_is_explicitly_settable(blur_job):
+    cfg = blur_job.parse_args([*BASE_ARGS, "--back-hold-frames", "45"])
+    assert cfg.back_hold_frames == 45
+
+
+def test_negative_back_hold_is_rejected(blur_job):
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--back-hold-frames", "-1"])

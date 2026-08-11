@@ -231,6 +231,7 @@ class Config:
     skip_shutdown: bool
     force_reprocess: bool
     probe_frames_dir: Path
+    back_hold_frames: int
     gen2_resize_px: int | None
     detect_batch: int
 
@@ -257,6 +258,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--dilate-scale", type=float, default=1.3)
     p.add_argument("--motion-margin-px", type=int, default=8)
     p.add_argument("--hold-frames", type=int, default=0, help="0 = auto (1s of frames)")
+    p.add_argument("--back-hold-frames", type=int, default=0,
+                    help="frames to cover BEFORE a track's first detection. 0 = auto "
+                         "(same as --hold-frames). Was hardcoded to one detection "
+                         "stride, i.e. a tenth of the forward hold: a face walking "
+                         "into view shipped unredacted from the moment it appeared "
+                         "until the detector first caught it, typically 5-25 frames.")
     p.add_argument("--min-box-px", type=int, default=8)
     p.add_argument("--encode-preset", default="slow")
     p.add_argument("--encode-crf", type=int, default=18)
@@ -307,6 +314,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error(f"--detect-hz {a.detect_hz} must be > 0 (it divides fps to pick a stride).")
     if a.hold_frames < 0:
         p.error(f"--hold-frames {a.hold_frames} is negative — disables track association.")
+    if a.back_hold_frames < 0:
+        p.error(f"--back-hold-frames {a.back_hold_frames} is negative.")
     if a.detect_batch < 1:
         p.error(f"--detect-batch {a.detect_batch} must be >= 1.")
     if a.gen2_resize_px is not None and a.gen2_resize_px < 64:
@@ -365,6 +374,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         dilate_scale=a.dilate_scale,
         motion_margin_px=a.motion_margin_px,
         hold_frames=a.hold_frames,
+        back_hold_frames=a.back_hold_frames,
         min_box_px=a.min_box_px,
         encode_preset=a.encode_preset,
         encode_crf=a.encode_crf,
@@ -1718,8 +1728,14 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
     covered at every frame in between even when the detector missed the
     frame(s) that would have covered them directly.
 
-    Pass back_hold_frames=stride so the frames between a face appearing and
-    its first detection sample are covered too (see the hold loop below)."""
+    back_hold_frames defaults (in process_clip) to the SAME value as
+    hold_frames. It was one detection stride, on the reasoning that it only
+    had to bridge the sampling gap; measured against real footage, a face
+    entering frame goes uncovered from the moment it appears until the
+    detector first scores it above threshold, which was 5-25 frames in 8 of
+    13 inspected misses. Nothing downstream catches that: fill_integrity
+    only inspects frames the map already claims, and YuNet samples the same
+    stride grid."""
     if dropped_small is None:
         dropped_small = []
     by_frame: dict[int, list[Detection]] = {}
@@ -2394,7 +2410,8 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             "detect_hz": cfg.detect_hz, "redaction": cfg.redaction,
             "lp_checked": cfg.lp_weights_gen2 is not None or cfg.lp_weights_gen1 is not None,
             "dilate_scale": cfg.dilate_scale, "motion_margin_px": cfg.motion_margin_px,
-            "hold_frames": cfg.hold_frames, "min_box_px": cfg.min_box_px,
+            "hold_frames": cfg.hold_frames, "back_hold_frames": cfg.back_hold_frames,
+            "min_box_px": cfg.min_box_px,
             # None = native resolution. Recorded because it changes the scale
             # the model runs at, and therefore what a score MEANS — two runs
             # at different values are not comparable.
@@ -2433,6 +2450,24 @@ def shutdown_pod() -> None:
 # =============================================================================
 # main
 # =============================================================================
+
+
+def resolve_holds(cfg: Config, fps: float) -> tuple[int, int]:
+    """(forward, backward) hold in frames.
+
+    A function rather than two lines inside process_clip so the defaulting
+    can be tested without standing up a decoder, a GPU and a video. The
+    backward value was hardcoded to one detection stride — a tenth of the
+    forward hold — which left a face unredacted from the moment it entered
+    frame until the detector first scored it. On real footage that gap was
+    5-26 frames against a backward hold of 3, and nothing downstream could
+    see it: fill_integrity only inspects frames the map already claims, and
+    YuNet samples the same stride grid, so it looks at the very frame that
+    IS covered.
+    """
+    forward = cfg.hold_frames or round(fps)
+    backward = cfg.back_hold_frames or forward
+    return forward, backward
 
 
 def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
@@ -2478,11 +2513,11 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
               "%d in the audit sweep band", clip.clip_id, len(detections),
               len(redact_dets), len(detections) - len(redact_dets))
 
-    hold_frames = cfg.hold_frames or round(clip.fps)
+    hold_frames, back_hold = resolve_holds(cfg, clip.fps)
     stride = max(1, round(clip.fps / cfg.detect_hz))
     dropped_small: list[Detection] = []
     tracks = build_tracks(redact_dets, cfg.min_box_px, iou_thresh=TRACK_IOU_DEFAULT,
-                           hold_frames=hold_frames, back_hold_frames=stride,
+                           hold_frames=hold_frames, back_hold_frames=back_hold,
                            dropped_small=dropped_small)
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
@@ -2499,7 +2534,7 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     if cfg.forced_boxes is not None:
         n_forced = _apply_forced_boxes(
             cfg.forced_boxes, clip, fill_map,
-            hold_frames=hold_frames, back_hold_frames=stride,
+            hold_frames=hold_frames, back_hold_frames=back_hold,
             dilate_scale=cfg.dilate_scale, motion_margin_px=cfg.motion_margin_px)
         log.info("%s: applied %d forced boxes from human review", clip.clip_id, n_forced)
 
