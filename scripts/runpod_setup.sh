@@ -70,24 +70,26 @@ else
 fi
 
 # --- ffprobe ------------------------------------------------------------
-# A SEPARATE binary from ffmpeg, and the two do not always ship together.
-# imageio-ffmpeg's wheel embeds ffmpeg only — the branch above never put
-# ffprobe on PATH. The first pod this script ran on happened to already
-# have an old system ffprobe (Ubuntu 22.04's package), so this went
-# unnoticed; a different base image with neither ffmpeg nor ffprobe
-# preinstalled hit "ffprobe: command not found" the moment the job's
-# preflight ran. ffprobe's VERSION does not matter for what this job asks
-# of it (see open_decoder's docstring — only ancient, stable options), so
-# try the cheapest source first and fall back to a source that needs
-# nothing but curl+tar, since we don't know what this base image ships.
-if command -v ffprobe >/dev/null 2>&1; then
-    echo ">> ffprobe already present"
-elif command -v apt-get >/dev/null 2>&1; then
-    echo ">> installing ffprobe via apt (its ffmpeg build is irrelevant — $BIN/ffmpeg wins on PATH)"
-    apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null
+# A SEPARATE binary from ffmpeg, and the two do not always ship together —
+# imageio-ffmpeg's wheel embeds ffmpeg only, so the branch above never puts
+# ffprobe anywhere.
+#
+# It MUST land on the volume, exactly like ffmpeg and uv. An earlier version
+# of this preferred `apt-get install ffmpeg` as the cheap path, which
+# installs to /usr/bin — CONTAINER disk. That works once and then silently
+# evaporates on the next pod restart, and the failure is maximally confusing:
+# a pod that looks fully provisioned (repo, weights, footage, uv and ffmpeg
+# all present on the volume) rejects the run at preflight with "ffprobe not
+# found on PATH — check the pod image". It cost two separate run attempts
+# before the pattern was obvious.
+#
+# So: only $BIN/ffprobe counts. A system ffprobe is deliberately IGNORED
+# even when present, because relying on it is what produced the bug — its
+# presence is a property of this boot, not of the volume.
+if [ -x "$BIN/ffprobe" ]; then
+    echo ">> ffprobe already on the volume: $BIN/ffprobe"
 else
-    echo ">> no apt-get on this image — pulling ffprobe from the same static-build"
-    echo "   source imageio-ffmpeg vendors, directly"
+    echo ">> installing ffprobe into $BIN (NOT via apt — /usr/bin does not survive a stop)"
     tmp="$(mktemp -d)"
     curl -LsSf https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
         -o "$tmp/ffmpeg-static.tar.xz"
@@ -95,9 +97,14 @@ else
     cp "$tmp"/ffmpeg-*-amd64-static/ffprobe "$BIN/ffprobe"
     chmod +x "$BIN/ffprobe"
     rm -rf "$tmp"
+    hash -r 2>/dev/null || true
 fi
-command -v ffprobe >/dev/null 2>&1 || {
-    echo "FATAL: still no ffprobe on PATH after both install paths" >&2
+[ -x "$BIN/ffprobe" ] || {
+    echo "FATAL: no ffprobe at $BIN/ffprobe after install" >&2
+    exit 1
+}
+"$BIN/ffprobe" -version >/dev/null 2>&1 || {
+    echo "FATAL: $BIN/ffprobe exists but will not execute" >&2
     exit 1
 }
 
