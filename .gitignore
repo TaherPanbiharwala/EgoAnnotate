@@ -22,3 +22,9 @@ runs/
 *.key
 
 .DS_Store
+
+# session handoff notes — personal working docs, not project documentation.
+# (a prior session's git add -A already swept up one stray working file —
+# forced_boxes.json, removed in 8b1b2fa — this is the guard against a repeat.)
+handover.md
+.mp_models/
