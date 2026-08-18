@@ -1,9 +1,10 @@
 # egoannote — session handover
 
 Written 2026-08-11, end of a long tuning session on `jobs/10_blur_egoblur.py`
-(EgoBlur face/plate redaction). Repo HEAD at handoff: **`8b1b2fa`**, tree
-clean, 267 tests passing. Read this top to bottom before doing anything —
-the "do this first" item below is a genuine unknown, not busywork.
+(EgoBlur face/plate redaction), updated same day after two more fixes
+landed. Repo HEAD at handoff: **`d0cbe10`**, tree clean, 272 tests passing.
+Read this top to bottom before doing anything — the "do this first" item
+below is a genuine unknown, not busywork.
 
 ## The project, in one paragraph
 
@@ -66,34 +67,52 @@ Notes on why each piece is there:
   hand-leakage statistically unchanged from the very first conservative
   run. Do not lower the threshold again without re-running that sweep.
 
-## Two real, small bugs still open (unrelated to hysteresis)
+## Two real, small bugs — both fixed now (commit `d0cbe10`)
 
-Both flagged in the last `/review` pass, neither fixed yet, both cheap:
+Both flagged in the `/review` pass, both fixed and mutation-tested before
+this handoff, kept here so the reasoning is still visible:
 
-1. **`max_fill_area_frac` is a dead canary.** `redact_and_encode` computes
-   it, `write_audit_summary` prints it labelled "runaway false-positive
-   canary" — but `build_audit` never reads it, so nothing can actually gate
-   on it. If a future threshold change floods a frame with fill, this
-   number sits there printed and inert while the clip still reports
-   `PASS_AUTOMATED`. Fix: add a ceiling check to `build_audit`'s
-   `status_reasons`.
+1. **`max_fill_area_frac` was a dead canary.** `redact_and_encode` computed
+   it, `write_audit_summary` printed it labelled "runaway false-positive
+   canary" — but `build_audit` never read it, so nothing could actually
+   gate on it; a flooded frame could still report `PASS_AUTOMATED`.
+   **Fixed:** `build_audit` now flags `NEEDS_REVIEW` above
+   `MAX_FILL_AREA_FRAC_CEILING = 0.5` — deliberately generous so a
+   legitimate close-up face doesn't false-alarm.
 
-2. **A resumed batch can silently mix redaction configs across clips.**
-   `process_clip`'s manifest-skip (`if manifest_path.exists() and not
-   cfg.force_reprocess`) only checks *whether* a manifest exists, never
-   *what config produced it* — unlike `detection_pass`'s own
-   `checkpoint_fingerprint()`, which does exactly this correctly for the
-   detection step. If the 16-clip batch gets interrupted (pod
-   disconnects have happened repeatedly this session — see "RunPod
-   gotchas" below) and resumed with a changed flag, already-finished
-   clips keep their old settings with **zero warning**, and
-   `run_manifest.json` doesn't even record which thresholds were used.
-   Fix: extend something like `checkpoint_fingerprint()` to cover
-   redaction-relevant config (thresholds, dilate/margin, holds) and check
-   it at the manifest-skip site too, or at minimum log the mismatch
-   loudly.
+2. **The hysteresis drift bound (`max_low_run`) counted absorption
+   events, not video frames** — so its real-time budget silently depended
+   on `--detect-hz`. At the tested default stride this happened to look
+   right, hiding the bug; at a coarser stride (or just detections that
+   don't land on every sampled frame) the same "4 events" could span far
+   more real drift than intended — reproduced directly: weak detections
+   30 frames apart were all absorbed under the old gate, none are now.
+   **Fixed:** `Track` now tracks `last_confident_frame`; the gate is
+   `frame_idx - tr.last_confident_frame > max_low_run * stride`, which
+   means the same thing regardless of `--detect-hz`. This was still
+   open when the message above ("hysteresis buys ~12 frames...") was
+   written — it's item 1 in the numbered list further down in this same
+   conversation, now resolved.
 
-Neither touches detection, so fixing them doesn't cost any GPU re-run.
+## Still open — the resumed-batch config gap
+
+Not fixed this session; the batch is currently small enough (16 clips, one
+sitting) that it's a real but lower-urgency risk than the two above were:
+
+**A resumed batch can silently mix redaction configs across clips.**
+`process_clip`'s manifest-skip (`if manifest_path.exists() and not
+cfg.force_reprocess`) only checks *whether* a manifest exists, never
+*what config produced it* — unlike `detection_pass`'s own
+`checkpoint_fingerprint()`, which does exactly this correctly for the
+detection step. If the 16-clip batch gets interrupted (pod disconnects
+have happened repeatedly this session — see "RunPod gotchas" below) and
+resumed with a changed flag, already-finished clips keep their old
+settings with **zero warning**, and `run_manifest.json` doesn't even
+record which thresholds were used. Fix: extend something like
+`checkpoint_fingerprint()` to cover redaction-relevant config
+(thresholds, dilate/margin, holds) and check it at the manifest-skip site
+too, or at minimum log the mismatch loudly. Doesn't touch detection, so
+fixing it doesn't cost any GPU re-run.
 
 ## Dormant code — inactive unless `--continue-threshold` is passed
 
@@ -104,11 +123,12 @@ extend-an-existing-track-on-weak-evidence) was built, found to contain a
 face's coverage *worse* while silencing the sweep gate that would have
 flagged it — see commit `f17faf0` for the full repro), and fixed. It is
 **off by default** (`--continue-threshold` defaults to `0`) and the
-recommended batch command above does not use it. These are real findings
-from that same review pass, all currently unreachable, left as-is:
+recommended batch command above does not use it. Its drift bound
+(`max_low_run` counting absorption events instead of real video frames —
+originally listed here) was fixed alongside the two bugs above, in the
+same commit (`d0cbe10`). These are the remaining real findings from that
+review pass, all currently unreachable, left as-is:
 
-- `max_low_run` bounds *absorption events*, not video frames — actual
-  drift window is wider than the constant's own comment claims.
 - One `--continue-threshold` value applies to both face and plate
   classes, even though only the face model's behaviour was measured.
 - Greedy single-stage IoU association can let a low-confidence detection
@@ -320,11 +340,15 @@ Once the batch of 16 clips clears EgoBlur:
 
 1. Resume/start the pod, `git pull`, `bash scripts/runpod_setup.sh`,
    `source /workspace/env.sh`.
-2. Read `test-run-3`'s real `audit_summary.md` (see "Do this first").
-3. If clean: fix the two small bugs above (dead canary, resume
-   fingerprint gap), commit, then run the 16-clip batch with the
-   settings block above, one clip's `--input-dir` pointed at all 16
-   source files via `rclone` (already configured this session,
+2. Read `test-run-3`'s real `audit_summary.md` (see "Do this first"). The
+   dead-canary and drift-bound bugs are already fixed (`d0cbe10`) —
+   nothing to do there, this step is purely about the actual fill-integrity
+   number.
+3. If clean: optionally address the remaining resumed-batch config-drift
+   gap (see "Still open" above) — lower urgency, doesn't block a single
+   uninterrupted 16-clip run — then run the batch with the settings block
+   above, one clip's `--input-dir` pointed at all 16 source files via
+   `rclone` (already configured this session,
    `RCLONE_CONFIG=/workspace/.rclone.conf`, remote name `gdrive`,
    folder `nbt-videos`).
 4. If not clean: use `diag_integrity.py` (regenerate if needed) to

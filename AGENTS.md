@@ -1,8 +1,9 @@
 # egoannote — agent briefing
 
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
-repo cold. Written 2026-08-11. Repo HEAD at time of writing: **`8b1b2fa`**,
-tree clean, 267 tests passing (`uv run --extra test pytest tests/ -q`).
+repo cold. Written 2026-08-11, last updated same day after two more fixes
+landed. Repo HEAD at time of writing: **`d0cbe10`**, tree clean, 272 tests
+passing (`uv run --extra test pytest tests/ -q`).
 
 If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
@@ -210,12 +211,13 @@ video).
 
 ## Known open work (real, scoped, not busywork)
 
-1. **`max_fill_area_frac` is a dead canary.** Computed in
-   `redact_and_encode`, printed in `write_audit_summary` labelled
-   "runaway false-positive canary" — but `build_audit` never actually
-   reads it, so nothing can gate on it. Fix: add a ceiling check to
-   `build_audit`'s `status_reasons`.
-2. **A resumed multi-clip batch can silently mix redaction configs.**
+**Fixed since this file was first written** (commit `d0cbe10`): the
+`max_fill_area_frac` dead-canary gate, and hysteresis's drift bound
+(it counted absorption events instead of real video frames — now budgets
+`max_low_run * stride` frames since the track's last confident detection).
+Both mutation-tested. What's left:
+
+1. **A resumed multi-clip batch can silently mix redaction configs.**
    `process_clip`'s manifest-skip only checks whether a manifest file
    exists, never what config produced it — unlike `detection_pass`'s own
    `checkpoint_fingerprint()`, which does this correctly for the
@@ -224,20 +226,21 @@ video).
    no warning, and `run_manifest.json` doesn't even record which
    thresholds were used. Fix: extend fingerprinting to cover
    redaction-relevant config and check it at the manifest-skip site.
-3. **Two-threshold hysteresis exists in the code but is off by default**
+2. **Two-threshold hysteresis exists in the code but is off by default**
    (`--continue-threshold 0`) and has known unresolved issues if ever
-   turned on: its drift bound counts absorption events rather than video
-   frames, one threshold value applies to both face and plate classes,
+   turned on: one threshold value applies to both face and plate classes,
    greedy association can let a low-confidence detection outbid a
    high-confidence one for the same track, and its audit fields
    (`n_low_absorbed`, the `det_low` source tag) don't fully reach
-   human-readable output. A real privacy regression in this feature (an
-   absorbed low-confidence detection could make a confirmed face's
-   coverage *worse* while silencing the audit check that would have
-   caught it) was found and fixed — see `git log --oneline | grep -i
-   hysteresis` — but the items above were left open. Don't enable
-   `--continue-threshold` for a real batch without addressing them.
-4. **No independent second-opinion face detector is actually running.**
+   human-readable output. Two real privacy regressions in this feature
+   have already been found and fixed (an absorbed low-confidence
+   detection could make a confirmed face's coverage *worse* while
+   silencing the audit check that would have caught it; its drift bound
+   didn't actually bound drift — see `git log --oneline | grep -iE
+   "hysteresis|drift bound"`) — but the items above were left open.
+   Don't enable `--continue-threshold` for a real batch without
+   addressing them.
+3. **No independent second-opinion face detector is actually running.**
    `--yunet-model` was designed for this but real weights were never
    sourced. MediaPipe Face Landmarker was investigated as an
    alternative and found genuinely non-viable as a naive whole-frame
