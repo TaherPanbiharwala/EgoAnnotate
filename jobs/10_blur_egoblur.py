@@ -135,12 +135,22 @@ NMS_IOU_DEFAULT = 0.30
 YUNET_SCORE_COL = 14
 YUNET_SCORE_MIN = 0.5
 
-# Consecutive detection-frames a track may be carried on LOW-confidence
-# evidence alone under hysteresis before it is refused. Measured longest
-# natural run on real footage at continue=0.15 was 5, so this is close to
-# observed behaviour rather than permissive — an unbounded chain of weak
-# detections can walk a track off its subject, and the hold then extends
-# the error past the end of the chain.
+# How many DETECTION-STRIDE intervals a track may be carried on
+# LOW-confidence evidence alone, measured in real VIDEO FRAMES since its
+# last confident detection (the actual budget is max_low_run * stride —
+# see build_tracks). Measured longest natural run on real footage at
+# continue=0.15, --detect-hz 10 (stride 3) was 5 intervals, so 4 is close
+# to observed behaviour rather than permissive.
+#
+# Frames, not absorption COUNT, is load-bearing: an earlier version gated
+# on how many times in a row a track had been absorbed, which is only
+# equivalent to a frame budget when stride happens to match what this
+# constant was tuned against. At a coarser --detect-hz (larger stride)
+# the same "4 absorptions" silently permitted 4x more real drift — e.g.
+# stride 30 let a track ride 120 frames (4s) of weak evidence, not the
+# ~12 frames this constant's tuning intended. Budgeting in frames since
+# the last CONFIDENT sighting makes the bound mean the same thing
+# regardless of --detect-hz.
 MAX_LOW_RUN_DEFAULT = 4
 
 # A LOW-confidence detection must agree with the track's last position far
@@ -184,6 +194,16 @@ ASSUMED_YUNET_MS = 35.0     # per sampled frame, CPU
 # boxes before it counts as redacted. Deliberately near-1: this gates a
 # privacy claim, so "mostly covered" is a miss, not a pass.
 COVERAGE_MIN_FRAC = 0.98
+
+# Ceiling above which a frame's redacted area is almost certainly a
+# detection bug (mixed-up coordinates, a box spanning most of the frame)
+# rather than a legitimate large/close-up face or plate. Deliberately
+# generous — this exists to catch RUNAWAY failures, not to second-guess
+# normal dilation. Was computed and printed as a "runaway false-positive
+# canary" (write_audit_summary) without ever actually gating anything —
+# build_audit never read it, so a genuinely runaway frame could still
+# report PASS_AUTOMATED with this number sitting there, printed, ignored.
+MAX_FILL_AREA_FRAC_CEILING = 0.5
 
 # How far a redacted pixel may drift from FILL_VALUE and still count as
 # redacted. Not zero, because the output is lossily encoded: a flat block
@@ -1608,11 +1628,13 @@ def detection_pass(cfg: Config, clip: ClipInfo, face_det, lp_det, ffmpeg: str,
 class Track:
     track_id: int
     cls: str
-    # frame_idx -> (box, source) where source in {"det", "interp", "hold"}
+    # frame_idx -> (box, source) where source in {"det", "det_low", "interp", "hold"}
     frames: dict = field(default_factory=dict)
-    # Consecutive low-confidence (hysteresis) extensions ending at
-    # last_frame. Reset to 0 by any above-start-threshold detection.
-    low_run: int = 0
+    # Frame index of this track's most recent CONFIDENT (non-hysteresis)
+    # detection. Drives the drift bound below — see build_tracks. -1 means
+    # "no confident detection yet" (unreachable in practice: every track is
+    # SEEDED by a confident detection, never a low one).
+    last_confident_frame: int = -1
     # Highest DETECTION frame index in `frames`. Kept as a field rather than
     # recomputed with max(tr.frames): interpolation grows that dict by one
     # entry per video frame, so scanning it once per detection frame is
@@ -1836,11 +1858,12 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
          position instead of one that has drifted away from it.
 
     max_low_run bounds the drift this can cause: a track may not be carried
-    on low-confidence evidence alone for more than this many consecutive
-    detection frames. Measured longest natural run at cont=0.15 was 5, so
-    the default is deliberately close to observed behaviour rather than
-    permissive. low_absorbed collects the accepted low-band detections so
-    the count is auditable instead of invisible."""
+    on low-confidence evidence alone for more than max_low_run * stride
+    VIDEO FRAMES since its last confident detection. Frames, not a count of
+    absorptions — counting absorptions made the bound depend silently on
+    --detect-hz (a coarser stride let the same "N absorptions" cover
+    proportionally more real time). low_absorbed collects the accepted
+    low-band detections so the count is auditable instead of invisible."""
     if dropped_small is None:
         dropped_small = []
     hysteresis = start_thresh is not None and cont_thresh is not None
@@ -1944,10 +1967,13 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                     required_iou = iou_thresh
                 if best_j >= 0 and best_iou >= required_iou:
                     # Bounded drift: refuse to keep a track alive on
-                    # low-confidence evidence indefinitely. Without this a
-                    # track could ride a chain of 0.15s off the subject
+                    # low-confidence evidence indefinitely. Budgeted in
+                    # VIDEO FRAMES since the last confident detection (see
+                    # MAX_LOW_RUN_DEFAULT), not a count of absorptions —
+                    # frame-based is invariant to --detect-hz. Without this
+                    # a track could ride a chain of 0.15s off the subject
                     # entirely and the hold would then extend the error.
-                    if is_low and tr.low_run >= max_low_run:
+                    if is_low and frame_idx - tr.last_confident_frame > max_low_run * stride:
                         continue
                     used.add(best_j)
                     # UNION for a low box: coverage must be monotone. Writing
@@ -1968,11 +1994,14 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                     tr.frames[frame_idx] = (box, "det_low" if is_low else "det")
                     tr.last_frame = frame_idx
                     if is_low:
-                        tr.low_run += 1
                         if low_absorbed is not None:
                             low_absorbed.append(d)
                     else:
-                        tr.low_run = 0
+                        # Re-anchors the drift budget: a confident sighting
+                        # re-confirms the track's true position, so the
+                        # clock on how long it may next run on weak
+                        # evidence alone restarts from here.
+                        tr.last_confident_frame = frame_idx
                 # An unmatched track stays active until max_gap evicts it
                 # above; the previous rebuild-into-still_active was a no-op
                 # (both branches appended) and is gone.
@@ -1987,7 +2016,8 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                 # discarded here rather than becoming its own grey box.
                 if hysteresis and d.score <= start_thresh.get(cls, 0.0):
                     continue
-                tr = Track(track_id=next_id, cls=cls, last_frame=frame_idx)
+                tr = Track(track_id=next_id, cls=cls, last_frame=frame_idx,
+                           last_confident_frame=frame_idx)
                 next_id += 1
                 tr.frames[frame_idx] = (d.box, "det")
                 tracks.append(tr)
@@ -2429,8 +2459,9 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
     count, and every count is 0 when the detector returns NOTHING — so a
     run where detection silently produced no boxes at all (a wrong dtype,
     a wrong class mapping, a dead model) redacted nothing, verified
-    nothing, and reported PASS. `max_fill_area_frac` guarded against too
-    MUCH fill; nothing guarded against none."""
+    nothing, and reported PASS. `max_fill_area_frac` (below) guards
+    against too MUCH fill; the zero-coverage reason above guards against
+    none."""
     yunet_ran = "yunet_skipped" not in yunet
     integrity_ran = "integrity_skipped" not in integrity
 
@@ -2443,6 +2474,13 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         reasons.append("YuNet found uncovered faces")
     if not integrity_ran:
         reasons.append(f"integrity check did not run ({integrity.get('integrity_skipped')})")
+    max_area = fill_stats.get("max_fill_area_frac", 0.0)
+    if max_area > MAX_FILL_AREA_FRAC_CEILING:
+        reasons.append(
+            f"max_fill_area_frac {max_area:.3f} exceeds "
+            f"{MAX_FILL_AREA_FRAC_CEILING} — likely a detection bug (mixed-up "
+            f"coordinates, a box spanning most of the frame), not legitimate "
+            f"redaction")
     # Class-aware when the caller supplies it. n_frames_with_fill counts
     # frames where ANY box landed, so on footage where the plate model fires
     # on printed packaging a single lp box silenced this canary for the whole

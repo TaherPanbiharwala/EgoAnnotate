@@ -1565,3 +1565,67 @@ def test_default_wiring_passes_only_above_threshold_detections(blur_job):
     redact = [d for d in dets if d.score > operating[d.cls]]
     ti, st, ct = blur_job.resolve_hysteresis(cfg, dets, redact, operating)
     assert ti == redact and st is None and ct is None
+
+
+def test_low_run_budget_is_frames_since_confident_not_absorption_count(blur_job):
+    """The exact regression the review caught: an earlier version counted
+    ABSORPTION EVENTS, so 4 weak detections 30 frames apart (real drift far
+    outside any reasonable bound) were treated identically to 4 weak
+    detections 3 frames apart -- both "4 events", so both allowed. With
+    stride=3 and max_low_run=4 the real budget is 12 frames since the last
+    CONFIDENT sighting: a detection 30 frames later must be rejected
+    outright, not merely the fifth one in a row."""
+    dets = [_d(blur_job, 0, 0.90)] + [_d(blur_job, f, 0.18) for f in (30, 60, 90, 120)]
+    absorbed = []
+    tracks = _tracks(blur_job, dets, max_low_run=4, low_absorbed=absorbed)
+    assert absorbed == [], (
+        f"a detection 30 frames past the last confident sighting was "
+        f"absorbed even though the budget (max_low_run*stride = 4*3 = 12) "
+        f"was exceeded on the very first weak detection: {absorbed}")
+    assert tracks[0].last_frame == 0, "the track should never have re-matched"
+
+
+def test_low_run_budget_scales_with_stride(blur_job):
+    """The complementary case: the SAME 4-events-in-a-row pattern from the
+    original (pre-fix) test must still be allowed when the spacing genuinely
+    fits the frame budget -- this fix must not become simply stricter, it
+    must become CORRECT regardless of --detect-hz."""
+    dets = [_d(blur_job, 0, 0.90)] + [_d(blur_job, f, 0.18) for f in (10, 20, 30, 40)]
+    absorbed = []
+    tracks = blur_job.build_tracks(
+        dets, 8, blur_job.TRACK_IOU_DEFAULT, hold_frames=60, back_hold_frames=60,
+        stride=10, max_low_run=4, low_absorbed=absorbed,
+        start_thresh=_HYST_START, cont_thresh=_HYST_CONT)
+    assert len(absorbed) == 4, (
+        f"expected all 4 absorbed (budget = 4*stride=10 = 40, spacing fits "
+        f"exactly), got {len(absorbed)}")
+
+
+# ---------------------------------------------------------------------------
+# max_fill_area_frac was computed and printed as a "runaway false-positive
+# canary" but build_audit never read it -- a genuinely runaway frame (a
+# detection bug producing a box spanning most of the frame) could still
+# report PASS_AUTOMATED with the number sitting there, printed, ignored.
+# ---------------------------------------------------------------------------
+
+
+def test_runaway_fill_area_forces_review(blur_job):
+    a = _audit(blur_job, fill={"n_frames_with_fill": 10, "max_fill_area_frac": 0.73})
+    assert a["status"] == "NEEDS_REVIEW"
+    assert any("max_fill_area_frac" in r for r in a["status_reasons"]), (
+        f"a 73% redacted frame produced no reason: {a['status_reasons']}")
+
+
+def test_normal_fill_area_does_not_trip_the_ceiling(blur_job):
+    """A legitimate close-up face, generously dilated, must not false-alarm."""
+    a = _audit(blur_job, fill={"n_frames_with_fill": 10, "max_fill_area_frac": 0.22})
+    assert a["status"] == "PASS_AUTOMATED"
+
+
+def test_fill_area_ceiling_is_a_boundary_not_a_typo(blur_job):
+    at_ceiling = _audit(blur_job, fill={"n_frames_with_fill": 10,
+                                        "max_fill_area_frac": blur_job.MAX_FILL_AREA_FRAC_CEILING})
+    assert at_ceiling["status"] == "PASS_AUTOMATED", "exactly at the ceiling should not fire"
+    just_over = _audit(blur_job, fill={"n_frames_with_fill": 10,
+                                       "max_fill_area_frac": blur_job.MAX_FILL_AREA_FRAC_CEILING + 0.001})
+    assert just_over["status"] == "NEEDS_REVIEW"
