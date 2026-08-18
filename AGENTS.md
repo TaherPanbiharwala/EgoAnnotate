@@ -228,18 +228,24 @@ Both mutation-tested. What's left:
    redaction-relevant config and check it at the manifest-skip site.
 2. **Two-threshold hysteresis exists in the code but is off by default**
    (`--continue-threshold 0`) and has known unresolved issues if ever
-   turned on: one threshold value applies to both face and plate classes,
-   greedy association can let a low-confidence detection outbid a
-   high-confidence one for the same track, and its audit fields
+   turned on: greedy association can let a low-confidence detection
+   outbid a high-confidence one for the same track, and its audit fields
    (`n_low_absorbed`, the `det_low` source tag) don't fully reach
-   human-readable output. Two real privacy regressions in this feature
-   have already been found and fixed (an absorbed low-confidence
-   detection could make a confirmed face's coverage *worse* while
-   silencing the audit check that would have caught it; its drift bound
-   didn't actually bound drift — see `git log --oneline | grep -iE
-   "hysteresis|drift bound"`) — but the items above were left open.
-   Don't enable `--continue-threshold` for a real batch without
-   addressing them.
+   human-readable output. (A third concern once listed here — one
+   threshold value shared between face and plate classes, only face's
+   behaviour measured — is moot for how this project actually runs:
+   `--lp-weights-gen2` is dropped project-wide, so `lp_det` is `None` and
+   no `cls == "lp"` detection is ever produced for a shared threshold to
+   mishandle. That's a config fact, not a code fix — the threshold dict
+   still carries an unused `"lp"` key, and the risk is live again
+   immediately if plate redaction is ever re-enabled for different
+   footage.) Two real privacy regressions in this feature have already
+   been found and fixed (an absorbed low-confidence detection could make
+   a confirmed face's coverage *worse* while silencing the audit check
+   that would have caught it; its drift bound didn't actually bound
+   drift — see `git log --oneline | grep -iE "hysteresis|drift bound"`)
+   — but the two items above were left open. Don't enable
+   `--continue-threshold` for a real batch without addressing them.
 3. **No independent second-opinion face detector is actually running.**
    `--yunet-model` was designed for this but real weights were never
    sourced. MediaPipe Face Landmarker was investigated as an

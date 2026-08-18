@@ -129,8 +129,18 @@ originally listed here) was fixed alongside the two bugs above, in the
 same commit (`d0cbe10`). These are the remaining real findings from that
 review pass, all currently unreachable, left as-is:
 
-- One `--continue-threshold` value applies to both face and plate
-  classes, even though only the face model's behaviour was measured.
+- ~~One `--continue-threshold` value applies to both face and plate
+  classes, even though only the face model's behaviour was measured.~~
+  **Resolved by context, not by code.** `--lp-weights-gen2` is dropped
+  for the whole batch (see "Current best-known-good settings" above), so
+  `lp_det` is `None` and `detection_pass` never produces a single
+  `cls == "lp"` detection — confirmed directly: `lp_det.detect_batch(...)`
+  only runs inside `if lp_det is not None`. `resolve_hysteresis` still
+  builds a `cont_thresh` dict with an `"lp"` key, but nothing ever reads
+  it, so a shared threshold has no second class left to mishandle. This
+  is a fact about how the job is run right now, not a code change — the
+  risk is live again immediately if plate redaction is ever re-enabled
+  for different footage.
 - Greedy single-stage IoU association can let a low-confidence detection
   outbid a high-confidence one for the same track (real ByteTrack
   matches high-score detections first; this doesn't).
@@ -139,9 +149,10 @@ review pass, all currently unreachable, left as-is:
 - `n_low_absorbed` reaches the JSON manifest but not
   `write_audit_summary`'s markdown.
 
-**Do not turn hysteresis on for the batch without addressing these.** If a
-future session wants it, treat the list above as the acceptance criteria,
-not just the union-not-replace fix already shipped.
+**Do not turn hysteresis on for the batch without addressing the three
+still-open items above.** If a future session wants it, treat that list
+as the acceptance criteria, not just the union-not-replace fix already
+shipped.
 
 ## MediaPipe as a second detector — investigated, concluded, code removed
 
