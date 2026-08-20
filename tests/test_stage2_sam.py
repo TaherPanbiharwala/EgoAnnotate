@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
+import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -85,6 +88,7 @@ def _dino_artifact(stage2_job, tmp_path, stage1, proposals=()):
 def _config(stage2_job, adapter, **changes):
     values = dict(
         model=adapter.identity,
+        runtime=adapter.runtime_identity,
         accepted_proposal_threshold=0.20,
         window_size=10,
         window_overlap=2,
@@ -189,6 +193,7 @@ def test_fake_adapter_propagates_forward_and_reverse_and_keeps_anchor_fallback(
     assert (6, "sam2-forward") in sources
     assert (5, "dino-fallback") in sources
     assert [prompt["local_object_id"] for prompt in loaded.meta.prompts] == [1]
+    assert loaded.meta.runtime == stage2_job.FakeSamAdapter.runtime_identity
     assert result.review_flags == ()
 
 
@@ -269,6 +274,42 @@ def test_wrong_window_source_is_never_sent_to_sam(stage2_job, tmp_path):
     assert {mask.frame_idx for mask in loaded.masks} == set(range(10))
 
 
+def test_dino_artifact_from_another_source_is_rejected_before_sam(
+    stage2_job, tmp_path
+):
+    stage1 = _stage1(stage2_job, n_frames=10)
+    proposal = _proposal(stage2_job, frame_idx=5)
+    dino_ref, dino_meta = _dino_artifact(
+        stage2_job, tmp_path / "inputs", stage1, (proposal,)
+    )
+    mismatched_stage1 = replace(
+        stage1,
+        source=replace(stage1.source, sha256="9" * 64),
+    )
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    adapter = stage2_job.FakeSamAdapter()
+    loader_called = False
+
+    def forbidden_loader(_window):
+        nonlocal loader_called
+        loader_called = True
+        raise AssertionError("source mismatch must fail before frame loading")
+
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.generate_sam_mask_shards(
+            stage1=mismatched_stage1,
+            paths=paths,
+            dino_artifact=dino_ref,
+            dino_meta=dino_meta,
+            config=_config(stage2_job, adapter),
+            adapter=adapter,
+            window_loader=forbidden_loader,
+        )
+    assert caught.value.code == "DINO_SOURCE_MISMATCH"
+    assert adapter.calls == 0
+    assert loader_called is False
+
+
 @pytest.mark.parametrize(
     ("raw", "changes", "reason"),
     [
@@ -320,6 +361,7 @@ def test_pathological_sam_masks_are_rejected(stage2_job, raw, changes, reason):
 class _FailingAdapter:
     def __init__(self, stage2_job):
         self.identity = stage2_job.FakeSamAdapter.identity
+        self.runtime_identity = stage2_job.FakeSamAdapter.runtime_identity
         self.calls = 0
 
     def propagate_window(self, **_kwargs):
@@ -331,6 +373,7 @@ class _InterruptedAdapter:
     def __init__(self, stage2_job):
         self.job = stage2_job
         self.identity = stage2_job.FakeSamAdapter.identity
+        self.runtime_identity = stage2_job.FakeSamAdapter.runtime_identity
 
     def propagate_window(self, **_kwargs):
         return self.job.SamPropagationResult(
@@ -342,6 +385,7 @@ class _SparseAdapter:
     def __init__(self, stage2_job, *, off_prompt=False):
         self.job = stage2_job
         self.identity = stage2_job.FakeSamAdapter.identity
+        self.runtime_identity = stage2_job.FakeSamAdapter.runtime_identity
         self.off_prompt = off_prompt
 
     def propagate_window(self, *, window, prompts, **_kwargs):
@@ -395,6 +439,41 @@ def test_sam_failure_cannot_remove_dino_fallback(stage2_job, tmp_path):
     )
     assert sum(frame) > (proposal.box[2] - proposal.box[0]) * (
         proposal.box[3] - proposal.box[1]
+    )
+
+
+def test_reused_fallback_shard_cannot_erase_required_review_flag(stage2_job, tmp_path):
+    stage1 = _stage1(stage2_job, n_frames=10)
+    proposal = _proposal(stage2_job, frame_idx=5)
+    adapter = _FailingAdapter(stage2_job)
+    result, _paths, _dino_ref, _dino_meta, _adapter, config = _generate(
+        stage2_job,
+        tmp_path,
+        stage1=stage1,
+        proposals=(proposal,),
+        adapter=adapter,
+        config=_config(stage2_job, adapter),
+    )
+    path = Path(result.shards[0].path)
+    loaded = stage2_job.load_sam_mask_shard(path)
+    path.write_bytes(
+        stage2_job.encode_sam_mask_shard(
+            replace(loaded.meta, review_flags=()), loaded.masks
+        )
+    )
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        _generate(
+            stage2_job,
+            tmp_path,
+            stage1=stage1,
+            proposals=(proposal,),
+            adapter=stage2_job.FakeSamAdapter(),
+            config=config,
+        )
+    assert caught.value.code == "INVALID_SAM_SHARD"
+    assert any(
+        "required fallback" in problem
+        for problem in caught.value.details["problems"]
     )
 
 
@@ -558,6 +637,61 @@ def test_noncanonical_or_tampered_shard_is_rejected(stage2_job, tmp_path):
     assert caught.value.code == "INVALID_SAM_SHARD"
 
 
+def test_real_adapter_first_frame_prompt_does_not_require_reverse_output(
+    stage2_job, tmp_path
+):
+    class Predictor:
+        def __init__(self):
+            self.reverse_calls = 0
+
+        def init_state(self, **_kwargs):
+            return object()
+
+        def add_new_points_or_box(self, **_kwargs):
+            return None
+
+        def propagate_in_video(self, _state, *, reverse, **_kwargs):
+            if reverse:
+                self.reverse_calls += 1
+                return
+            for frame_idx in range(3):
+                yield frame_idx, (), ()
+
+        def reset_state(self, _state):
+            return None
+
+    adapter = object.__new__(stage2_job.MetaSam2VideoAdapter)
+    predictor = Predictor()
+    adapter.predictor = predictor
+    adapter.device = "cpu"
+    adapter._torch = SimpleNamespace(
+        float32="float32",
+        float16="float16",
+        bfloat16="bfloat16",
+        inference_mode=contextlib.nullcontext,
+        cuda=SimpleNamespace(is_available=lambda: False),
+    )
+    result = adapter.propagate_window(
+        window_input=tmp_path,
+        window=stage2_job.TemporalWindow(index=0, frame_start=0, frame_end=2),
+        prompts=(
+            stage2_job.SamPrompt(
+                prompt_id="prompt",
+                prompt_kind="dino",
+                anchor_frame=0,
+                box=(10.0, 10.0, 20.0, 20.0),
+                source_id="proposal",
+            ),
+        ),
+        width=100,
+        height=80,
+        precision="float32",
+    )
+    assert result.forward_complete is True
+    assert result.reverse_complete is True
+    assert predictor.reverse_calls == 0
+
+
 def test_shard_set_rejects_missing_window(stage2_job, tmp_path):
     result, *_ = _generate(stage2_job, tmp_path)
     with pytest.raises(stage2_job.Stage2Error) as caught:
@@ -593,8 +727,13 @@ def test_frame_union_rejects_wrong_dimensions(stage2_job, tmp_path):
         {"window_overlap": 3},
         {"precision": "bfloat16"},
         {"fallback_padding_scale": 0.20},
+        {"fallback_min_padding_px": 8},
         {"min_mask_pixels": 8},
+        {"min_prompt_area_ratio": 0.10},
+        {"max_prompt_area_ratio": 8.0},
         {"max_frame_area_ratio": 0.60},
+        {"anchor_neighborhood_scale": 1.5},
+        {"min_anchor_neighborhood_fraction": 0.25},
     ],
 )
 def test_every_sam_meaning_change_changes_window_fingerprint(stage2_job, tmp_path, change):
@@ -627,6 +766,111 @@ def test_every_sam_meaning_change_changes_window_fingerprint(stage2_job, tmp_pat
     assert changed_value != original
 
 
+@pytest.mark.parametrize(
+    "model_change",
+    [
+        {"name": "different-sam"},
+        {"revision": "different-revision"},
+        {"sha256": "9" * 64},
+    ],
+)
+def test_every_sam_model_identity_field_changes_fingerprint(
+    stage2_job, tmp_path, model_change
+):
+    stage1 = _stage1(stage2_job)
+    proposal = _proposal(stage2_job, frame_idx=5)
+    dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path, stage1, (proposal,))
+    adapter = stage2_job.FakeSamAdapter()
+    config = _config(stage2_job, adapter)
+    window = stage2_job.temporal_windows(20, 10, 2)[0]
+    prompts = stage2_job.sam_prompts_for_window(window, (proposal,), ())
+    original = stage2_job.sam_fingerprint(
+        stage2_job.sam_window_fingerprint_payload(
+            dino_artifact=dino_ref,
+            dino_meta=dino_meta,
+            config=config,
+            window=window,
+            prompts=prompts,
+        )
+    )
+    changed = replace(config, model=replace(config.model, **model_change))
+    assert original != stage2_job.sam_fingerprint(
+        stage2_job.sam_window_fingerprint_payload(
+            dino_artifact=dino_ref,
+            dino_meta=dino_meta,
+            config=changed,
+            window=window,
+            prompts=prompts,
+        )
+    )
+
+
+def test_sam_runtime_identity_changes_window_fingerprint(stage2_job, tmp_path):
+    stage1 = _stage1(stage2_job)
+    proposal = _proposal(stage2_job, frame_idx=5)
+    dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path, stage1, (proposal,))
+    adapter = stage2_job.FakeSamAdapter()
+    config = _config(stage2_job, adapter)
+    window = stage2_job.temporal_windows(20, 10, 2)[0]
+    prompts = stage2_job.sam_prompts_for_window(window, (proposal,), ())
+    original = stage2_job.sam_fingerprint(
+        stage2_job.sam_window_fingerprint_payload(
+            dino_artifact=dino_ref,
+            dino_meta=dino_meta,
+            config=config,
+            window=window,
+            prompts=prompts,
+        )
+    )
+    changed = replace(
+        config,
+        runtime=replace(config.runtime, source_tree_sha256="9" * 64),
+    )
+    assert original != stage2_job.sam_fingerprint(
+        stage2_job.sam_window_fingerprint_payload(
+            dino_artifact=dino_ref,
+            dino_meta=dino_meta,
+            config=changed,
+            window=window,
+            prompts=prompts,
+        )
+    )
+
+
+def test_wrong_sam_runtime_identity_fails_before_window_loading(stage2_job, tmp_path):
+    stage1 = _stage1(stage2_job, n_frames=10)
+    proposal = _proposal(stage2_job, frame_idx=5)
+    dino_ref, dino_meta = _dino_artifact(
+        stage2_job, tmp_path / "inputs", stage1, (proposal,)
+    )
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    adapter = stage2_job.FakeSamAdapter()
+    config = replace(
+        _config(stage2_job, adapter),
+        runtime=replace(adapter.runtime_identity, revision="different-revision"),
+    )
+    loader_called = False
+
+    def forbidden_loader(_window):
+        nonlocal loader_called
+        loader_called = True
+        raise AssertionError("runtime mismatch must fail before frame loading")
+
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.generate_sam_mask_shards(
+            stage1=stage1,
+            paths=paths,
+            dino_artifact=dino_ref,
+            dino_meta=dino_meta,
+            config=config,
+            adapter=adapter,
+            window_loader=forbidden_loader,
+        )
+    assert caught.value.code == "SAM_RUNTIME_IDENTITY_MISMATCH"
+    assert adapter.calls == 0
+    assert loader_called is False
+
+
 def test_sam_code_changes_do_not_invalidate_dino_layer(stage2_job, monkeypatch):
     assert stage2_job.DINO_CODE_VERSION == "milestone-2"
     dino_payload = {"source": "same", "prompt": "face."}
@@ -653,11 +897,130 @@ def test_manual_seed_validation_is_clip_and_bounds_safe(stage2_job):
     assert caught.value.code == "INVALID_MANUAL_SEED"
 
 
+def test_malformed_manual_seed_types_return_structured_error(stage2_job):
+    stage1 = _stage1(stage2_job)
+    seed = stage2_job.ManualSeed(
+        schema_version=1,
+        seed_id="seed",
+        clip_id="clip",
+        frame_idx="not-a-frame",
+        box=("not-a-number", 0.0, 5.0, 5.0),
+        reason="human-confirmed miss",
+    )
+    valid = replace(
+        seed,
+        seed_id="valid-seed",
+        frame_idx=1,
+        box=(0.0, 0.0, 5.0, 5.0),
+    )
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.validate_manual_seeds((valid, seed), stage1)
+    assert caught.value.code == "INVALID_MANUAL_SEED"
+
+
 def test_official_sam_identity_is_fully_pinned(stage2_job):
     identity = stage2_job.MetaSam2VideoAdapter.identity
     assert identity.name == "facebook/sam2.1-hiera-large"
     assert identity.revision == "665f8e2ad61cf5f53d65644ff27c8ee525124610"
     assert identity.sha256 == "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318"
+    assert stage2_job.SAM_RUNTIME_REVISION == "2b90b9f5ceec907a1c18123530e92e794ad901a4"
+    assert stage2_job.SAM_MODEL_CONFIG == "configs/sam2.1/sam2.1_hiera_l.yaml"
+    assert (
+        stage2_job.SAM_MODEL_CONFIG_SHA256
+        == "1dbd6cb6dfebeaf588c7006ee222c6efbfa9049a7ad472a3cdfb2f5d919e8107"
+    )
+
+
+def test_verified_sam_runtime_hashes_config_code_and_execution_stack(
+    stage2_job, tmp_path, monkeypatch
+):
+    package_root = tmp_path / "sam2"
+    config = package_root / stage2_job.SAM_MODEL_CONFIG
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"pinned-test-config\n")
+    (package_root / "predictor.py").write_bytes(b"runtime-code\n")
+    monkeypatch.setattr(
+        stage2_job,
+        "SAM_MODEL_CONFIG_SHA256",
+        stage2_job.sha256_file(config),
+    )
+    identity = stage2_job.verified_sam_runtime_identity(
+        package_root,
+        revision=stage2_job.SAM_RUNTIME_REVISION,
+        torch_version="2.5.1+cu124",
+        cuda_version="12.4",
+    )
+    assert identity.revision == stage2_job.SAM_RUNTIME_REVISION
+    assert identity.model_config_sha256 == stage2_job.sha256_file(config)
+    assert identity.source_tree_sha256 == stage2_job.sha256_directory_tree(package_root)
+    assert identity.torch_version == "2.5.1+cu124"
+    assert identity.cuda_version == "12.4"
+
+
+def test_verified_sam_runtime_rejects_revision_and_config_drift(
+    stage2_job, tmp_path
+):
+    package_root = tmp_path / "sam2"
+    config = package_root / stage2_job.SAM_MODEL_CONFIG
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"changed-config\n")
+    with pytest.raises(stage2_job.Stage2Error) as revision_error:
+        stage2_job.verified_sam_runtime_identity(
+            package_root,
+            revision="wrong-revision",
+            torch_version="2.5.1",
+            cuda_version="12.4",
+        )
+    assert revision_error.value.code == "SAM_RUNTIME_REVISION_MISMATCH"
+    with pytest.raises(stage2_job.Stage2Error) as config_error:
+        stage2_job.verified_sam_runtime_identity(
+            package_root,
+            revision=stage2_job.SAM_RUNTIME_REVISION,
+            torch_version="2.5.1",
+            cuda_version="12.4",
+        )
+    assert config_error.value.code == "SAM_MODEL_CONFIG_HASH_MISMATCH"
+
+
+def test_installed_sam_revision_uses_vcs_metadata_and_checks_repository(
+    stage2_job, tmp_path, monkeypatch
+):
+    package_root = tmp_path / "sam2"
+    package_root.mkdir()
+
+    class Distribution:
+        def __init__(self, repository):
+            self.repository = repository
+
+        def read_text(self, name):
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": self.repository,
+                    "vcs_info": {
+                        "vcs": "git",
+                        "commit_id": stage2_job.SAM_RUNTIME_REVISION,
+                    },
+                }
+            )
+
+    monkeypatch.setattr(
+        stage2_job.importlib_metadata,
+        "distribution",
+        lambda _name: Distribution(stage2_job.SAM_RUNTIME_REPOSITORY),
+    )
+    assert (
+        stage2_job.installed_sam_runtime_revision(package_root)
+        == stage2_job.SAM_RUNTIME_REVISION
+    )
+    monkeypatch.setattr(
+        stage2_job.importlib_metadata,
+        "distribution",
+        lambda _name: Distribution("https://example.com/not-meta/sam2.git"),
+    )
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.installed_sam_runtime_revision(package_root)
+    assert caught.value.code == "SAM_RUNTIME_REPOSITORY_MISMATCH"
 
 
 def test_real_adapter_rejects_wrong_checkpoint_before_import(stage2_job, tmp_path):

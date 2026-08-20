@@ -17,6 +17,7 @@ import argparse
 import ast
 import contextlib
 import hashlib
+import importlib.metadata as importlib_metadata
 import io
 import json
 import math
@@ -35,10 +36,10 @@ from pathlib import Path
 from typing import Any
 
 STAGE2_SCHEMA_VERSION = 1
-STAGE2_CODE_VERSION = "milestone-3"
-STAGE2_JOB_VERSION = "0.3.0"
+STAGE2_CODE_VERSION = "milestone-3.1"
+STAGE2_JOB_VERSION = "0.3.1"
 DINO_CODE_VERSION = "milestone-2"
-SAM_CODE_VERSION = "milestone-3"
+SAM_CODE_VERSION = "milestone-3.1-runtime-bound"
 RENDER_CODE_VERSION = "milestone-1"
 
 DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
@@ -54,6 +55,10 @@ DINO_NMS_IOU = 0.70
 SAM_MODEL_ID = "facebook/sam2.1-hiera-large"
 SAM_MODEL_REVISION = "665f8e2ad61cf5f53d65644ff27c8ee525124610"
 SAM_MODEL_WEIGHTS_SHA256 = "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318"
+SAM_RUNTIME_REPOSITORY = "https://github.com/facebookresearch/sam2.git"
+SAM_RUNTIME_REVISION = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
+SAM_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+SAM_MODEL_CONFIG_SHA256 = "1dbd6cb6dfebeaf588c7006ee222c6efbfa9049a7ad472a3cdfb2f5d919e8107"
 SAM_FALLBACK_PADDING_SCALE = 0.15
 SAM_FALLBACK_MIN_PADDING_PX = 4
 SAM_MIN_MASK_PIXELS = 4
@@ -126,6 +131,17 @@ class ModelIdentity:
     name: str
     revision: str
     sha256: str
+
+
+@dataclass(slots=True, frozen=True)
+class SamRuntimeIdentity:
+    repository: str
+    revision: str
+    source_tree_sha256: str
+    model_config: str
+    model_config_sha256: str
+    torch_version: str
+    cuda_version: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -267,6 +283,7 @@ class TemporalWindow:
 @dataclass(slots=True, frozen=True)
 class SamGenerationConfig:
     model: ModelIdentity
+    runtime: SamRuntimeIdentity
     accepted_proposal_threshold: float
     window_size: int
     window_overlap: int
@@ -338,6 +355,7 @@ class SamMaskShardMeta:
     dino_artifact_sha256: str
     dino_fingerprint: str
     model: ModelIdentity
+    runtime: SamRuntimeIdentity
     accepted_proposal_threshold: float
     frame_start: int
     frame_end: int
@@ -529,6 +547,195 @@ def sha256_file(path: Path) -> str:
             details={"path": str(path), "cause": str(exc)},
         ) from exc
     return digest.hexdigest()
+
+
+def sha256_directory_tree(root: Path) -> str:
+    """Hash installed runtime files by relative path and content."""
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise Stage2Error(
+            "SAM_RUNTIME_UNVERIFIABLE",
+            f"Could not resolve the installed SAM2 package directory: {root}",
+        ) from exc
+    if not root.is_dir():
+        raise Stage2Error(
+            "SAM_RUNTIME_UNVERIFIABLE",
+            f"Installed SAM2 package path is not a directory: {root}",
+        )
+    def runtime_files() -> list[Path]:
+        found: list[Path] = []
+        for path in root.rglob("*"):
+            relative = path.relative_to(root)
+            if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
+            if path.is_symlink():
+                raise Stage2Error(
+                    "SAM_RUNTIME_UNVERIFIABLE",
+                    f"Installed SAM2 runtime contains a symbolic link: {path}",
+                )
+            if path.is_file():
+                found.append(path)
+        return sorted(found, key=lambda item: item.relative_to(root).as_posix())
+
+    files = runtime_files()
+    if not files:
+        raise Stage2Error(
+            "SAM_RUNTIME_UNVERIFIABLE",
+            "Installed SAM2 package contains no hashable runtime files.",
+        )
+    before_stamps = {path: file_stamp(path) for path in files}
+    digest = hashlib.sha256()
+    for path in files:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(sha256_file(path)))
+    if runtime_files() != files or any(
+        file_stamp(path) != before_stamps[path] for path in files
+    ):
+        raise Stage2Error(
+            "SAM_RUNTIME_CHANGED_DURING_HASH",
+            "Installed SAM2 runtime changed while its identity was being calculated.",
+            recovery="Stop the installer or updater, then retry.",
+        )
+    return digest.hexdigest()
+
+
+def _normalized_git_url(value: str) -> str:
+    normalized = value.removeprefix("git+").rstrip("/")
+    return normalized.removesuffix(".git")
+
+
+def installed_sam_runtime_revision(package_root: Path) -> str:
+    """Read the VCS revision from package metadata, with an editable-clone fallback."""
+    try:
+        distribution = importlib_metadata.distribution("SAM-2")
+    except importlib_metadata.PackageNotFoundError:
+        distribution = None
+    if distribution is not None:
+        direct_url_text = distribution.read_text("direct_url.json")
+        if direct_url_text:
+            try:
+                direct_url = json.loads(direct_url_text)
+                repository = str(direct_url["url"])
+                revision = str(direct_url["vcs_info"]["commit_id"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            else:
+                if _normalized_git_url(repository) != _normalized_git_url(
+                    SAM_RUNTIME_REPOSITORY
+                ):
+                    raise Stage2Error(
+                        "SAM_RUNTIME_REPOSITORY_MISMATCH",
+                        "Installed SAM2 runtime came from an unexpected repository.",
+                        details={
+                            "expected": SAM_RUNTIME_REPOSITORY,
+                            "actual": repository,
+                        },
+                    )
+                return revision
+
+    repository_root = package_root.resolve().parent
+    if (repository_root / ".git").exists():
+        try:
+            revision_result = subprocess.run(
+                ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            remote_result = subprocess.run(
+                ["git", "-C", str(repository_root), "remote", "get-url", "origin"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            revision_result = remote_result = None
+        if (
+            revision_result is not None
+            and remote_result is not None
+            and revision_result.returncode == 0
+            and remote_result.returncode == 0
+        ):
+            repository = remote_result.stdout.strip()
+            if _normalized_git_url(repository) != _normalized_git_url(
+                SAM_RUNTIME_REPOSITORY
+            ):
+                raise Stage2Error(
+                    "SAM_RUNTIME_REPOSITORY_MISMATCH",
+                    "Editable SAM2 runtime came from an unexpected repository.",
+                    details={"expected": SAM_RUNTIME_REPOSITORY, "actual": repository},
+                )
+            return revision_result.stdout.strip()
+    raise Stage2Error(
+        "SAM_RUNTIME_REVISION_UNVERIFIABLE",
+        "Could not prove which SAM2 source revision is installed.",
+        recovery=(
+            "Install SAM2 from the pinned Git commit using the Stage II setup command, "
+            "then retry."
+        ),
+    )
+
+
+def verified_sam_runtime_identity(
+    package_root: Path,
+    *,
+    revision: str,
+    torch_version: str,
+    cuda_version: str | None,
+) -> SamRuntimeIdentity:
+    if revision != SAM_RUNTIME_REVISION:
+        raise Stage2Error(
+            "SAM_RUNTIME_REVISION_MISMATCH",
+            "Installed SAM2 source revision does not match the pinned runtime.",
+            details={"expected": SAM_RUNTIME_REVISION, "actual": revision},
+        )
+    try:
+        package_root = package_root.resolve(strict=True)
+        config_path = (package_root / SAM_MODEL_CONFIG).resolve(strict=True)
+        config_path.relative_to(package_root)
+    except (OSError, ValueError) as exc:
+        raise Stage2Error(
+            "SAM_MODEL_CONFIG_MISSING",
+            "Pinned SAM2 model configuration is missing from the installed runtime.",
+            details={"config": SAM_MODEL_CONFIG},
+        ) from exc
+    config_sha256 = sha256_file(config_path)
+    if config_sha256 != SAM_MODEL_CONFIG_SHA256:
+        raise Stage2Error(
+            "SAM_MODEL_CONFIG_HASH_MISMATCH",
+            "Installed SAM2 model configuration does not match the pinned configuration.",
+            details={
+                "config": SAM_MODEL_CONFIG,
+                "expected": SAM_MODEL_CONFIG_SHA256,
+                "actual": config_sha256,
+            },
+        )
+    if not isinstance(torch_version, str) or not torch_version.strip():
+        raise Stage2Error(
+            "SAM_RUNTIME_UNVERIFIABLE",
+            "Installed Torch runtime did not report a version.",
+        )
+    source_tree_sha256 = sha256_directory_tree(package_root)
+    if sha256_file(config_path) != config_sha256:
+        raise Stage2Error(
+            "SAM_RUNTIME_CHANGED_DURING_HASH",
+            "SAM2 model configuration changed while runtime identity was calculated.",
+            recovery="Stop the installer or updater, then retry.",
+        )
+    return SamRuntimeIdentity(
+        repository=SAM_RUNTIME_REPOSITORY,
+        revision=revision,
+        source_tree_sha256=source_tree_sha256,
+        model_config=SAM_MODEL_CONFIG,
+        model_config_sha256=config_sha256,
+        torch_version=torch_version,
+        cuda_version=str(cuda_version or "none"),
+    )
 
 
 def file_stamp(path: Path) -> tuple[int, int, int, int]:
@@ -2149,6 +2356,24 @@ def validate_sam_config(config: SamGenerationConfig) -> None:
         problems.append("min_mask_pixels must be at least 1")
     if not re.fullmatch(r"[0-9a-f]{64}", config.model.sha256):
         problems.append("model.sha256 must be a lowercase 64-character SHA-256")
+    if not isinstance(config.runtime, SamRuntimeIdentity):
+        problems.append("runtime must use the versioned SamRuntimeIdentity schema")
+    else:
+        for name, value in (
+            ("runtime.source_tree_sha256", config.runtime.source_tree_sha256),
+            ("runtime.model_config_sha256", config.runtime.model_config_sha256),
+        ):
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                problems.append(f"{name} must be a lowercase 64-character SHA-256")
+        for name, value in (
+            ("runtime.repository", config.runtime.repository),
+            ("runtime.revision", config.runtime.revision),
+            ("runtime.model_config", config.runtime.model_config),
+            ("runtime.torch_version", config.runtime.torch_version),
+            ("runtime.cuda_version", config.runtime.cuda_version),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                problems.append(f"{name} must be a non-empty string")
     if problems:
         raise Stage2Error(
             "INVALID_SAM_CONFIG",
@@ -2322,6 +2547,7 @@ def sam_window_fingerprint_payload(
         "dino_artifact_sha256": dino_artifact.sha256,
         "dino_fingerprint": dino_meta.fingerprint,
         "model": _jsonable(config.model),
+        "runtime": _jsonable(config.runtime),
         "accepted_proposal_threshold": config.accepted_proposal_threshold,
         "prompt_conversion": "global-xyxy-box-to-local-object",
         "window": _jsonable(window),
@@ -2746,6 +2972,23 @@ def _sam_model_identity_from_dict(raw: dict[str, Any]) -> ModelIdentity:
         raise Stage2Error("INVALID_SAM_SHARD", "Stored SAM model identity is malformed.") from exc
 
 
+def _sam_runtime_identity_from_dict(raw: dict[str, Any]) -> SamRuntimeIdentity:
+    try:
+        return SamRuntimeIdentity(
+            repository=str(raw["repository"]),
+            revision=str(raw["revision"]),
+            source_tree_sha256=str(raw["source_tree_sha256"]),
+            model_config=str(raw["model_config"]),
+            model_config_sha256=str(raw["model_config_sha256"]),
+            torch_version=str(raw["torch_version"]),
+            cuda_version=str(raw["cuda_version"]),
+        )
+    except (KeyError, TypeError) as exc:
+        raise Stage2Error(
+            "INVALID_SAM_SHARD", "Stored SAM runtime identity is malformed."
+        ) from exc
+
+
 def _sam_mask_record_from_dict(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         return {
@@ -2773,6 +3016,7 @@ def sam_meta_from_dict(raw: dict[str, Any]) -> SamMaskShardMeta:
             dino_artifact_sha256=str(raw["dino_artifact_sha256"]),
             dino_fingerprint=str(raw["dino_fingerprint"]),
             model=_sam_model_identity_from_dict(raw["model"]),
+            runtime=_sam_runtime_identity_from_dict(raw["runtime"]),
             accepted_proposal_threshold=float(raw["accepted_proposal_threshold"]),
             frame_start=int(raw["frame_start"]),
             frame_end=int(raw["frame_end"]),
@@ -3087,6 +3331,7 @@ def build_sam_mask_shard(
         dino_artifact_sha256=dino_artifact.sha256,
         dino_fingerprint=dino_meta.fingerprint,
         model=config.model,
+        runtime=config.runtime,
         accepted_proposal_threshold=config.accepted_proposal_threshold,
         frame_start=window.frame_start,
         frame_end=window.frame_end,
@@ -3124,6 +3369,7 @@ def validate_sam_mask_shard(
         "dino_artifact_sha256": dino_artifact.sha256,
         "dino_fingerprint": dino_meta.fingerprint,
         "model": config.model,
+        "runtime": config.runtime,
         "accepted_proposal_threshold": config.accepted_proposal_threshold,
         "frame_start": window.frame_start,
         "frame_end": window.frame_end,
@@ -3148,6 +3394,7 @@ def validate_sam_mask_shard(
         problems.append("mask records do not match packed arrays")
     prompt_by_id = {prompt.prompt_id: prompt for prompt in prompts}
     prompt_frames: set[tuple[str, int]] = set()
+    sam_prompt_frames: set[tuple[str, int]] = set()
     anchor_fallbacks: set[str] = set()
     valid_sources = {
         "sam2-anchor",
@@ -3196,6 +3443,8 @@ def validate_sam_mask_shard(
             )
             if rejection is not None:
                 problems.append(f"stored SAM mask {mask.key} no longer passes validation")
+            else:
+                sam_prompt_frames.add((mask.prompt_id, mask.frame_idx))
         prompt_frames.add((mask.prompt_id, mask.frame_idx))
         expected_fallback = (
             "dino-fallback" if prompt.prompt_kind == "dino" else "manual-fallback"
@@ -3211,6 +3460,33 @@ def validate_sam_mask_shard(
                     f"prompt {prompt.prompt_id} has no SAM or fallback mask at frame {frame_idx}"
                 )
                 break
+    required_fallback_flags: set[str] = set()
+    for prompt in prompts:
+        missing_frames = [
+            frame_idx
+            for frame_idx in range(window.frame_start, window.frame_end + 1)
+            if (prompt.prompt_id, frame_idx) not in sam_prompt_frames
+        ]
+        if missing_frames:
+            required_fallback_flags.add(
+                _sam_review_flag(
+                    "SAM_FALLBACK_USED",
+                    window,
+                    prompt_id=prompt.prompt_id,
+                    detail=(
+                        f"ranges={_compact_frame_ranges(missing_frames)}|"
+                        f"count={len(missing_frames)}"
+                    ),
+                )
+            )
+    if not isinstance(meta.review_flags, tuple) or tuple(sorted(set(meta.review_flags))) != meta.review_flags:
+        problems.append("review_flags must be unique strings in canonical order")
+    missing_required_flags = required_fallback_flags.difference(meta.review_flags)
+    if missing_required_flags:
+        problems.append(
+            "review_flags omit required fallback review items: "
+            + ", ".join(sorted(missing_required_flags))
+        )
     expected_metrics = {
         "n_prompts": len(prompts),
         "n_valid_sam_masks": sum(
@@ -3298,10 +3574,26 @@ def generate_sam_mask_shards(
             "INVALID_DINO_ARTIFACT",
             "Provided DINO metadata does not match its immutable artifact.",
         )
+    if dino_meta.source_sha256 != stage1.source.sha256:
+        raise Stage2Error(
+            "DINO_SOURCE_MISMATCH",
+            "DINO proposals were generated from a different original video.",
+            details={
+                "expected_source_sha256": stage1.source.sha256,
+                "dino_source_sha256": dino_meta.source_sha256,
+            },
+            recovery="Select or recompute the DINO artifact for this exact original video.",
+        )
     if getattr(adapter, "identity", None) != config.model:
         raise Stage2Error(
             "SAM_MODEL_IDENTITY_MISMATCH",
             "Loaded SAM adapter identity does not match the fingerprinted configuration.",
+        )
+    if getattr(adapter, "runtime_identity", None) != config.runtime:
+        raise Stage2Error(
+            "SAM_RUNTIME_IDENTITY_MISMATCH",
+            "Loaded SAM runtime does not match the fingerprinted configuration.",
+            recovery="Rebuild the SAM configuration from the verified loaded adapter.",
         )
     selection = select_dino_proposals(dino_meta, config.accepted_proposal_threshold)
     seeds = validate_manual_seeds(manual_seeds, stage1)
@@ -3463,9 +3755,10 @@ def union_sam_masks_for_frame(
 class MetaSam2VideoAdapter:
     """Lazy boundary around Meta's official SAM2.1 video predictor.
 
-    The checkpoint and config must already exist locally and be verified by
-    setup. A window input is a directory of sequential JPEG frames whose
-    local index zero corresponds to ``window.frame_start``.
+    The checkpoint and pinned runtime must already exist locally. This adapter
+    verifies their hashes and source revision before model loading. A window
+    input is a directory of sequential JPEG frames whose local index zero
+    corresponds to ``window.frame_start``.
     """
 
     identity = ModelIdentity(
@@ -3478,7 +3771,6 @@ class MetaSam2VideoAdapter:
         self,
         *,
         checkpoint_path: Path,
-        model_config: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
         device: str = "cuda",
     ) -> None:
         checkpoint_path = resolve_input_file(checkpoint_path, "SAM2.1 checkpoint")
@@ -3488,6 +3780,7 @@ class MetaSam2VideoAdapter:
                 "SAM2.1 checkpoint hash does not match the pinned model.",
             )
         try:
+            import sam2
             import torch
             from sam2.build_sam import build_sam2_video_predictor
         except ImportError as exc:
@@ -3498,9 +3791,23 @@ class MetaSam2VideoAdapter:
             ) from exc
         self._torch = torch
         self.device = device
+        package_file = getattr(sam2, "__file__", None)
+        if not isinstance(package_file, str) or not package_file:
+            raise Stage2Error(
+                "SAM_RUNTIME_UNVERIFIABLE",
+                "Installed SAM2 package did not report its source location.",
+            )
+        package_root = Path(package_file).resolve().parent
+        revision = installed_sam_runtime_revision(package_root)
+        self.runtime_identity = verified_sam_runtime_identity(
+            package_root,
+            revision=revision,
+            torch_version=str(getattr(torch, "__version__", "")),
+            cuda_version=getattr(getattr(torch, "version", None), "cuda", None),
+        )
         try:
             self.predictor = build_sam2_video_predictor(
-                model_config,
+                SAM_MODEL_CONFIG,
                 str(checkpoint_path),
                 device=device,
                 mode="eval",
@@ -3620,25 +3927,26 @@ class MetaSam2VideoAdapter:
                             height=height,
                         )
                     )
-                for local_frame, object_ids, logits in self.predictor.propagate_in_video(
-                    state,
-                    start_frame_idx=latest,
-                    max_frame_num_to_track=latest + 1,
-                    reverse=True,
-                ):
-                    global_frame = window.frame_start + int(local_frame)
-                    reverse_seen.add(global_frame)
-                    masks.extend(
-                        self._raw_masks_from_output(
-                            frame_idx=global_frame,
-                            object_ids=object_ids,
-                            logits=logits,
-                            id_to_prompt=id_to_prompt,
-                            direction="reverse",
-                            width=width,
-                            height=height,
+                if latest > 0:
+                    for local_frame, object_ids, logits in self.predictor.propagate_in_video(
+                        state,
+                        start_frame_idx=latest,
+                        max_frame_num_to_track=latest + 1,
+                        reverse=True,
+                    ):
+                        global_frame = window.frame_start + int(local_frame)
+                        reverse_seen.add(global_frame)
+                        masks.extend(
+                            self._raw_masks_from_output(
+                                frame_idx=global_frame,
+                                object_ids=object_ids,
+                                logits=logits,
+                                id_to_prompt=id_to_prompt,
+                                direction="reverse",
+                                width=width,
+                                height=height,
+                            )
                         )
-                    )
         finally:
             if state is not None:
                 reset = getattr(self.predictor, "reset_state", None)
@@ -3648,7 +3956,11 @@ class MetaSam2VideoAdapter:
         if self.device.startswith("cuda") and self._torch.cuda.is_available():
             peak_vram = int(self._torch.cuda.max_memory_allocated())
         expected_forward = set(range(window.frame_start + earliest, window.frame_end + 1))
-        expected_reverse = set(range(window.frame_start, window.frame_start + latest + 1))
+        expected_reverse = (
+            set()
+            if latest == 0
+            else set(range(window.frame_start, window.frame_start + latest + 1))
+        )
         return SamPropagationResult(
             masks=tuple(masks),
             forward_complete=expected_forward.issubset(forward_seen),
@@ -3714,22 +4026,18 @@ class FakeDinoAdapter:
     def peak_vram_bytes(self) -> int:
         return 0
 
-    def detect(self, frame_idx: int, width: int, height: int) -> tuple[Proposal, ...]:
-        size = max(8.0, min(width, height) * 0.1)
-        x1 = float((frame_idx * 7) % max(1, int(width - size)))
-        y1 = float((frame_idx * 5) % max(1, int(height - size)))
-        return (
-            Proposal(
-                frame_idx=frame_idx,
-                box=(x1, y1, x1 + size, y1 + size),
-                score=0.42,
-                source="fake-full-frame",
-            ),
-        )
-
 
 class FakeSamAdapter:
     identity = ModelIdentity(name="fake-sam2", revision="milestone-3", sha256="a" * 64)
+    runtime_identity = SamRuntimeIdentity(
+        repository="fake://sam2-runtime",
+        revision="milestone-3",
+        source_tree_sha256="b" * 64,
+        model_config="fake-sam2-config",
+        model_config_sha256="c" * 64,
+        torch_version="fake-torch",
+        cuda_version="none",
+    )
 
     def __init__(self) -> None:
         self.calls = 0
@@ -3779,23 +4087,6 @@ class FakeSamAdapter:
             runtime_seconds=0.0,
             peak_vram_bytes=0,
         )
-
-    def propagate(
-        self, proposals: tuple[Proposal, ...], frame_start: int, frame_end: int
-    ) -> tuple[dict[str, Any], ...]:
-        masks = []
-        for proposal in proposals:
-            for frame_idx in range(frame_start, frame_end + 1):
-                masks.append(
-                    {
-                        "frame_idx": frame_idx,
-                        "box": list(proposal.box),
-                        "source": "fake-sam2",
-                        "anchor_frame": proposal.frame_idx,
-                    }
-                )
-        return tuple(masks)
-
 
 def run_fake_pipeline(
     *,
@@ -3878,9 +4169,10 @@ def run_fake_pipeline(
         dino_meta=dino_result.meta,
         config=SamGenerationConfig(
             model=sam.identity,
+            runtime=sam.runtime_identity,
             accepted_proposal_threshold=0.20,
-            window_size=min(10, validated.source_video.n_frames),
-            window_overlap=min(2, max(0, validated.source_video.n_frames - 1)),
+            window_size=sam_window_size,
+            window_overlap=min(2, sam_window_size // 2),
             precision="float32",
         ),
         adapter=sam,

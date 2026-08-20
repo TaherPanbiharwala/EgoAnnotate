@@ -72,6 +72,7 @@ Add `--json` before the subcommand for machine-readable output. A fake run recor
 ## Milestone 3 SAM2 and mask-shard contract
 
 - The Meta SAM2.1 Hiera Large model is pinned to `facebook/sam2.1-hiera-large` revision `665f8e2ad61cf5f53d65644ff27c8ee525124610`, using the official `sam2.1_hiera_large.pt` SHA-256 `2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318`.
+- The interpreting runtime is independently pinned to Meta SAM2 commit `2b90b9f5ceec907a1c18123530e92e794ad901a4`. The official `configs/sam2.1/sam2.1_hiera_l.yaml` is verified against SHA-256 `1dbd6cb6dfebeaf588c7006ee222c6efbfa9049a7ad472a3cdfb2f5d919e8107`. Every SAM shard fingerprint and metadata record also bind the installed SAM2 source-tree hash plus Torch and CUDA versions, so a runtime or configuration change cannot silently reuse old masks.
 - SAM work is divided into deterministic bounded overlapping windows. Window size and overlap are required, fingerprinted inputs; the production values remain deliberately unfrozen until the Milestone 6 RunPod memory pilot.
 - Every accepted DINO proposal and intersecting manual seed becomes a box prompt with a window-local SAM object ID. The adapter propagates from the prompt anchors in both forward and reverse time. Cross-window identity is neither required nor inferred.
 - Every decoded SAM window is bound to the validated original-video hash, exact frame range, and display dimensions before the adapter can see it. A wrong or unverifiable window is discarded in favor of flagged DINO/manual fallback coverage.
