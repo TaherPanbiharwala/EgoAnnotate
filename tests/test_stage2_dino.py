@@ -398,6 +398,8 @@ def test_checkpoint_fingerprint_mismatch_never_reuses_rows(stage2_job, tmp_path)
         {"proposal_floor": 0.11},
         {"text_threshold": 0.3},
         {"anchor_spacing": 10},
+        {"tile_rows": 3},
+        {"tile_cols": 3},
         {"tile_overlap": 0.1},
         {"nms_iou": 0.5},
         {"view_batch_size": 2},
@@ -441,6 +443,28 @@ def test_source_and_model_identity_change_dino_fingerprint(stage2_job):
     )
     assert original != stage2_job.dino_fingerprint(
         stage2_job.dino_fingerprint_payload(stage1, changed_model, anchors)
+    )
+
+
+@pytest.mark.parametrize(
+    "model_change",
+    [
+        {"name": "different-model"},
+        {"revision": "different-revision"},
+        {"sha256": "9" * 64},
+    ],
+)
+def test_every_dino_model_identity_field_changes_fingerprint(stage2_job, model_change):
+    stage1 = _stage1(stage2_job)
+    adapter = GlobalFaceAdapter(stage2_job)
+    config = _config(stage2_job, adapter)
+    anchors = stage2_job.anchor_schedule(stage1.source_video.n_frames, config.anchor_spacing)
+    original = stage2_job.dino_fingerprint(
+        stage2_job.dino_fingerprint_payload(stage1, config, anchors)
+    )
+    changed = replace(config, model=replace(config.model, **model_change))
+    assert original != stage2_job.dino_fingerprint(
+        stage2_job.dino_fingerprint_payload(stage1, changed, anchors)
     )
 
 
@@ -532,6 +556,32 @@ def test_final_artifact_tampering_is_not_reused(stage2_job, tmp_path):
         )
     assert result.meta.metrics["n_proposals"] != 999
     assert caught.value.code == "INVALID_DINO_ARTIFACT"
+
+
+def test_canonical_proposal_edit_that_diverges_from_checkpoint_is_not_reused(
+    stage2_job, tmp_path
+):
+    stage1 = _stage1(stage2_job)
+    adapter = GlobalFaceAdapter(stage2_job)
+    config = _config(stage2_job, adapter)
+    result, paths = _generate(stage2_job, tmp_path, stage1, adapter, config)
+    original = result.meta.proposals[0]
+    changed = stage2_job._finalize_proposal(
+        replace(original, box=(original.box[0] + 0.5, *original.box[1:]))
+    )
+    raw = stage2_job.read_json(paths.dino)
+    raw["proposals"][0] = stage2_job._jsonable(changed)
+    stage2_job.atomic_write_json(paths.dino, raw)
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.generate_dino_proposals(
+            stage1=stage1,
+            paths=paths,
+            config=config,
+            adapter=adapter,
+            frame_loader=lambda _index: stage2_job.FakeImage(100, 80),
+        )
+    assert caught.value.code == "INVALID_DINO_ARTIFACT"
+    assert "checkpoint" in caught.value.message.lower()
 
 
 def test_checkpoint_tampering_after_finalization_is_not_reused(stage2_job, tmp_path):

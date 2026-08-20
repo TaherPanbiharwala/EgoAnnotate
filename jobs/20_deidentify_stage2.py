@@ -1887,6 +1887,28 @@ def generate_dino_proposals(
                 "DINO checkpoint changed after the final artifact was created.",
                 recovery="Explicitly recompute from the DINO layer.",
             )
+        checkpoint_rows = load_dino_checkpoint(
+            paths.dino_checkpoint,
+            fingerprint_value=fingerprint_value,
+            anchors=anchors,
+        )
+        if set(checkpoint_rows) != set(anchors):
+            raise Stage2Error(
+                "INVALID_DINO_ARTIFACT",
+                "DINO checkpoint does not contain every finalized anchor.",
+                recovery="Explicitly recompute from the DINO layer.",
+            )
+        checkpoint_proposals = tuple(
+            proposal
+            for frame_idx in anchors
+            for proposal in checkpoint_rows[frame_idx]["proposals"]
+        )
+        if checkpoint_proposals != meta.proposals:
+            raise Stage2Error(
+                "INVALID_DINO_ARTIFACT",
+                "DINO proposal artifact does not match its inference checkpoint.",
+                recovery="Explicitly recompute from the DINO layer.",
+            )
         return DinoGenerationResult(
             artifact=artifact_ref(paths.dino),
             meta=meta,
