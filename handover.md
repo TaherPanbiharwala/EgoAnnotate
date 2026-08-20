@@ -6,6 +6,7 @@ Updated 2026-08-20 for the next coding session.
 
 - Worktree: `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2`
 - Branch: `feature/stage2-deidentification`
+- Milestone 5 implementation HEAD: `dba85a9`
 - Baseline HEAD before Milestone 5: `f0754f1`
 - Base merged from `master`: `9acfe07`
 - Milestones through 5 are implemented, tested, and documented on this branch.
@@ -94,6 +95,8 @@ The complete review then produced separate milestone-specific fix commits:
 - `c7b4005` — documentation refreshed to match Milestones 1-3.
 - `f0754f1` — Milestone 4 verified Stage I-only rendering and atomic output
   promotion.
+- `dba85a9` — Milestone 5 private artifacts, immutable review/release gates,
+  operator commands, persistent setup, tests, and documentation.
 
 Milestone 5 adds content-addressed private labels, manual seeds, evidence, and
 review flags beneath `DO-NOT-SHIP`; immutable human reviews bound to exact
@@ -173,11 +176,11 @@ by the Milestone 5 command implementation until this work begins.
 These were identified during review and should be addressed in their planned
 milestones:
 
-- Before real SAM2 execution in Milestone 6, attest the actual extracted frame-window payload,
-  not just loader-supplied metadata. Verify frame count, names/order, and content
-  identity so an off-by-one or wrong directory cannot reach SAM2 with plausible
-  metadata. This belongs with the Stage II setup/real-adapter path in Milestones
-  5-6.
+- Before real SAM2 execution in Milestone 6, attest the actual extracted
+  frame-window payload, not just loader-supplied metadata. Verify frame count,
+  names/order, and content identity so an off-by-one or wrong directory cannot
+  reach SAM2 with plausible metadata. This belongs with the Milestone 6
+  real-adapter path.
 - Profile the real SAM2 adapter's full-resolution GPU-to-CPU mask copies and
   Python-list conversion. Forward/reverse overlap may duplicate work. Measure
   this during the Milestone 6 GPU pilot before optimizing.

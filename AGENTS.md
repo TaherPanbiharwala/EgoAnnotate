@@ -3,8 +3,8 @@
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
 repo cold. Written 2026-08-11 and updated on the Stage II feature branch on
 2026-08-20. The branch includes clean `master` baseline **`9acfe07`** plus
-the reviewed Stage II plan and Milestones 1-5 implementation. The last baseline
-HEAD before Milestone 5 was **`f0754f1`**. The complete suite
+the reviewed Stage II plan and Milestones 1-5 implementation. The Milestone 5
+implementation baseline is committed at **`dba85a9`**. The complete suite
 was verified at **446 passing tests** with
 `uv run --extra test pytest tests/ -q`. Run `git status`, then read
 `handover.md` and `STAGE2_DEIDENTIFICATION_PLAN.md` before changing either
@@ -196,12 +196,14 @@ and pinned with a regression test:
 
 ## Stage II continuation point
 
-Milestones 1-3 and their review fixes are committed separately on
+Milestones 1-5 and their review fixes are committed separately on
 `feature/stage2-deidentification`:
 
 - implementation: `03762c5`, `0c8bc87`, `5905aee`;
 - review hardening: `a31e65c`, `ce08d73`, `c5609ca`;
-- documentation refresh: `c7b4005`.
+- documentation refresh: `c7b4005`;
+- verified Stage I-only rendering: `f0754f1`;
+- private review, release gates, and operator workflow: `dba85a9`.
 
 The review's P1 provenance defects are resolved. Reused DINO proposals must
 match their finalized checkpoint rows; SAM fallback review flags cannot be
