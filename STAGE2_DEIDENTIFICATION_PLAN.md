@@ -1,8 +1,18 @@
 # Stage II EgoBlur + DINO/SAM2 De-identification Plan
 
-Status: implementation-ready and divided into reviewable milestones
+Status: Milestone 1 complete; Milestone 2 next
 
 Saved: 2026-08-18; milestone structure updated 2026-08-20
+
+| Milestone | Status |
+|---|---|
+| 1. Contracts, validation, and local skeleton | Complete — 2026-08-20 |
+| 2. DINO proposal generation and reuse | Not started |
+| 3. SAM2 propagation and mask shards | Not started |
+| 4. Rendering and technical verification | Not started |
+| 5. Labels, review workflow, and operator UX | Not started |
+| 6. Real-GPU smoke test and `GX010057` calibration | Not started |
+| 7. Canary and production rollout | Not started |
 
 ## Worktree and execution boundary
 
@@ -20,6 +30,34 @@ Saved: 2026-08-18; milestone structure updated 2026-08-20
 - Do not require a GPU until Milestone 6. Milestones 1-5 must be testable locally with deterministic fake model adapters.
 - A milestone is complete only when its code, tests, manifest fields, operator documentation, and failure behavior are reviewed together.
 - Privacy or provenance failures block advancement. Convenience features may be deferred without weakening fail-closed behavior.
+
+## Milestone 1 local operator commands
+
+Milestone 1 exposes only the contract-testing commands below. They load no real DINO/SAM models and cannot produce a publishable video:
+
+```bash
+# Validate the original, EgoBlur output, and EgoBlur manifest without writing a run.
+bash scripts/runpod_stage2.sh validate \
+  --source-video /path/to/GX010057.MP4 \
+  --stage1-video /path/to/GX010057.blurred.mp4 \
+  --stage1-manifest /path/to/GX010057.manifest.json
+
+# Exercise deterministic local artifacts, state transitions, and resume behavior.
+bash scripts/runpod_stage2.sh fake-run \
+  --source-video /path/to/GX010057.MP4 \
+  --stage1-video /path/to/GX010057.blurred.mp4 \
+  --stage1-manifest /path/to/GX010057.manifest.json \
+  --work-dir /path/to/stage2-work \
+  --run-id milestone-1-smoke
+
+# Read state without modifying the run.
+bash scripts/runpod_stage2.sh status \
+  --work-dir /path/to/stage2-work \
+  --run-id milestone-1-smoke \
+  --clip-id GX010057
+```
+
+Add `--json` before the subcommand for machine-readable output. A fake run records `NOT_RUN_FAKE` and `NOT_REVIEWABLE_FAKE`; it may never be accepted or released.
 
 ## Architecture
 
@@ -46,7 +84,7 @@ Do not modify EgoBlur's known completed-manifest config-matching behavior in thi
 - hysteresis disabled;
 - plate detector disabled;
 - expected dilation/motion-margin settings;
-- fill-integrity check ran and reported zero violations.
+- fill-integrity check ran across the complete clip and reported its findings. Preserve nonzero legacy exact-pixel findings as Stage II review reasons rather than rejecting `GX010057`: the measured evidence in `AGENTS.md`/`handover.md` established that its findings are mild H.264 quantization, not exposed pixels. Stage II's own renderer will use its new verification contract before promotion.
 
 Any mismatch fails closed. Carry `NEEDS_REVIEW` and its reasons into Stage II rather than treating it as failure, because Stage II exists to investigate and recover misses. Record that historical Stage I model-weight identity is weaker when the upstream manifest did not store its hash.
 

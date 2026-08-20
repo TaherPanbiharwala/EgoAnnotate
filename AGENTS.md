@@ -1,14 +1,11 @@
 # egoannote — agent briefing
 
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
-repo cold. Written 2026-08-11, substantially updated in a later session
-after the EgoBlur fill-integrity question got resolved with real evidence
-and two more hysteresis visibility bugs got fixed. Repo HEAD at time of
-writing: **`5cca081`** — but the working tree has real, tested,
-**uncommitted** changes on top (the `det_low`/`n_low_absorbed` fixes below,
-plus an SSH durability fix in `scripts/runpod_setup.sh`); run `git status`
-before trusting this describes `HEAD` exactly. 279 tests passing
-(`uv run --extra test pytest tests/ -q`), including the uncommitted work.
+repo cold. Written 2026-08-11 and updated on the Stage II feature branch on
+2026-08-20. The branch includes clean `master` baseline **`9acfe07`** plus
+the Stage II plan and Milestone 1 implementation. 318 tests pass
+(`uv run --extra test pytest tests/ -q`). Run `git status` and read
+`STAGE2_DEIDENTIFICATION_PLAN.md` before changing either GPU stage.
 
 If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
@@ -26,9 +23,9 @@ privacy, then write an honest post-mortem about the whole project.
 Pipeline, in order:
 
 ```
-EgoBlur (GPU pod)  →  MediaPipe hands (local CPU)  →  VLM captioning (API)
-   redacts faces         tracks hand landmarks         describes actions
-   and plates            on the REDACTED video          per 6s window
+EgoBlur (GPU pod)  →  Stage II DINO/SAM2 (same GPU pod)  →  MediaPipe hands (local CPU)  →  VLM captioning (API)
+   first-pass boxes      recovers difficult face misses      tracks hand landmarks         describes actions
+                                                              on the REDACTED video          per 6s window
                                                               ↓
                                           segmentation (NOT implemented yet)
                                           turns captions into action segments
@@ -37,18 +34,27 @@ EgoBlur (GPU pod)  →  MediaPipe hands (local CPU)  →  VLM captioning (API)
                                           assembles + validates HF dataset
 ```
 
-**Only the EgoBlur stage needs a GPU.** Everything else runs free, locally,
-on the developer's Mac (MediaPipe is CPU/Metal; captioning is an HTTP API
-call). This matters: don't assume the whole pipeline needs to run on a
-rented pod.
+**EgoBlur and the eventual real DINO/SAM2 Stage II need a GPU.** They run
+sequentially on the same pod and persistent `/workspace` volume, but in
+independent PEP 723 environments because their Torch/CUDA stacks are not
+assumed compatible. Milestone 1 of Stage II is contract-only and runs
+locally with fake adapters; real model/GPU work does not begin until later
+milestones. MediaPipe remains local CPU/Metal and captioning remains an HTTP
+API call.
 
 ## Repo layout
 
 ```
-jobs/10_blur_egoblur.py     the ONE GPU job. Self-contained PEP 723 script
+jobs/10_blur_egoblur.py     first GPU job. Self-contained PEP 723 script
                              (see below for why). ~2800 lines, heavily
                              tested and heavily reviewed — read its module
                              docstring before changing anything in it.
+jobs/20_deidentify_stage2.py
+                             Stage II self-contained PEP 723 job. Milestone 1
+                             currently contains schemas, strict Stage I
+                             validation, layered fingerprints, atomic state,
+                             immutable artifacts, and deterministic fake
+                             DINO/SAM adapters — no real models yet.
 jobs/_contract.py           the shard-metadata contract other future GPU
                              jobs (hand-pose, depth, SLAM) will vendor by
                              copy — NOT imported (see PEP 723 section).
@@ -57,6 +63,7 @@ scripts/22_blur_review.py   builds an HTML gallery of flagged detections
                              publishing.
 scripts/runpod_setup.sh     idempotent RunPod environment setup. Re-run
                              after every pod restart (see "RunPod" below).
+scripts/runpod_stage2.sh    thin wrapper for Stage II validate/fake-run/status.
 scripts/demo.py             zero-setup plumbing smoke test — no GPU, no
                              API key, runs the whole non-GPU pipeline
                              against a bundled synthetic clip.
@@ -89,7 +96,7 @@ models.toml                 VLM model registry. Ships with placeholder
                              entries; needs 2 real models from DIFFERENT
                              labs (see file's own comments on why) before
                              any real captioning run.
-tests/                       pytest, 279 tests. Run before AND after any
+tests/                       pytest, 318 tests. Run before AND after any
                              change: `uv run --extra test pytest tests/ -q`
 handover.md                  a PREVIOUS session's own continuation notes.
                              Tracked in git (not gitignored) — read it,
@@ -164,6 +171,7 @@ and pinned with a regression test:
 | Stage | Status |
 |---|---|
 | EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
+| Stage II DINO/SAM2 | Milestone 1 complete on `feature/stage2-deidentification`: schemas, Stage I validation, fingerprints, atomic state/immutable artifacts, fake adapters, and local commands. No real DINO/SAM inference or publishable rendering exists yet. Continue with Milestone 2 in `STAGE2_DEIDENTIFICATION_PLAN.md`. |
 | MediaPipe hands | Code complete, unit-tested, proven working (Metal-accelerated, fast). Never run against real *redacted* output — only a synthetic test clip. |
 | VLM captioning | Code complete, unit-tested. `models.toml` still has placeholder model IDs / $0.00 prices — cannot run for real until filled in with two real models from different labs. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |

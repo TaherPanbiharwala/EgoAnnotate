@@ -38,3 +38,8 @@ def blur_job():
 @pytest.fixture(scope="session")
 def blur_review():
     return _load("scripts/22_blur_review.py", "blur_review")
+
+
+@pytest.fixture(scope="session")
+def stage2_job():
+    return _load("jobs/20_deidentify_stage2.py", "stage2_job")
