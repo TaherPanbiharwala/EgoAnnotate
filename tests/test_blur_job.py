@@ -1074,6 +1074,127 @@ def test_audit_summary_states_the_reason_for_needs_review(blur_job, tmp_path):
         f"human actually reads:\n{text}")
 
 
+def test_build_audit_reports_det_low_frames(blur_job):
+    """det_low_frames used to not exist at all: n_low_absorbed reached the
+    manifest but nothing said WHICH frames it counted."""
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=5, n_low_absorbed=2, det_low_frames=[9, 3, 3])
+    # Caller passes raw appends (process_clip's own list can repeat a
+    # frame_idx across tracks) -- build_audit stores what it's given as-is;
+    # sorting/deduping is process_clip's job at the call site, not this
+    # function's, so this pins that build_audit itself does not silently
+    # do it a second time and mask a caller-side regression.
+    assert audit["det_low_frames"] == [9, 3, 3]
+
+
+def test_build_audit_det_low_frames_defaults_empty(blur_job):
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=5)
+    assert audit["det_low_frames"] == []
+
+
+def test_build_audit_caps_det_low_frames_like_its_siblings(blur_job):
+    """Same convention as candidates_truncated/yunet_truncated: cap the
+    stored list at AUDIT_MAX_ITEMS and count what got cut, rather than
+    storing an unbounded list -- a long clip under heavy hysteresis use
+    could otherwise put thousands of entries in every manifest."""
+    clip = _clip(blur_job)
+    frames = list(range(blur_job.AUDIT_MAX_ITEMS + 5))
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=5, n_low_absorbed=len(frames), det_low_frames=frames)
+    assert len(audit["det_low_frames"]) == blur_job.AUDIT_MAX_ITEMS
+    assert audit["det_low_frames_truncated"] == 5
+
+
+def test_audit_summary_prints_low_absorbed_count_and_frames(blur_job, tmp_path):
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=5, n_low_absorbed=2, det_low_frames=[3, 9])
+    p = tmp_path / "s.md"
+    blur_job.write_audit_summary(audit, clip, p)
+    text = p.read_text()
+    assert "n_low_absorbed: 2" in text, (
+        f"n_low_absorbed reaches the JSON manifest but not the markdown a "
+        f"human actually reads:\n{text}")
+    assert "3, 9" in text, (
+        f"the count is printed but not WHICH frames it refers to:\n{text}")
+
+
+def test_audit_summary_caps_the_printed_frame_list(blur_job, tmp_path):
+    """A clip with dozens of absorptions must not turn the summary into an
+    unreadable dump -- the full list still reaches the JSON manifest."""
+    clip = _clip(blur_job)
+    frames = list(range(20))
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=5, n_low_absorbed=20, det_low_frames=frames)
+    assert audit["det_low_frames"] == frames, "the JSON field must stay uncapped"
+    p = tmp_path / "s.md"
+    blur_job.write_audit_summary(audit, clip, p)
+    text = p.read_text()
+    assert "+12 more" in text, f"expected the markdown excerpt capped at 8:\n{text}"
+
+
+def test_audit_summary_does_not_guess_why_nothing_was_absorbed(blur_job, tmp_path):
+    """write_audit_summary only ever sees the audit dict -- never
+    cfg.continue_threshold -- so it cannot tell 'hysteresis was off' apart
+    from 'hysteresis was on and genuinely absorbed nothing on this clip'.
+    Regression: it used to print '0 when --continue-threshold is off' as a
+    hardcoded, unverified guess, which is simply false on a clip run WITH
+    hysteresis that happened to absorb nothing."""
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=5)  # n_low_absorbed/det_low_frames both default empty
+    p = tmp_path / "s.md"
+    blur_job.write_audit_summary(audit, clip, p)
+    text = p.read_text()
+    assert "n_low_absorbed: 0" in text
+    assert "continue-threshold" not in text, (
+        f"asserted a specific cause for zero absorptions that this function "
+        f"has no way to actually verify:\n{text}")
+
+
+def test_audit_summary_labels_absorptions_separately_from_distinct_frames(
+        blur_job, tmp_path):
+    """n_low_absorbed counts EVENTS; det_low_frames is DEDUPLICATED frames.
+    Two different tracks absorbing on the same frame_idx makes these
+    legitimately differ (2 events, 1 distinct frame) -- the summary must
+    label them as two different measures, not print a bare frame count next
+    to an absorption count as though they're the same number."""
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5, "max_fill_area_frac": 0.1},
+        {"fill_integrity_violations": 0, "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_face_fill_frames=5, n_low_absorbed=2, det_low_frames=[5])
+    p = tmp_path / "s.md"
+    blur_job.write_audit_summary(audit, clip, p)
+    text = p.read_text()
+    assert "n_low_absorbed: 2" in text
+    assert "1 distinct frame" in text, (
+        f"a reviewer seeing 'n_low_absorbed: 2' next to a single frame number "
+        f"needs the mismatch explained, not left to look like a bug:\n{text}")
+
+
 def test_changing_gen2_resize_px_discards_the_checkpoint(blur_job, monkeypatch, tmp_path):
     """Inference scale changes what a score means, so cached rows from the
     other scale are not reusable — same reasoning as gen and weights."""
