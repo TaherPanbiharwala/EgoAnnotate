@@ -6,6 +6,7 @@ Updated 2026-08-20 after starting Milestone 6.
 
 - Worktree: `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2`
 - Branch: `feature/stage2-deidentification`
+- Milestone 6 local preparation checkpoint: `39d23ed`
 - Milestone 5 implementation HEAD: `dba85a9`
 - Baseline HEAD before Milestone 5: `f0754f1`
 - Base merged from `master`: `9acfe07`

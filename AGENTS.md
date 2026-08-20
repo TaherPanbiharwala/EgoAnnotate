@@ -217,7 +217,7 @@ now version `0.5.0` with code version `milestone-5`.
 
 The in-progress Milestone 6 preparation reports job version `0.6.0` and code
 version `milestone-6`; those identifiers do not mean the real calibration gate
-has passed.
+has passed. Its local implementation checkpoint is `39d23ed`.
 
 Continue **Milestone 6 — real-GPU smoke test and full `GX010057`
 calibration** in `STAGE2_DEIDENTIFICATION_PLAN.md`. The local implementation now
