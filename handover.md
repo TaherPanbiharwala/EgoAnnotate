@@ -1,6 +1,6 @@
 # egoannote Stage II session handover
 
-Updated 2026-08-20 for the next coding session.
+Updated 2026-08-20 after starting Milestone 6.
 
 ## Start here
 
@@ -10,6 +10,10 @@ Updated 2026-08-20 for the next coding session.
 - Baseline HEAD before Milestone 5: `f0754f1`
 - Base merged from `master`: `9acfe07`
 - Milestones through 5 are implemented, tested, and documented on this branch.
+- Milestone 6 is in progress locally. The offline sequential CUDA smoke,
+  verified persistent DINO snapshot binding, and exact source/frame-attested
+  SAM window extraction are implemented; the actual pod and `GX010057` work
+  have not run.
 - Nothing from this branch has been pushed or merged into `master` by this
   session.
 
@@ -159,10 +163,24 @@ items outside the Stage II change:
 
 Do not mix those unrelated cleanup items into a Stage II milestone commit.
 
-## Next milestone
+## Milestone 6 progress and next external gate
 
-Continue with **Milestone 6: real-GPU smoke test and full `GX010057`
-calibration** in `STAGE2_DEIDENTIFICATION_PLAN.md`.
+Milestone 6 has started. Local code now:
+
+- makes persistent setup run DINO and SAM2 sequentially with networking
+  disabled and saves `models/stage2/gpu-smoke.json` atomically;
+- chooses BF16 on compute capability 8+ and FP16 on older CUDA devices;
+- records device/model/runtime identity, runtime, peak VRAM, and residual DINO
+  memory before SAM loads;
+- loads DINO from the exact persistent snapshot whose weights were hash
+  verified; and
+- atomically extracts numeric SAM JPEG windows, verifies exact frame count,
+  names, dimensions, hashes, source/range binding, and revalidates the payload
+  before inference and reuse.
+
+The local complete suite currently passes at **453 tests** and the focused
+M6/DINO/SAM/operator suite passes at **124 tests**. No model assets were
+downloaded and no CUDA execution occurred locally.
 
 On RunPod, run the persistent setup, verify the exact assets and offline
 CUDA/model load, attest the extracted frame-window payload, and select a safe

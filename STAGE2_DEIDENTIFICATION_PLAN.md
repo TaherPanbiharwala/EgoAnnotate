@@ -1,6 +1,6 @@
 # Stage II EgoBlur + DINO/SAM2 De-identification Plan
 
-Status: Milestones 1-5 complete; Milestone 6 next
+Status: Milestones 1-5 complete; Milestone 6 in progress
 
 Saved: 2026-08-18; milestone structure updated 2026-08-20
 
@@ -11,7 +11,7 @@ Saved: 2026-08-18; milestone structure updated 2026-08-20
 | 3. SAM2 propagation and mask shards | Complete — 2026-08-20 |
 | 4. Rendering and technical verification | Complete — 2026-08-20 |
 | 5. Labels, review workflow, and operator UX | Complete — 2026-08-20 |
-| 6. Real-GPU smoke test and `GX010057` calibration | Not started |
+| 6. Real-GPU smoke test and `GX010057` calibration | In progress — local GPU/frame gates ready; RunPod calibration pending |
 | 7. Canary and production rollout | Not started |
 
 ## Worktree and execution boundary
@@ -330,6 +330,12 @@ Before publication, watch every complete final clip at accelerated speed and ins
 - Private artifacts cannot enter a release package; any correction invalidates earlier acceptance; errors identify reusable layers and exact recovery commands; the documented golden path works up to the real-GPU boundary.
 
 ### Milestone 6 — Real-GPU smoke test and full `GX010057` calibration
+
+**Progress — 2026-08-20**
+
+- The persistent setup now runs an offline sequential DINO-to-SAM CUDA inference smoke and atomically records device, precision, runtime, peak VRAM, residual DINO VRAM, pinned model/runtime identity, and verified asset evidence.
+- DINO loads from the exact hash-verified persistent snapshot. Every real SAM window is atomically extracted as numeric JPEGs and bound to the source hash, exact global/local frame indices, dimensions, per-frame hashes, and a content attestation that is revalidated before inference or shard reuse.
+- Local focused and complete-suite gates pass. The RunPod smoke, 30-60 second window-size pilot, private `GX010057` labeling, four-candidate sweep, human review, and production-config freeze remain required; no calibration setting is frozen from local fake evidence.
 
 **Build/run**
 

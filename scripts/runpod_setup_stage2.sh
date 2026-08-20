@@ -82,6 +82,7 @@ SAM_RUNTIME="$MODEL_ROOT/sam2-runtime"
 STAGE2_WORK="$WORKSPACE_ROOT/stage2"
 ENV_FILE="$WORKSPACE_ROOT/stage2-env.sh"
 ASSET_MANIFEST="$MODEL_ROOT/assets.manifest.json"
+GPU_SMOKE_RESULT="$MODEL_ROOT/gpu-smoke.json"
 
 DINO_REVISION="e76a695ed7ae1032a61530cce4b4e9b65f4e368b"
 DINO_SHA256="5548f844c928c4b6f411fa8cbcc2bfa8dbbba437cb1d513975519f93c2a9ed21"
@@ -100,6 +101,7 @@ show_plan() {
     echo "  DINO revision   $DINO_REVISION"
     echo "  SAM2 revision   $SAM_REVISION"
     echo "  work directory  $STAGE2_WORK"
+    echo "  GPU smoke       $GPU_SMOKE_RESULT"
 }
 if [ "$DRY_RUN" = "1" ]; then
     show_plan
@@ -181,23 +183,20 @@ if [ "$VERIFY_ONLY" != "1" ]; then
     export TRANSFORMERS_OFFLINE=0
     export HF_HUB_OFFLINE=0
     DINO_SNAPSHOT="$(uv run --no-project --with 'huggingface-hub==0.29.1' python - \
-        "$DINO_REVISION" <<'PY'
+        "$DINO_REVISION" "$DINO_DIR" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
 
 print(snapshot_download(
     repo_id="IDEA-Research/grounding-dino-base",
     revision=sys.argv[1],
+    local_dir=sys.argv[2],
 ))
 PY
 )"
     export TRANSFORMERS_OFFLINE=1
     export HF_HUB_OFFLINE=1
     verify_hash "$DINO_SNAPSHOT/model.safetensors" "$DINO_SHA256" "Grounding DINO weights"
-    if [ ! -f "$DINO_WEIGHTS" ]; then
-        cp --reflink=auto "$DINO_SNAPSHOT/model.safetensors" "$DINO_WEIGHTS" 2>/dev/null || \
-            cp "$DINO_SNAPSHOT/model.safetensors" "$DINO_WEIGHTS"
-    fi
 fi
 verify_hash "$DINO_WEIGHTS" "$DINO_SHA256" "Grounding DINO weights"
 
@@ -289,7 +288,27 @@ with temporary.open("w", encoding="utf-8") as handle:
 os.replace(temporary, path)
 PY
 
-echo ">> Stage II assets and environment verified"
+GPU_SMOKE_PARTIAL="$GPU_SMOKE_RESULT.partial"
+if [ -e "$GPU_SMOKE_PARTIAL" ]; then
+    echo "FATAL: interrupted GPU smoke result exists: $GPU_SMOKE_PARTIAL" >&2
+    exit 1
+fi
+echo ">> running offline sequential DINO/SAM2 CUDA smoke"
+uv run "$REPO_DIR/jobs/20_deidentify_stage2.py" --json doctor \
+    --workspace-root "$WORKSPACE_ROOT" --load-models > "$GPU_SMOKE_PARTIAL"
+uv run --no-project python - "$GPU_SMOKE_PARTIAL" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+if payload.get("status") != "PASS_OFFLINE_GPU_SMOKE":
+    raise SystemExit(f"GPU smoke did not pass: {payload}")
+PY
+mv "$GPU_SMOKE_PARTIAL" "$GPU_SMOKE_RESULT"
+
+echo ">> Stage II assets, environment, and offline GPU smoke verified"
 echo ">> source $ENV_FILE"
 echo ">> bash scripts/runpod_stage2.sh doctor --workspace-root $WORKSPACE_ROOT"
-echo ">> real CUDA/model-load smoke remains intentionally gated to Milestone 6"
+echo ">> GPU smoke evidence: $GPU_SMOKE_RESULT"

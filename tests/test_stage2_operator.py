@@ -386,6 +386,7 @@ def test_stage2_setup_dry_run_is_idempotent_and_non_mutating(stage2_job, tmp_pat
         assert "no writes" in result.stdout
         assert stage2_job.DINO_MODEL_REVISION in result.stdout
         assert stage2_job.SAM_RUNTIME_REVISION in result.stdout
+        assert "gpu-smoke.json" in result.stdout
     assert not workspace.exists()
 
 
@@ -434,3 +435,4 @@ def test_gpu_environment_and_setup_assets_are_pinned_together(stage2_job):
         stage2_job.SAM_MODEL_CONFIG_SHA256,
     ):
         assert identity in setup_text
+    assert "local_dir=sys.argv[2]" in setup_text

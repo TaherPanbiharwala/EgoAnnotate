@@ -19,29 +19,32 @@ bash scripts/runpod_stage2.sh doctor --workspace-root /workspace
 The setup is idempotent. It stores `uv`, Hugging Face, Torch, model, runtime,
 and job caches under `/workspace`; verifies the pinned DINO and SAM2 hashes;
 and rejects a changed SAM2 commit, remote, tracked source, or configuration.
-Use `--dry-run` to inspect paths without writing and `--verify-only` to forbid
-downloads. Real CUDA/model loading remains locked until the Milestone 6 smoke
-test.
+It then disables model networking, loads DINO and SAM2 sequentially, runs a
+synthetic CUDA inference through each, and atomically writes the evidence to
+`/workspace/models/stage2/gpu-smoke.json`. Use `--dry-run` to inspect paths
+without writing and `--verify-only` to forbid downloads. The same smoke can be
+rerun explicitly with `doctor --workspace-root /workspace --load-models`.
 
 ## Commands
 
 Global `--json` emits one machine-readable object. Global `--dry-run` reports
 planned writes without changing the run.
 
-| Command | Milestone 5 behavior |
+| Command | Current behavior |
 |---|---|
 | `doctor` | Checks persistent tools, caches, exact weights, runtime, and config. |
 | `smoke` | Runs deterministic fake DINO/SAM plumbing. Its output is never reviewable or releasable. |
-| `pilot` | Describes the fixed real-GPU pilot and stops at the Milestone 6 boundary. |
-| `sweep` | Describes the `0.15/0.20/0.25/0.30` threshold sweep and stops at the GPU boundary. |
-| `run` | Supports `--fake`; production execution remains gated to Milestone 6. |
+| `pilot` | Describes the fixed real-GPU pilot; clip execution remains gated until the RunPod smoke evidence and private inputs are present. |
+| `sweep` | Describes the `0.15/0.20/0.25/0.30` threshold sweep and remains gated until the smoke slice is reviewed. |
+| `run` | Supports `--fake`; production clip execution remains pending the Milestone 6 RunPod pilot. |
 | `status` | Reports processing, automated audit, and human review independently. |
 | `resume` | Clears a cooperative stop and preserves compatible completed layers. |
 | `stop` | Writes an idempotent cooperative stop marker without deleting artifacts. |
 | `review` | Creates a content-bound immutable `ACCEPTED` or `REJECTED` human record. |
 | `release-check` | Requires exact accepted hashes and scans staged release content for private bytes. |
 
-The golden path available now ends deliberately at the GPU boundary:
+The current golden path runs the real offline model smoke and then stops before
+paid clip inference:
 
 ```bash
 bash scripts/runpod_setup_stage2.sh

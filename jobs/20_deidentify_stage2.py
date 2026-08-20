@@ -17,8 +17,9 @@ Milestones 1-5 define the fail-closed local contracts, DINO proposal layer,
 bounded SAM2 mask-shard layer, verified Stage I-only renderer, private review
 artifacts, release gating, and operator command surface. Heavy model imports
 remain lazy so deterministic adapters and rendering fixtures can be exercised
-without a GPU. Milestone 6 enables real GPU execution in this same
-self-contained PEP-723 job because GPU jobs may not share an environment.
+without a GPU. Milestone 6 adds verified offline model smoke and real-frame
+attestation in this same self-contained PEP-723 job because GPU jobs may not
+share an environment; paid clip calibration remains an explicit operator gate.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import gc
 import hashlib
 import importlib.metadata as importlib_metadata
 import io
@@ -48,10 +50,10 @@ from pathlib import Path
 from typing import Any
 
 STAGE2_SCHEMA_VERSION = 1
-STAGE2_CODE_VERSION = "milestone-5"
-STAGE2_JOB_VERSION = "0.5.0"
+STAGE2_CODE_VERSION = "milestone-6"
+STAGE2_JOB_VERSION = "0.6.0"
 DINO_CODE_VERSION = "milestone-2"
-SAM_CODE_VERSION = "milestone-3.1-runtime-bound"
+SAM_CODE_VERSION = "milestone-6-frame-attested"
 RENDER_CODE_VERSION = "milestone-4"
 
 DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
@@ -79,6 +81,8 @@ SAM_MAX_PROMPT_AREA_RATIO = 16.0
 SAM_MAX_FRAME_AREA_RATIO = 0.65
 SAM_ANCHOR_NEIGHBORHOOD_SCALE = 2.0
 SAM_MIN_ANCHOR_NEIGHBORHOOD_FRACTION = 0.50
+SAM_FRAME_EXTRACTION_VERSION = "ffmpeg-select-jpeg-q2-v1"
+SAM_FRAME_ATTESTATION_FILENAME = "frames.manifest.json"
 
 RENDER_DILATION_PIXELS_AT_1080P = 8
 RENDER_FILL_YUV = (128, 128, 128)
@@ -332,6 +336,9 @@ class SamWindowInput:
     frame_width: int
     frame_height: int
     payload: Any
+    frame_payload_sha256: str | None = None
+    frame_artifacts: tuple[ArtifactRef, ...] = ()
+    attestation_artifact: ArtifactRef | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -515,6 +522,7 @@ class RunPaths:
     dino: Path
     dino_checkpoint: Path
     sam_dir: Path
+    frames_dir: Path
     render: Path
     private_root: Path
     reviews_dir: Path
@@ -607,6 +615,7 @@ def sha256_directory_tree(root: Path) -> str:
             "SAM_RUNTIME_UNVERIFIABLE",
             f"Installed SAM2 package path is not a directory: {root}",
         )
+
     def runtime_files() -> list[Path]:
         found: list[Path] = []
         for path in root.rglob("*"):
@@ -635,9 +644,7 @@ def sha256_directory_tree(root: Path) -> str:
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         digest.update(bytes.fromhex(sha256_file(path)))
-    if runtime_files() != files or any(
-        file_stamp(path) != before_stamps[path] for path in files
-    ):
+    if runtime_files() != files or any(file_stamp(path) != before_stamps[path] for path in files):
         raise Stage2Error(
             "SAM_RUNTIME_CHANGED_DURING_HASH",
             "Installed SAM2 runtime changed while its identity was being calculated.",
@@ -667,9 +674,7 @@ def installed_sam_runtime_revision(package_root: Path) -> str:
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 pass
             else:
-                if _normalized_git_url(repository) != _normalized_git_url(
-                    SAM_RUNTIME_REPOSITORY
-                ):
+                if _normalized_git_url(repository) != _normalized_git_url(SAM_RUNTIME_REPOSITORY):
                     raise Stage2Error(
                         "SAM_RUNTIME_REPOSITORY_MISMATCH",
                         "Installed SAM2 runtime came from an unexpected repository.",
@@ -706,9 +711,7 @@ def installed_sam_runtime_revision(package_root: Path) -> str:
             and remote_result.returncode == 0
         ):
             repository = remote_result.stdout.strip()
-            if _normalized_git_url(repository) != _normalized_git_url(
-                SAM_RUNTIME_REPOSITORY
-            ):
+            if _normalized_git_url(repository) != _normalized_git_url(SAM_RUNTIME_REPOSITORY):
                 raise Stage2Error(
                     "SAM_RUNTIME_REPOSITORY_MISMATCH",
                     "Editable SAM2 runtime came from an unexpected repository.",
@@ -719,8 +722,7 @@ def installed_sam_runtime_revision(package_root: Path) -> str:
         "SAM_RUNTIME_REVISION_UNVERIFIABLE",
         "Could not prove which SAM2 source revision is installed.",
         recovery=(
-            "Install SAM2 from the pinned Git commit using the Stage II setup command, "
-            "then retry."
+            "Install SAM2 from the pinned Git commit using the Stage II setup command, then retry."
         ),
     )
 
@@ -815,9 +817,7 @@ def artifact_ref(path: Path) -> ArtifactRef:
 def artifact_set_sha256(artifacts: tuple[ArtifactRef, ...]) -> str:
     if not artifacts:
         raise Stage2Error("EMPTY_ARTIFACT_SET", "Artifact set must not be empty.")
-    payload = tuple(
-        {"sha256": artifact.sha256, "bytes": artifact.bytes} for artifact in artifacts
-    )
+    payload = tuple({"sha256": artifact.sha256, "bytes": artifact.bytes} for artifact in artifacts)
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
@@ -974,6 +974,7 @@ def build_run_paths(work_dir: Path, run_id: str, clip_id: str) -> RunPaths:
         dino=resolved_root / "dino" / "artifact.json",
         dino_checkpoint=resolved_root / "dino" / "checkpoint.jsonl",
         sam_dir=resolved_root / "sam",
+        frames_dir=resolved_root / "frames",
         render=resolved_root / "render" / "artifact.json",
         private_root=resolved_root / "DO-NOT-SHIP",
         reviews_dir=resolved_root / "reviews",
@@ -1049,27 +1050,21 @@ def probe_video(path: Path) -> VideoFacts:
         data = json.loads(result.stdout)
         stream = data["streams"][0]
     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-        raise Stage2Error("VIDEO_PROBE_INVALID", f"ffprobe found no usable video in {path}") from exc
+        raise Stage2Error(
+            "VIDEO_PROBE_INVALID", f"ffprobe found no usable video in {path}"
+        ) from exc
 
     r_fps = _parse_rate(stream.get("r_frame_rate"), path=path, field_name="r_frame_rate")
-    avg_fps = _parse_rate(
-        stream.get("avg_frame_rate"), path=path, field_name="avg_frame_rate"
-    )
+    avg_fps = _parse_rate(stream.get("avg_frame_rate"), path=path, field_name="avg_frame_rate")
     is_cfr = abs(r_fps - avg_fps) / r_fps <= 0.001
     try:
-        rotation = int(
-            stream.get("rotation", stream.get("tags", {}).get("rotate", 0)) or 0
-        )
+        rotation = int(stream.get("rotation", stream.get("tags", {}).get("rotate", 0)) or 0)
         coded_width = int(stream["width"])
         coded_height = int(stream["height"])
         frame_value = stream.get("nb_read_packets") or stream.get("nb_frames")
-        duration = float(
-            stream.get("duration") or data.get("format", {}).get("duration") or 0.0
-        )
+        duration = float(stream.get("duration") or data.get("format", {}).get("duration") or 0.0)
         n_frames = (
-            int(frame_value)
-            if frame_value not in {None, "", "N/A"}
-            else round(duration * r_fps)
+            int(frame_value) if frame_value not in {None, "", "N/A"} else round(duration * r_fps)
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise Stage2Error(
@@ -1200,8 +1195,7 @@ def validate_stage1(
         abs_tol=duration_tolerance,
     ):
         problems.append(
-            "source.duration_s: "
-            f"manifest={manifest_duration!r}, probed={source_facts.duration_s!r}"
+            f"source.duration_s: manifest={manifest_duration!r}, probed={source_facts.duration_s!r}"
         )
     if source_facts.rotation != source.get("rotation"):
         problems.append(
@@ -1220,9 +1214,7 @@ def validate_stage1(
     )
     _expect_equal(stage1_facts.n_frames, source_facts.n_frames, "Stage I frame count", problems)
     if not math.isclose(stage1_facts.fps, source_facts.fps, rel_tol=0.001, abs_tol=0.001):
-        problems.append(
-            f"Stage I fps: source={source_facts.fps!r}, output={stage1_facts.fps!r}"
-        )
+        problems.append(f"Stage I fps: source={source_facts.fps!r}, output={stage1_facts.fps!r}")
     if not math.isclose(
         stage1_facts.duration_s,
         source_facts.duration_s,
@@ -1279,9 +1271,7 @@ def validate_stage1(
             "preserved for review rather than treated as proof of exposed pixels."
         )
     if not egoblur.get("face_weights_sha256"):
-        warnings.append(
-            "Historical Stage I manifest does not prove the EgoBlur face-weight hash."
-        )
+        warnings.append("Historical Stage I manifest does not prove the EgoBlur face-weight hash.")
 
     for path, initial_stamp in initial_stamps.items():
         if file_stamp(path) != initial_stamp:
@@ -1609,8 +1599,7 @@ def _proposal_id(proposal: Proposal) -> str:
 def _finalize_proposal(proposal: Proposal) -> Proposal:
     origins = tuple(sorted(set(proposal.origins)))
     if not origins or any(
-        origin != "full-frame" and not re.fullmatch(r"tile-r\d+-c\d+", origin)
-        for origin in origins
+        origin != "full-frame" and not re.fullmatch(r"tile-r\d+-c\d+", origin) for origin in origins
     ):
         raise Stage2Error(
             "INVALID_DINO_OUTPUT",
@@ -1701,7 +1690,9 @@ def union_nms(proposals: tuple[Proposal, ...], iou_threshold: float) -> tuple[Pr
             replace(existing, origins=existing.origins + candidate.origins)
         )
     return tuple(
-        sorted(kept, key=lambda proposal: (proposal.frame_idx, -proposal.score, proposal.proposal_id))
+        sorted(
+            kept, key=lambda proposal: (proposal.frame_idx, -proposal.score, proposal.proposal_id)
+        )
     )
 
 
@@ -1824,9 +1815,7 @@ def validate_dino_meta(
     }
     for name, expected_value in expected.items():
         if getattr(meta, name) != expected_value:
-            problems.append(
-                f"{name}: expected {expected_value!r}, got {getattr(meta, name)!r}"
-            )
+            problems.append(f"{name}: expected {expected_value!r}, got {getattr(meta, name)!r}")
     seen_ids: set[str] = set()
     source_counts = {"full-frame-only": 0, "tiled-only": 0, "shared": 0}
     for proposal in meta.proposals:
@@ -1866,7 +1855,10 @@ def validate_dino_meta(
 def select_dino_proposals(
     meta: DinoArtifactMeta, operating_threshold: float
 ) -> DinoThresholdSelection:
-    if not math.isfinite(operating_threshold) or not meta.proposal_floor <= operating_threshold <= 1.0:
+    if (
+        not math.isfinite(operating_threshold)
+        or not meta.proposal_floor <= operating_threshold <= 1.0
+    ):
         raise Stage2Error(
             "INVALID_DINO_OPERATING_THRESHOLD",
             "DINO operating threshold must be finite and no lower than the stored proposal floor.",
@@ -1876,8 +1868,12 @@ def select_dino_proposals(
             },
             recovery="Recompute DINO with a lower proposal floor before selecting this threshold.",
         )
-    accepted = tuple(proposal for proposal in meta.proposals if proposal.score >= operating_threshold)
-    rejected = tuple(proposal for proposal in meta.proposals if proposal.score < operating_threshold)
+    accepted = tuple(
+        proposal for proposal in meta.proposals if proposal.score >= operating_threshold
+    )
+    rejected = tuple(
+        proposal for proposal in meta.proposals if proposal.score < operating_threshold
+    )
     return DinoThresholdSelection(
         threshold=operating_threshold,
         accepted=accepted,
@@ -2218,9 +2214,7 @@ def generate_dino_proposals(
         rows[frame_idx] = _checkpoint_row_from_dict(_jsonable(row))
 
     all_proposals = tuple(
-        proposal
-        for frame_idx in anchors
-        for proposal in rows[frame_idx]["proposals"]
+        proposal for frame_idx in anchors for proposal in rows[frame_idx]["proposals"]
     )
     anchor_metrics = [rows[frame_idx]["metrics"] for frame_idx in anchors]
     source_counts = {
@@ -2231,13 +2225,9 @@ def generate_dino_proposals(
         "n_anchors": len(anchors),
         "n_proposals": len(all_proposals),
         "n_model_calls": sum(int(value.get("n_model_calls", 0)) for value in anchor_metrics),
-        "n_raw_proposals": sum(
-            int(value.get("n_raw_proposals", 0)) for value in anchor_metrics
-        ),
+        "n_raw_proposals": sum(int(value.get("n_raw_proposals", 0)) for value in anchor_metrics),
         "n_below_floor": sum(int(value.get("n_below_floor", 0)) for value in anchor_metrics),
-        "n_nms_suppressed": sum(
-            int(value.get("n_nms_suppressed", 0)) for value in anchor_metrics
-        ),
+        "n_nms_suppressed": sum(int(value.get("n_nms_suppressed", 0)) for value in anchor_metrics),
         "source_counts": source_counts,
         "runtime_seconds": sum(
             float(value.get("runtime_seconds", 0.0)) for value in anchor_metrics
@@ -2286,7 +2276,7 @@ def generate_dino_proposals(
 
 
 class TransformersGroundingDinoAdapter:
-    """Lazy official Transformers adapter; model files must already be cached.
+    """Lazy official Transformers adapter for a pinned local snapshot.
 
     Milestone 2 defines this boundary but does not install/download its GPU
     dependencies. The Stage II setup milestone will pin the runtime and
@@ -2299,7 +2289,49 @@ class TransformersGroundingDinoAdapter:
         sha256=DINO_MODEL_WEIGHTS_SHA256,
     )
 
-    def __init__(self, *, device: str = "cuda", local_files_only: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        device: str = "cuda",
+        local_files_only: bool = True,
+        model_path: Path | None = None,
+    ) -> None:
+        verified_weights: ArtifactRef | None = None
+        if model_path is not None:
+            supplied = model_path.expanduser()
+            if supplied.is_symlink():
+                raise Stage2Error(
+                    "DINO_SNAPSHOT_UNSAFE",
+                    "The persistent DINO snapshot directory may not be a symbolic link.",
+                )
+            try:
+                model_path = supplied.resolve(strict=True)
+            except OSError as exc:
+                raise Stage2Error(
+                    "DINO_SNAPSHOT_MISSING",
+                    "The verified persistent DINO snapshot is missing.",
+                ) from exc
+            if not model_path.is_dir():
+                raise Stage2Error(
+                    "DINO_SNAPSHOT_MISSING",
+                    "The verified persistent DINO snapshot is not a directory.",
+                )
+            weights = model_path / "model.safetensors"
+            if weights.is_symlink():
+                raise Stage2Error(
+                    "DINO_SNAPSHOT_UNSAFE",
+                    "The persistent DINO weights may not be a symbolic link.",
+                )
+            verified_weights = artifact_ref(weights)
+            if verified_weights.sha256 != DINO_MODEL_WEIGHTS_SHA256:
+                raise Stage2Error(
+                    "DINO_CHECKPOINT_HASH_MISMATCH",
+                    "Persistent DINO weights do not match the pinned model.",
+                    details={
+                        "expected": DINO_MODEL_WEIGHTS_SHA256,
+                        "actual": verified_weights.sha256,
+                    },
+                )
         try:
             import torch
             from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
@@ -2311,17 +2343,19 @@ class TransformersGroundingDinoAdapter:
             ) from exc
         self._torch = torch
         self.device = device
+        pretrained_source = str(model_path) if model_path is not None else DINO_MODEL_ID
+        pretrained_options: dict[str, Any] = {"local_files_only": local_files_only}
+        if model_path is None:
+            pretrained_options["revision"] = DINO_MODEL_REVISION
         try:
             self.processor = AutoProcessor.from_pretrained(
-                DINO_MODEL_ID,
-                revision=DINO_MODEL_REVISION,
-                local_files_only=local_files_only,
+                pretrained_source,
+                **pretrained_options,
             )
             self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
-                DINO_MODEL_ID,
-                revision=DINO_MODEL_REVISION,
-                local_files_only=local_files_only,
+                pretrained_source,
                 use_safetensors=True,
+                **pretrained_options,
             ).to(device)
             self.model.eval()
         except Exception as exc:
@@ -2331,6 +2365,11 @@ class TransformersGroundingDinoAdapter:
                 details={"cause": str(exc), "revision": DINO_MODEL_REVISION},
                 recovery="Run the Stage II setup command to verify and prime model assets.",
             ) from exc
+        if verified_weights is not None and artifact_ref(Path(verified_weights.path)) != verified_weights:
+            raise Stage2Error(
+                "DINO_CHECKPOINT_CHANGED",
+                "Persistent DINO weights changed while the model was loading.",
+            )
 
     def infer_batch(
         self,
@@ -2383,8 +2422,7 @@ def validate_sam_config(config: SamGenerationConfig) -> None:
         DINO_PROPOSAL_FLOOR <= config.accepted_proposal_threshold <= 1.0
     ):
         problems.append(
-            "accepted_proposal_threshold must be finite and in "
-            f"[{DINO_PROPOSAL_FLOOR}, 1]"
+            f"accepted_proposal_threshold must be finite and in [{DINO_PROPOSAL_FLOOR}, 1]"
         )
     if config.window_size < 1:
         problems.append("window_size must be at least 1")
@@ -2401,11 +2439,17 @@ def validate_sam_config(config: SamGenerationConfig) -> None:
     ):
         if not math.isfinite(value) or not lower <= value <= upper:
             problems.append(f"{name} must be finite and in [{lower}, {upper}]")
-    if not math.isfinite(config.max_frame_area_ratio) or not 0.0 < config.max_frame_area_ratio <= 1.0:
+    if (
+        not math.isfinite(config.max_frame_area_ratio)
+        or not 0.0 < config.max_frame_area_ratio <= 1.0
+    ):
         problems.append("max_frame_area_ratio must be finite and in (0, 1]")
     if not math.isfinite(config.max_prompt_area_ratio) or config.max_prompt_area_ratio < 1.0:
         problems.append("max_prompt_area_ratio must be finite and at least 1")
-    if not math.isfinite(config.anchor_neighborhood_scale) or config.anchor_neighborhood_scale < 1.0:
+    if (
+        not math.isfinite(config.anchor_neighborhood_scale)
+        or config.anchor_neighborhood_scale < 1.0
+    ):
         problems.append("anchor_neighborhood_scale must be finite and at least 1")
     if config.fallback_min_padding_px < 0:
         problems.append("fallback_min_padding_px must be non-negative")
@@ -2464,12 +2508,11 @@ def temporal_windows(
     return tuple(windows)
 
 
-def _valid_frame_box(
-    box: Any, width: int, height: int
-) -> bool:
-    if not isinstance(box, (tuple, list)) or len(box) != 4 or any(
-        not isinstance(value, (int, float)) or isinstance(value, bool)
-        for value in box
+def _valid_frame_box(box: Any, width: int, height: int) -> bool:
+    if (
+        not isinstance(box, (tuple, list))
+        or len(box) != 4
+        or any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in box)
     ):
         return False
     x1, y1, x2, y2 = box
@@ -2663,17 +2706,13 @@ def _private_path(paths: RunPaths, relative: Path) -> Path:
     if relative.is_absolute() or ".." in relative.parts:
         raise Stage2Error("UNSAFE_PRIVATE_PATH", "Private artifact path is unsafe.")
     if paths.private_root.is_symlink():
-        raise Stage2Error(
-            "UNSAFE_PRIVATE_PATH", "DO-NOT-SHIP may not be a symbolic link."
-        )
+        raise Stage2Error("UNSAFE_PRIVATE_PATH", "DO-NOT-SHIP may not be a symbolic link.")
     candidate = paths.private_root / relative
     resolved = candidate.resolve(strict=False)
     try:
         resolved.relative_to(paths.private_root.resolve(strict=False))
     except ValueError as exc:
-        raise Stage2Error(
-            "UNSAFE_PRIVATE_PATH", "Private artifact escaped DO-NOT-SHIP."
-        ) from exc
+        raise Stage2Error("UNSAFE_PRIVATE_PATH", "Private artifact escaped DO-NOT-SHIP.") from exc
     current = paths.private_root
     for component in relative.parts[:-1]:
         current /= component
@@ -2763,9 +2802,7 @@ def load_private_labels_file(path: Path, stage1: StageIInput) -> tuple[FaceEvent
     return validate_face_event_labels(tuple(labels), stage1)
 
 
-def load_private_manual_seeds_file(
-    path: Path, stage1: StageIInput
-) -> tuple[ManualSeed, ...]:
+def load_private_manual_seeds_file(path: Path, stage1: StageIInput) -> tuple[ManualSeed, ...]:
     raw = read_json(resolve_input_file(path, "private manual seeds file"))
     if (
         raw.get("schema_version") != STAGE2_SCHEMA_VERSION
@@ -2833,7 +2870,11 @@ def register_private_evidence(
         raise Stage2Error("INVALID_PRIVATE_EVIDENCE", "Evidence metadata is invalid.")
     source = resolve_input_file(source, "private evidence")
     source_ref = artifact_ref(source)
-    suffix = source.suffix.lower() if re.fullmatch(r"\.[a-z0-9]{1,10}", source.suffix.lower()) else ".bin"
+    suffix = (
+        source.suffix.lower()
+        if re.fullmatch(r"\.[a-z0-9]{1,10}", source.suffix.lower())
+        else ".bin"
+    )
     evidence_path = _private_path(
         paths,
         Path("evidence") / f"{evidence_id}-{source_ref.sha256}{suffix}",
@@ -2895,8 +2936,7 @@ def sam_prompts_for_window(
 
 def _sam_prompt_records(prompts: tuple[SamPrompt, ...]) -> tuple[dict[str, Any], ...]:
     return tuple(
-        {**_jsonable(prompt), "local_object_id": index + 1}
-        for index, prompt in enumerate(prompts)
+        {**_jsonable(prompt), "local_object_id": index + 1} for index, prompt in enumerate(prompts)
     )
 
 
@@ -2907,6 +2947,8 @@ def sam_window_fingerprint_payload(
     config: SamGenerationConfig,
     window: TemporalWindow,
     prompts: tuple[SamPrompt, ...],
+    frame_payload_sha256: str | None = None,
+    frame_payload_status: str = "metadata-only",
 ) -> dict[str, Any]:
     return {
         "dino_artifact_sha256": dino_artifact.sha256,
@@ -2919,6 +2961,10 @@ def sam_window_fingerprint_payload(
         "window_layout": {
             "size": config.window_size,
             "overlap": config.window_overlap,
+        },
+        "frame_payload": {
+            "sha256": frame_payload_sha256,
+            "status": frame_payload_status,
         },
         "precision": config.precision,
         "fallback": {
@@ -2935,6 +2981,308 @@ def sam_window_fingerprint_payload(
         },
         "prompts": _sam_prompt_records(prompts),
     }
+
+
+def _sam_frame_names(window: TemporalWindow) -> tuple[str, ...]:
+    return tuple(f"{local_index:06d}.jpg" for local_index in range(window.n_frames))
+
+
+def _inspect_sam_jpeg_frames(
+    frame_dir: Path,
+    *,
+    window: TemporalWindow,
+    width: int,
+    height: int,
+    include_attestation: bool,
+) -> tuple[dict[str, Any], ...]:
+    if frame_dir.is_symlink() or not frame_dir.is_dir():
+        raise Stage2Error(
+            "INVALID_FRAME_PAYLOAD",
+            "Extracted SAM frame payload must be a real directory.",
+        )
+    expected_names = _sam_frame_names(window)
+    allowed_names = set(expected_names)
+    if include_attestation:
+        allowed_names.add(SAM_FRAME_ATTESTATION_FILENAME)
+    entries = tuple(frame_dir.iterdir())
+    if any(path.is_symlink() for path in entries):
+        raise Stage2Error(
+            "INVALID_FRAME_PAYLOAD",
+            "Extracted SAM frame payload may not contain symbolic links.",
+        )
+    actual_names = {path.name for path in entries}
+    if actual_names != allowed_names:
+        raise Stage2Error(
+            "INVALID_FRAME_PAYLOAD",
+            "Extracted SAM frame names or count do not match the requested window.",
+            details={
+                "expected": sorted(allowed_names),
+                "actual": sorted(actual_names),
+            },
+        )
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise Stage2Error(
+            "PILLOW_NOT_FOUND",
+            "Pillow is required to verify extracted SAM frames.",
+        ) from exc
+    records = []
+    for local_index, name in enumerate(expected_names):
+        path = frame_dir / name
+        if not path.is_file() or path.is_symlink():
+            raise Stage2Error("INVALID_FRAME_PAYLOAD", f"Extracted SAM frame is unsafe: {path}")
+        before = artifact_ref(path)
+        try:
+            with Image.open(path) as image:
+                image_size = image.size
+                image_format = image.format
+                image.verify()
+        except Exception as exc:
+            raise Stage2Error(
+                "INVALID_FRAME_PAYLOAD",
+                f"Extracted SAM frame is not a valid JPEG: {path}",
+                details={"cause": str(exc)},
+            ) from exc
+        if image_format != "JPEG" or image_size != (width, height):
+            raise Stage2Error(
+                "INVALID_FRAME_PAYLOAD",
+                "Extracted SAM frame dimensions or format are wrong.",
+                details={
+                    "path": str(path),
+                    "expected_size": (width, height),
+                    "actual_size": image_size,
+                    "format": image_format,
+                },
+            )
+        if artifact_ref(path) != before:
+            raise Stage2Error(
+                "FRAME_PAYLOAD_CHANGED",
+                f"Extracted SAM frame changed during validation: {path}",
+            )
+        records.append(
+            {
+                "local_index": local_index,
+                "global_index": window.frame_start + local_index,
+                "name": name,
+                "sha256": before.sha256,
+                "bytes": before.bytes,
+            }
+        )
+    return tuple(records)
+
+
+def _frame_payload_identity(
+    *,
+    source_sha256: str,
+    window: TemporalWindow,
+    width: int,
+    height: int,
+    frames: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    return {
+        "schema_version": STAGE2_SCHEMA_VERSION,
+        "artifact_type": "sam_frame_payload",
+        "extraction_version": SAM_FRAME_EXTRACTION_VERSION,
+        "source_sha256": source_sha256,
+        "frame_start": window.frame_start,
+        "frame_end": window.frame_end,
+        "frame_width": width,
+        "frame_height": height,
+        "frames": _jsonable(frames),
+    }
+
+
+def load_attested_sam_window(
+    frame_dir: Path,
+    *,
+    source_sha256: str,
+    window: TemporalWindow,
+    width: int,
+    height: int,
+) -> SamWindowInput:
+    supplied = frame_dir.expanduser()
+    if supplied.is_symlink():
+        raise Stage2Error(
+            "INVALID_FRAME_PAYLOAD", "SAM frame payload directory may not be a symlink."
+        )
+    try:
+        frame_dir = supplied.resolve(strict=True)
+    except OSError as exc:
+        raise Stage2Error(
+            "INVALID_FRAME_PAYLOAD", "SAM frame payload directory is missing."
+        ) from exc
+    records = _inspect_sam_jpeg_frames(
+        frame_dir,
+        window=window,
+        width=width,
+        height=height,
+        include_attestation=True,
+    )
+    attestation_path = frame_dir / SAM_FRAME_ATTESTATION_FILENAME
+    attestation_ref = artifact_ref(attestation_path)
+    raw = read_json(attestation_path)
+    identity = _frame_payload_identity(
+        source_sha256=source_sha256,
+        window=window,
+        width=width,
+        height=height,
+        frames=records,
+    )
+    expected_fields = {*identity, "frame_payload_sha256"}
+    if set(raw) != expected_fields or any(raw.get(key) != value for key, value in identity.items()):
+        raise Stage2Error(
+            "INVALID_FRAME_ATTESTATION",
+            "Extracted SAM frame attestation does not match the source window.",
+        )
+    payload_sha256 = hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+    if raw.get("frame_payload_sha256") != payload_sha256:
+        raise Stage2Error(
+            "INVALID_FRAME_ATTESTATION",
+            "Extracted SAM frame payload digest is invalid.",
+        )
+    frame_artifacts = tuple(artifact_ref(frame_dir / record["name"]) for record in records)
+    if artifact_ref(attestation_path) != attestation_ref:
+        raise Stage2Error(
+            "FRAME_PAYLOAD_CHANGED",
+            "Extracted SAM frame attestation changed during validation.",
+        )
+    return SamWindowInput(
+        source_sha256=source_sha256,
+        frame_start=window.frame_start,
+        frame_end=window.frame_end,
+        frame_width=width,
+        frame_height=height,
+        payload=frame_dir,
+        frame_payload_sha256=payload_sha256,
+        frame_artifacts=frame_artifacts,
+        attestation_artifact=attestation_ref,
+    )
+
+
+def extract_attested_sam_window(
+    *,
+    stage1: StageIInput,
+    paths: RunPaths,
+    window: TemporalWindow,
+) -> SamWindowInput:
+    """Atomically extract and attest the exact JPEG sequence SAM2 will load."""
+    assert_run_root_safe(paths)
+    if not 0 <= window.frame_start <= window.frame_end < stage1.source_video.n_frames:
+        raise Stage2Error("INVALID_FRAME_WINDOW", "SAM extraction window is out of bounds.")
+    source_path = Path(stage1.source.path)
+    before_source = file_stamp(source_path)
+    frame_parent = paths.frames_dir / f"source-{stage1.source.sha256[:16]}"
+    target = frame_parent / f"window-{window.frame_start:06d}-{window.frame_end:06d}"
+    for candidate in (paths.frames_dir, frame_parent, target):
+        if candidate.is_symlink():
+            raise Stage2Error(
+                "UNSAFE_FRAME_PAYLOAD_PATH",
+                f"SAM frame payload path contains a symlink: {candidate}",
+            )
+    if target.exists():
+        return load_attested_sam_window(
+            target,
+            source_sha256=stage1.source.sha256,
+            window=window,
+            width=stage1.source_video.display_width,
+            height=stage1.source_video.display_height,
+        )
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise Stage2Error(
+            "FFMPEG_NOT_FOUND",
+            "ffmpeg is required to extract source-bound SAM windows.",
+            recovery="Run the Stage II persistent setup command, then retry.",
+        )
+    frame_parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(dir=frame_parent, prefix=f".{target.name}.partial-"))
+    promoted = False
+    try:
+        output_pattern = temporary / "%06d.jpg"
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source_path),
+            "-vf",
+            f"select=between(n\\,{window.frame_start}\\,{window.frame_end})",
+            "-fps_mode",
+            "passthrough",
+            "-frames:v",
+            str(window.n_frames),
+            "-q:v",
+            "2",
+            "-start_number",
+            "0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-y",
+            str(output_pattern),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise Stage2Error(
+                "FRAME_EXTRACTION_FAILED",
+                "ffmpeg could not extract the requested SAM frame window.",
+                details={"stderr": result.stderr[-4000:], "window": _jsonable(window)},
+            )
+        records = _inspect_sam_jpeg_frames(
+            temporary,
+            window=window,
+            width=stage1.source_video.display_width,
+            height=stage1.source_video.display_height,
+            include_attestation=False,
+        )
+        for record in records:
+            frame_fd = os.open(temporary / record["name"], os.O_RDONLY)
+            try:
+                os.fsync(frame_fd)
+            finally:
+                os.close(frame_fd)
+        identity = _frame_payload_identity(
+            source_sha256=stage1.source.sha256,
+            window=window,
+            width=stage1.source_video.display_width,
+            height=stage1.source_video.display_height,
+            frames=records,
+        )
+        payload_sha256 = hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+        atomic_write_json(
+            temporary / SAM_FRAME_ATTESTATION_FILENAME,
+            {**identity, "frame_payload_sha256": payload_sha256},
+        )
+        if file_stamp(source_path) != before_source:
+            raise Stage2Error(
+                "SOURCE_VIDEO_CHANGED", "Original video changed during SAM frame extraction."
+            )
+        try:
+            os.replace(temporary, target)
+        except OSError as exc:
+            raise Stage2Error(
+                "FRAME_PAYLOAD_PROMOTION_FAILED",
+                "Verified SAM frame payload could not be promoted atomically.",
+                details={"cause": str(exc)},
+            ) from exc
+        promoted = True
+        directory_fd = os.open(frame_parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if not promoted and temporary.exists():
+            shutil.rmtree(temporary)
+    return load_attested_sam_window(
+        target,
+        source_sha256=stage1.source.sha256,
+        window=window,
+        width=stage1.source_video.display_width,
+        height=stage1.source_video.display_height,
+    )
 
 
 def sam_shard_path(paths: RunPaths, window: TemporalWindow, fingerprint_value: str) -> Path:
@@ -2973,6 +3321,32 @@ def validate_sam_window_input(
             "SAM window does not match the validated original source and frame range.",
             details={"expected": expected, "actual": actual},
         )
+    if isinstance(value.payload, (str, Path)):
+        verified = load_attested_sam_window(
+            Path(value.payload),
+            source_sha256=stage1.source.sha256,
+            window=window,
+            width=stage1.source_video.display_width,
+            height=stage1.source_video.display_height,
+        )
+        if (
+            value.frame_payload_sha256 != verified.frame_payload_sha256
+            or value.frame_artifacts != verified.frame_artifacts
+            or value.attestation_artifact != verified.attestation_artifact
+        ):
+            raise Stage2Error(
+                "INVALID_FRAME_ATTESTATION",
+                "SAM window metadata does not bind the exact extracted frame payload.",
+            )
+    elif (
+        value.frame_payload_sha256 is not None
+        or value.frame_artifacts
+        or value.attestation_artifact is not None
+    ):
+        raise Stage2Error(
+            "INVALID_FRAME_ATTESTATION",
+            "Non-directory SAM input may not claim extracted-frame attestation.",
+        )
     return value
 
 
@@ -2995,9 +3369,7 @@ def _validate_packed_bits(packed: bytes, size: int) -> None:
 
 def _unpack_bits(packed: bytes, size: int) -> bytes:
     _validate_packed_bits(packed, size)
-    return bytes(
-        (packed[index // 8] >> (7 - index % 8)) & 1 for index in range(size)
-    )
+    return bytes((packed[index // 8] >> (7 - index % 8)) & 1 for index in range(size))
 
 
 def _packed_bit(packed: bytes, index: int) -> int:
@@ -3068,9 +3440,7 @@ def _tighten_raw_mask(
         x1, y1, x2, y2 = (int(value) for value in raw.crop_box)
     except (TypeError, ValueError) as exc:
         raise Stage2Error("INVALID_SAM_MASK", "SAM mask crop is malformed.") from exc
-    if (x1, y1, x2, y2) != raw.crop_box or not (
-        0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height
-    ):
+    if (x1, y1, x2, y2) != raw.crop_box or not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
         raise Stage2Error("INVALID_SAM_MASK", "SAM mask crop is outside the frame.")
     crop_width = x2 - x1
     crop_height = y2 - y1
@@ -3214,12 +3584,8 @@ def reassess_packed_sam_mask(
         return "SAM_MASK_NEAR_FULL_FRAME"
     top = any(_packed_bit(mask.packed_bits, index) for index in range(crop_width))
     bottom_start = (crop_height - 1) * crop_width
-    bottom = any(
-        _packed_bit(mask.packed_bits, bottom_start + index) for index in range(crop_width)
-    )
-    left = any(
-        _packed_bit(mask.packed_bits, row * crop_width) for row in range(crop_height)
-    )
+    bottom = any(_packed_bit(mask.packed_bits, bottom_start + index) for index in range(crop_width))
+    left = any(_packed_bit(mask.packed_bits, row * crop_width) for row in range(crop_height))
     right = any(
         _packed_bit(mask.packed_bits, row * crop_width + crop_width - 1)
         for row in range(crop_height)
@@ -3315,8 +3681,7 @@ def encode_sam_mask_shard(meta: SamMaskShardMeta, masks: tuple[PackedMask, ...])
         ) as archive:
             members = [("metadata.npy", _npy_uint8_bytes(canonical_json_bytes(meta)))]
             members.extend(
-                (f"{key}.npy", _npy_uint8_bytes(by_key[key].packed_bits))
-                for key in sorted(by_key)
+                (f"{key}.npy", _npy_uint8_bytes(by_key[key].packed_bits)) for key in sorted(by_key)
             )
             for name, content in members:
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
@@ -3349,9 +3714,7 @@ def _sam_runtime_identity_from_dict(raw: dict[str, Any]) -> SamRuntimeIdentity:
             cuda_version=str(raw["cuda_version"]),
         )
     except (KeyError, TypeError) as exc:
-        raise Stage2Error(
-            "INVALID_SAM_SHARD", "Stored SAM runtime identity is malformed."
-        ) from exc
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored SAM runtime identity is malformed.") from exc
 
 
 def _sam_mask_record_from_dict(raw: dict[str, Any]) -> dict[str, Any]:
@@ -3471,12 +3834,16 @@ def load_sam_mask_shard(
         with zipfile.ZipFile(io.BytesIO(content), mode="r") as archive:
             names = archive.namelist()
             if len(names) != len(set(names)) or "metadata.npy" not in names:
-                raise Stage2Error("INVALID_SAM_SHARD", "SAM shard members are incomplete or duplicate.")
+                raise Stage2Error(
+                    "INVALID_SAM_SHARD", "SAM shard members are incomplete or duplicate."
+                )
             metadata_bytes = _read_npy_uint8(archive.read("metadata.npy"))
             try:
                 raw_meta = json.loads(metadata_bytes)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise Stage2Error("INVALID_SAM_SHARD", "SAM shard metadata is not valid JSON.") from exc
+                raise Stage2Error(
+                    "INVALID_SAM_SHARD", "SAM shard metadata is not valid JSON."
+                ) from exc
             if not isinstance(raw_meta, dict):
                 raise Stage2Error("INVALID_SAM_SHARD", "SAM shard metadata must be an object.")
             meta = sam_meta_from_dict(raw_meta)
@@ -3576,7 +3943,10 @@ def build_sam_mask_shard(
                 rejected_count += 1
                 review_flags.add(
                     _sam_review_flag(
-                        "SAM_UNKNOWN_OBJECT", window, prompt_id=raw.prompt_id, frame_idx=raw.frame_idx
+                        "SAM_UNKNOWN_OBJECT",
+                        window,
+                        prompt_id=raw.prompt_id,
+                        frame_idx=raw.frame_idx,
                     )
                 )
                 continue
@@ -3621,9 +3991,7 @@ def build_sam_mask_shard(
             scale=config.fallback_padding_scale,
             min_padding_px=config.fallback_min_padding_px,
         )
-        fallback_source = (
-            "dino-fallback" if prompt.prompt_kind == "dino" else "manual-fallback"
-        )
+        fallback_source = "dino-fallback" if prompt.prompt_kind == "dino" else "manual-fallback"
         anchor_fallback = rectangle_packed_mask(
             frame_idx=prompt.anchor_frame,
             prompt=prompt,
@@ -3660,7 +4028,7 @@ def build_sam_mask_shard(
     masks = tuple(
         sorted(
             masks_by_key.values(),
-            key=lambda mask: (mask.key),
+            key=lambda mask: mask.key,
         )
     )
     records = tuple(_mask_record(mask) for mask in masks)
@@ -3681,9 +4049,7 @@ def build_sam_mask_shard(
         "n_rejected_sam_masks": rejected_count,
         "n_fallback_masks": sum(1 for mask in masks if mask.source.endswith("fallback")),
         "n_missing_frame_fallbacks": fallback_count,
-        "n_manual_fallback_masks": sum(
-            1 for mask in masks if mask.source == "manual-fallback"
-        ),
+        "n_manual_fallback_masks": sum(1 for mask in masks if mask.source == "manual-fallback"),
         "n_masks": len(masks),
         "mask_area_pixels_unioned_later": sum(mask.area_pixels for mask in masks),
         "runtime_seconds": runtime_seconds,
@@ -3811,9 +4177,7 @@ def validate_sam_mask_shard(
             else:
                 sam_prompt_frames.add((mask.prompt_id, mask.frame_idx))
         prompt_frames.add((mask.prompt_id, mask.frame_idx))
-        expected_fallback = (
-            "dino-fallback" if prompt.prompt_kind == "dino" else "manual-fallback"
-        )
+        expected_fallback = "dino-fallback" if prompt.prompt_kind == "dino" else "manual-fallback"
         if mask.frame_idx == prompt.anchor_frame and mask.source == expected_fallback:
             anchor_fallbacks.add(prompt.prompt_id)
     for prompt in prompts:
@@ -3844,7 +4208,10 @@ def validate_sam_mask_shard(
                     ),
                 )
             )
-    if not isinstance(meta.review_flags, tuple) or tuple(sorted(set(meta.review_flags))) != meta.review_flags:
+    if (
+        not isinstance(meta.review_flags, tuple)
+        or tuple(sorted(set(meta.review_flags))) != meta.review_flags
+    ):
         problems.append("review_flags must be unique strings in canonical order")
     missing_required_flags = required_fallback_flags.difference(meta.review_flags)
     if missing_required_flags:
@@ -3854,12 +4221,8 @@ def validate_sam_mask_shard(
         )
     expected_metrics = {
         "n_prompts": len(prompts),
-        "n_valid_sam_masks": sum(
-            1 for mask in loaded.masks if mask.source.startswith("sam2-")
-        ),
-        "n_fallback_masks": sum(
-            1 for mask in loaded.masks if mask.source.endswith("fallback")
-        ),
+        "n_valid_sam_masks": sum(1 for mask in loaded.masks if mask.source.startswith("sam2-")),
+        "n_fallback_masks": sum(1 for mask in loaded.masks if mask.source.endswith("fallback")),
         "n_masks": len(loaded.masks),
         "mask_area_pixels_unioned_later": sum(mask.area_pixels for mask in loaded.masks),
         "n_manual_fallback_masks": sum(
@@ -3874,7 +4237,12 @@ def validate_sam_mask_shard(
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             problems.append(f"metrics.{name} must be a non-negative integer")
     runtime = meta.metrics.get("runtime_seconds")
-    if not isinstance(runtime, (int, float)) or isinstance(runtime, bool) or not math.isfinite(runtime) or runtime < 0:
+    if (
+        not isinstance(runtime, (int, float))
+        or isinstance(runtime, bool)
+        or not math.isfinite(runtime)
+        or runtime < 0
+    ):
         problems.append("metrics.runtime_seconds must be finite and non-negative")
     if problems:
         raise Stage2Error(
@@ -3893,9 +4261,7 @@ def validate_sam_shard_set(
     window_overlap: int,
 ) -> None:
     expected = temporal_windows(n_frames, window_size, window_overlap)
-    actual = tuple(
-        (meta.window.get("index"), meta.frame_start, meta.frame_end) for meta in metas
-    )
+    actual = tuple((meta.window.get("index"), meta.frame_start, meta.frame_end) for meta in metas)
     expected_ranges = tuple(
         (window.index, window.frame_start, window.frame_end) for window in expected
     )
@@ -3971,12 +4337,41 @@ def generate_sam_mask_shards(
     generated = 0
     for window in windows:
         prompts = sam_prompts_for_window(window, selection.accepted, seeds)
+        propagation: SamPropagationResult | None = None
+        propagation_failure: str | None = None
+        window_input: SamWindowInput | None = None
+        if prompts:
+            try:
+                window_input = validate_sam_window_input(
+                    window_loader(window), stage1=stage1, window=window
+                )
+            except Stage2Error as exc:
+                propagation_failure = exc.code
+            except Exception:
+                propagation_failure = "SAM_WINDOW_LOAD_FAILED"
+        else:
+            propagation = SamPropagationResult(
+                masks=(), forward_complete=True, reverse_complete=True
+            )
+        frame_payload_status = (
+            f"error:{propagation_failure}"
+            if propagation_failure is not None
+            else "verified"
+            if window_input is not None and window_input.frame_payload_sha256 is not None
+            else "metadata-only"
+            if window_input is not None
+            else "not-required"
+        )
         fingerprint_payload = sam_window_fingerprint_payload(
             dino_artifact=dino_artifact,
             dino_meta=dino_meta,
             config=config,
             window=window,
             prompts=prompts,
+            frame_payload_sha256=(
+                window_input.frame_payload_sha256 if window_input is not None else None
+            ),
+            frame_payload_status=frame_payload_status,
         )
         fingerprint_value = sam_fingerprint(fingerprint_payload)
         shard_path = sam_shard_path(paths, window, fingerprint_value)
@@ -3998,36 +4393,21 @@ def generate_sam_mask_shards(
             reused += 1
             continue
 
-        propagation: SamPropagationResult | None = None
-        propagation_failure: str | None = None
-        if prompts:
+        if prompts and window_input is not None:
             try:
-                window_input = validate_sam_window_input(
-                    window_loader(window), stage1=stage1, window=window
+                candidate = adapter.propagate_window(
+                    window_input=window_input.payload,
+                    window=window,
+                    prompts=prompts,
+                    width=stage1.source_video.display_width,
+                    height=stage1.source_video.display_height,
+                    precision=config.precision,
                 )
-            except Stage2Error as exc:
-                propagation_failure = exc.code
+                if not isinstance(candidate, SamPropagationResult):
+                    raise TypeError("adapter returned an unknown result type")
+                propagation = candidate
             except Exception:
-                propagation_failure = "SAM_WINDOW_LOAD_FAILED"
-            else:
-                try:
-                    candidate = adapter.propagate_window(
-                        window_input=window_input.payload,
-                        window=window,
-                        prompts=prompts,
-                        width=stage1.source_video.display_width,
-                        height=stage1.source_video.display_height,
-                        precision=config.precision,
-                    )
-                    if not isinstance(candidate, SamPropagationResult):
-                        raise TypeError("adapter returned an unknown result type")
-                    propagation = candidate
-                except Exception:
-                    propagation_failure = "SAM_INFERENCE_FAILED"
-        else:
-            propagation = SamPropagationResult(
-                masks=(), forward_complete=True, reverse_complete=True
-            )
+                propagation_failure = "SAM_INFERENCE_FAILED"
         meta, masks = build_sam_mask_shard(
             dino_artifact=dino_artifact,
             dino_meta=dino_meta,
@@ -4069,9 +4449,7 @@ def generate_sam_mask_shards(
         metas=meta_tuple,
         reused_window_count=reused,
         generated_window_count=generated,
-        review_flags=tuple(
-            sorted({flag for meta in meta_tuple for flag in meta.review_flags})
-        ),
+        review_flags=tuple(sorted({flag for meta in meta_tuple for flag in meta.review_flags})),
     )
 
 
@@ -4086,12 +4464,14 @@ def union_sam_masks_for_frame(
         shard for shard in shards if shard.meta.frame_start <= frame_idx <= shard.meta.frame_end
     )
     if not relevant:
-        raise Stage2Error(
-            "SAM_SHARD_COVERAGE_GAP", f"No SAM shard covers frame {frame_idx}."
+        raise Stage2Error("SAM_SHARD_COVERAGE_GAP", f"No SAM shard covers frame {frame_idx}.")
+    if (
+        width < 1
+        or height < 1
+        or any(
+            shard.meta.frame_width != width or shard.meta.frame_height != height
+            for shard in relevant
         )
-    if width < 1 or height < 1 or any(
-        shard.meta.frame_width != width or shard.meta.frame_height != height
-        for shard in relevant
     ):
         raise Stage2Error(
             "SAM_FRAME_SIZE_MISMATCH",
@@ -4109,9 +4489,7 @@ def union_sam_masks_for_frame(
             for row in range(crop_height):
                 source_start = row * crop_width
                 destination_start = (y1 + row) * width + x1
-                for column, value in enumerate(
-                    pixels[source_start : source_start + crop_width]
-                ):
+                for column, value in enumerate(pixels[source_start : source_start + crop_width]):
                     if value:
                         output[destination_start + column] = 1
     return bytes(output)
@@ -4191,20 +4569,20 @@ def apply_mask_to_yuv420p(
         raise Stage2Error("INVALID_RENDER_MASK", "Render masks must contain only 0 or 1.")
     output[:luma_size].reshape(height, width)[luma_mask] = fill_yuv[0]
     chroma_mask = luma_mask.reshape(height // 2, 2, width // 2, 2).any(axis=(1, 3))
-    output[luma_size : luma_size + chroma_size].reshape(height // 2, width // 2)[
-        chroma_mask
-    ] = fill_yuv[1]
-    output[luma_size + chroma_size :].reshape(height // 2, width // 2)[chroma_mask] = (
-        fill_yuv[2]
+    output[luma_size : luma_size + chroma_size].reshape(height // 2, width // 2)[chroma_mask] = (
+        fill_yuv[1]
     )
+    output[luma_size + chroma_size :].reshape(height // 2, width // 2)[chroma_mask] = fill_yuv[2]
     return output.tobytes()
 
 
 def _validate_render_config(config: RenderConfig) -> None:
     problems = []
-    if isinstance(config.dilation_pixels_at_1080p, bool) or not isinstance(
-        config.dilation_pixels_at_1080p, int
-    ) or not 0 <= config.dilation_pixels_at_1080p <= 256:
+    if (
+        isinstance(config.dilation_pixels_at_1080p, bool)
+        or not isinstance(config.dilation_pixels_at_1080p, int)
+        or not 0 <= config.dilation_pixels_at_1080p <= 256
+    ):
         problems.append("dilation_pixels_at_1080p must be an integer from 0 to 256")
     if config.pixel_format != "yuv420p":
         problems.append("pixel_format must be yuv420p")
@@ -4358,9 +4736,7 @@ class _RenderShardReader:
             if meta.frame_start <= frame_idx <= meta.frame_end
         )
         if not relevant:
-            raise Stage2Error(
-                "SAM_SHARD_COVERAGE_GAP", f"No SAM shard covers frame {frame_idx}."
-            )
+            raise Stage2Error("SAM_SHARD_COVERAGE_GAP", f"No SAM shard covers frame {frame_idx}.")
         for index in tuple(self.loaded):
             if index not in relevant:
                 del self.loaded[index]
@@ -4471,12 +4847,14 @@ def _rawvideo_encoder(
         value = color_facts.get(field_name)
         if value and value not in {"unknown", "reserved", "unspecified"}:
             command.extend((option, value))
-    command.extend([
-        "-movflags",
-        "+faststart",
-        "-y",
-        str(path),
-    ])
+    command.extend(
+        [
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(path),
+        ]
+    )
     try:
         return subprocess.Popen(command, stdin=subprocess.PIPE, stderr=stderr)
     except OSError as exc:
@@ -4513,9 +4891,7 @@ def _render_frames(
         stream for stream in source_media["streams"] if stream.get("codec_type") == "video"
     ]
     if len(source_video_streams) != 1:
-        raise Stage2Error(
-            "RENDER_SOURCE_INVALID", "Stage I must contain exactly one video stream."
-        )
+        raise Stage2Error("RENDER_SOURCE_INVALID", "Stage I must contain exactly one video stream.")
     color_fields = (
         "color_range",
         "color_space",
@@ -4675,9 +5051,7 @@ def verify_rendered_video(
     ):
         problems.append("display dimensions changed")
     if output_facts.n_frames != expected.n_frames:
-        problems.append(
-            f"frame count changed from {expected.n_frames} to {output_facts.n_frames}"
-        )
+        problems.append(f"frame count changed from {expected.n_frames} to {output_facts.n_frames}")
     if not output_facts.is_cfr or not math.isclose(
         output_facts.fps, expected.fps, rel_tol=0.0, abs_tol=1e-6
     ):
@@ -4694,9 +5068,7 @@ def verify_rendered_video(
         )
     source_media = _probe_media_contract(Path(stage1.stage1_video.path))
     source_video_streams = [
-        stream
-        for stream in source_media["streams"]
-        if stream.get("codec_type") == "video"
+        stream for stream in source_media["streams"] if stream.get("codec_type") == "video"
     ]
     color_fields = (
         "color_range",
@@ -4716,9 +5088,10 @@ def verify_rendered_video(
         if len(streams) == 1 and streams[0].get(name)
     }
     for name, value in source_color_facts.items():
-        if value not in {"unknown", "reserved", "unspecified"} and output_color_facts.get(
-            name
-        ) != value:
+        if (
+            value not in {"unknown", "reserved", "unspecified"}
+            and output_color_facts.get(name) != value
+        ):
             problems.append(
                 f"color fact {name} changed from {value!r} to {output_color_facts.get(name)!r}"
             )
@@ -4799,9 +5172,7 @@ def verify_rendered_video(
             output_luma = output_values[:luma_size].reshape(height, width)
             source_luma = source_values[:luma_size].reshape(height, width)
             if luma_mask.any():
-                deviations = np.abs(
-                    output_luma[luma_mask].astype(np.int16) - config.fill_yuv[0]
-                )
+                deviations = np.abs(output_luma[luma_mask].astype(np.int16) - config.fill_yuv[0])
                 fill_checked += int(deviations.size)
                 fill_violations += int((deviations > config.fill_tolerance).sum())
             for offset, fill_value in (
@@ -4817,9 +5188,9 @@ def verify_rendered_video(
                     fill_violations += int((deviations > config.fill_tolerance).sum())
             outside = ~luma_mask
             if outside.any():
-                difference = output_luma[outside].astype(np.int16) - source_luma[
-                    outside
-                ].astype(np.int16)
+                difference = output_luma[outside].astype(np.int16) - source_luma[outside].astype(
+                    np.int16
+                )
                 absolute = np.abs(difference).astype(np.int64)
                 outside_abs_sum += int(absolute.sum())
                 outside_squared_sum += int((difference.astype(np.int64) ** 2).sum())
@@ -5011,9 +5382,7 @@ def render_stage2_video(
             raise Stage2Error(
                 "STAGE1_VIDEO_CHANGED", "Stage I changed during render reuse verification."
             )
-        return RenderGenerationResult(
-            artifact=artifact_ref(paths.render), meta=meta, reused=True
-        )
+        return RenderGenerationResult(artifact=artifact_ref(paths.render), meta=meta, reused=True)
 
     paths.render.parent.mkdir(parents=True, exist_ok=True)
     temporary_handle = tempfile.NamedTemporaryFile(
@@ -5147,14 +5516,10 @@ def finalize_verified_processing(
             "Only matching, technically verified render evidence may be finalized.",
         )
     if artifact_ref(Path(stored_render.output.path)) != stored_render.output:
-        raise Stage2Error(
-            "INVALID_RENDER_ARTIFACT", "Rendered output changed before finalization."
-        )
+        raise Stage2Error("INVALID_RENDER_ARTIFACT", "Rendered output changed before finalization.")
     metas = _load_render_shard_metas(sam_shards, stage1=stage1)
     if metas[0].dino_artifact_sha256 != dino_artifact.sha256:
-        raise Stage2Error(
-            "DINO_SAM_MISMATCH", "SAM shards do not bind the selected DINO artifact."
-        )
+        raise Stage2Error("DINO_SAM_MISMATCH", "SAM shards do not bind the selected DINO artifact.")
     if stored_render.mask_set_sha256 != artifact_set_sha256(sam_shards):
         raise Stage2Error(
             "SAM_RENDER_MISMATCH", "Render evidence does not bind the selected SAM shards."
@@ -5236,15 +5601,11 @@ def _artifact_ref_from_raw(raw: Any, label: str) -> ArtifactRef:
             "INVALID_PROCESSING_MANIFEST", f"{label} artifact reference is malformed."
         ) from exc
     if not re.fullmatch(r"[0-9a-f]{64}", reference.sha256) or reference.bytes < 1:
-        raise Stage2Error(
-            "INVALID_PROCESSING_MANIFEST", f"{label} artifact reference is invalid."
-        )
+        raise Stage2Error("INVALID_PROCESSING_MANIFEST", f"{label} artifact reference is invalid.")
     return reference
 
 
-def _manifest_private_artifacts(
-    paths: RunPaths, raw: dict[str, Any]
-) -> tuple[ArtifactRef, ...]:
+def _manifest_private_artifacts(paths: RunPaths, raw: dict[str, Any]) -> tuple[ArtifactRef, ...]:
     references = []
     private_root = paths.private_root.resolve(strict=False)
     for field_name in (
@@ -5255,9 +5616,7 @@ def _manifest_private_artifacts(
     ):
         values = raw.get(field_name, [])
         if not isinstance(values, list):
-            raise Stage2Error(
-                "INVALID_PROCESSING_MANIFEST", f"{field_name} must be a list."
-            )
+            raise Stage2Error("INVALID_PROCESSING_MANIFEST", f"{field_name} must be a list.")
         for index, value in enumerate(values):
             reference = _artifact_ref_from_raw(value, f"{field_name}[{index}]")
             path = Path(reference.path)
@@ -5339,9 +5698,7 @@ def _validated_reviewed_at(value: str) -> str:
 def _private_label_acceptance_problems(raw_manifest: dict[str, Any]) -> list[str]:
     problems = []
     for artifact_index, raw_reference in enumerate(raw_manifest.get("label_artifacts", [])):
-        reference = _artifact_ref_from_raw(
-            raw_reference, f"label_artifacts[{artifact_index}]"
-        )
+        reference = _artifact_ref_from_raw(raw_reference, f"label_artifacts[{artifact_index}]")
         envelope = read_json(Path(reference.path))
         if envelope.get("artifact_type") != "labels" or not isinstance(
             envelope.get("labels"), list
@@ -5356,14 +5713,19 @@ def _private_label_acceptance_problems(raw_manifest: dict[str, Any]) -> list[str
             if value.get("reviewer_disposition") != "accepted":
                 problems.append(f"label {event_id} is not accepted")
             coverage = value.get("final_mask_coverage")
-            if value.get("label_kind") == "face_event" and value.get("visibility") in {
-                "visible",
-                "partial",
-            } and (
-                isinstance(coverage, bool)
-                or not isinstance(coverage, (int, float))
-                or not math.isfinite(coverage)
-                or coverage < 0.95
+            if (
+                value.get("label_kind") == "face_event"
+                and value.get("visibility")
+                in {
+                    "visible",
+                    "partial",
+                }
+                and (
+                    isinstance(coverage, bool)
+                    or not isinstance(coverage, (int, float))
+                    or not math.isfinite(coverage)
+                    or coverage < 0.95
+                )
             ):
                 problems.append(f"visible label {event_id} has final coverage below 0.95")
     return problems
@@ -5473,9 +5835,7 @@ def create_review_record(
 ) -> tuple[ArtifactRef, ReviewRecord]:
     assert_run_root_safe(paths)
     raw, manifest_ref, render_meta = current_processing_evidence(paths)
-    bound_private = {
-        reference.sha256 for reference in _manifest_private_artifacts(paths, raw)
-    }
+    bound_private = {reference.sha256 for reference in _manifest_private_artifacts(paths, raw)}
     if _private_artifact_hashes(paths).difference(bound_private):
         raise Stage2Error(
             "CORRECTION_REQUIRES_REPROCESSING",
@@ -5487,12 +5847,8 @@ def create_review_record(
     reviewed_at = _validated_reviewed_at(reviewed_at)
     review_status = review_status.upper()
     if review_status not in {"ACCEPTED", "REJECTED"}:
-        raise Stage2Error(
-            "INVALID_REVIEW_STATUS", "Review decision must be ACCEPTED or REJECTED."
-        )
-    if review_status == "ACCEPTED" and not (
-        full_clip_reviewed and flagged_intervals_reviewed
-    ):
+        raise Stage2Error("INVALID_REVIEW_STATUS", "Review decision must be ACCEPTED or REJECTED.")
+    if review_status == "ACCEPTED" and not (full_clip_reviewed and flagged_intervals_reviewed):
         raise Stage2Error(
             "INCOMPLETE_HUMAN_REVIEW",
             "Acceptance requires full-clip and flagged-interval review attestations.",
@@ -5548,9 +5904,7 @@ def effective_review_status(paths: RunPaths) -> tuple[str, ArtifactRef | None]:
         if exc.code in {"PROCESSING_MANIFEST_MISSING", "PROCESSING_NOT_REVIEWABLE"}:
             return "PENDING", None
         raise
-    bound_private = {
-        reference.sha256 for reference in _manifest_private_artifacts(paths, raw)
-    }
+    bound_private = {reference.sha256 for reference in _manifest_private_artifacts(paths, raw)}
     if _private_artifact_hashes(paths).difference(bound_private):
         return "PENDING", None
     matching = [
@@ -5593,7 +5947,8 @@ def release_check(paths: RunPaths, *, release_root: Path) -> dict[str, Any]:
         release_root = supplied_release_root.resolve(strict=True)
     except OSError as exc:
         raise Stage2Error(
-            "RELEASE_ROOT_MISSING", "Release root does not exist.",
+            "RELEASE_ROOT_MISSING",
+            "Release root does not exist.",
             recovery="Create the release staging directory and copy only public artifacts into it.",
         ) from exc
     if not release_root.is_dir() or release_root.is_symlink():
@@ -5632,8 +5987,7 @@ def release_check(paths: RunPaths, *, release_root: Path) -> dict[str, Any]:
     unbound_private = sorted(private_hashes.difference(bound_private_hashes))
     if unbound_private:
         problems.append(
-            "private corrections/evidence are not bound to current processing: "
-            f"{unbound_private}"
+            f"private corrections/evidence are not bound to current processing: {unbound_private}"
         )
     if render_meta.output.sha256 not in release_hashes:
         problems.append("the accepted rendered output is absent from the release package")
@@ -5754,6 +6108,7 @@ def run_status(paths: RunPaths) -> dict[str, Any]:
             "run_root": str(paths.root),
             "dino": str(paths.dino),
             "sam": str(paths.sam_dir),
+            "frames": str(paths.frames_dir),
             "render": str(paths.render),
             "private": str(paths.private_root),
             "reviews": str(paths.reviews_dir),
@@ -5881,9 +6236,7 @@ class MetaSam2VideoAdapter:
         precision: str,
     ) -> SamPropagationResult:
         if not prompts:
-            return SamPropagationResult(
-                masks=(), forward_complete=True, reverse_complete=True
-            )
+            return SamPropagationResult(masks=(), forward_complete=True, reverse_complete=True)
         frame_dir = Path(window_input).resolve(strict=True)
         if not frame_dir.is_dir():
             raise Stage2Error("INVALID_SAM_WINDOW", "SAM window input must be a frame directory.")
@@ -5905,9 +6258,7 @@ class MetaSam2VideoAdapter:
         try:
             with self._torch.inference_mode(), autocast:
                 state = self.predictor.init_state(video_path=str(frame_dir))
-                id_to_prompt = {
-                    index + 1: prompt for index, prompt in enumerate(prompts)
-                }
+                id_to_prompt = {index + 1: prompt for index, prompt in enumerate(prompts)}
                 for object_id, prompt in id_to_prompt.items():
                     self.predictor.add_new_points_or_box(
                         inference_state=state,
@@ -5999,9 +6350,7 @@ class FakeImage:
 
 
 class FakeDinoAdapter:
-    identity = ModelIdentity(
-        name="fake-grounding-dino", revision="milestone-2", sha256="f" * 64
-    )
+    identity = ModelIdentity(name="fake-grounding-dino", revision="milestone-2", sha256="f" * 64)
 
     def __init__(self) -> None:
         self.calls = 0
@@ -6097,6 +6446,7 @@ class FakeSamAdapter:
             peak_vram_bytes=0,
         )
 
+
 def run_fake_pipeline(
     *,
     source_video: Path,
@@ -6106,9 +6456,7 @@ def run_fake_pipeline(
     run_id: str,
     probe_fn: Callable[[Path], VideoFacts] = probe_video,
 ) -> ProcessingManifest:
-    validated = validate_stage1(
-        source_video, stage1_video, stage1_manifest, probe_fn=probe_fn
-    )
+    validated = validate_stage1(source_video, stage1_video, stage1_manifest, probe_fn=probe_fn)
     paths = build_run_paths(work_dir, run_id, validated.clip_id)
     ensure_run_not_stopped(paths)
     resolved_inputs = {
@@ -6278,7 +6626,8 @@ def _remove_layer_path(paths: RunPaths, candidate: Path) -> None:
     assert_run_root_safe(paths)
     if candidate.is_symlink():
         raise Stage2Error(
-            "UNSAFE_INVALIDATION_PATH", f"Refusing to follow symlink during invalidation: {candidate}"
+            "UNSAFE_INVALIDATION_PATH",
+            f"Refusing to follow symlink during invalidation: {candidate}",
         )
     candidate = candidate.resolve(strict=False)
     try:
@@ -6317,8 +6666,8 @@ def invalidate_from(paths: RunPaths, *, layer: str) -> ProcessingState:
             f"Cannot recompute from {layer} before its upstream contract is complete.",
         )
     targets = {
-        "dino": (paths.dino.parent, paths.sam_dir, paths.render.parent),
-        "sam": (paths.sam_dir, paths.render.parent),
+        "dino": (paths.dino.parent, paths.sam_dir, paths.frames_dir, paths.render.parent),
+        "sam": (paths.sam_dir, paths.frames_dir, paths.render.parent),
         "render": (paths.render.parent,),
     }
     for target in targets[layer]:
@@ -6421,6 +6770,7 @@ def doctor_stage2(workspace_root: Path) -> dict[str, Any]:
     runtime_remote = None
     runtime_clean = False
     config_sha256 = None
+
     def git_probe(*arguments: str) -> subprocess.CompletedProcess[str] | None:
         try:
             return subprocess.run(
@@ -6459,9 +6809,7 @@ def doctor_stage2(workspace_root: Path) -> dict[str, Any]:
             config_sha256 = sha256_file(config_path)
         if runtime_revision != SAM_RUNTIME_REVISION:
             problems.append("SAM2 runtime revision mismatch")
-        if _normalized_git_url(runtime_remote or "") != _normalized_git_url(
-            SAM_RUNTIME_REPOSITORY
-        ):
+        if _normalized_git_url(runtime_remote or "") != _normalized_git_url(SAM_RUNTIME_REPOSITORY):
             problems.append("SAM2 runtime repository mismatch")
         if not runtime_clean:
             problems.append("SAM2 runtime has tracked modifications")
@@ -6485,9 +6833,7 @@ def doctor_stage2(workspace_root: Path) -> dict[str, Any]:
     assets_ready = all(item.get("verified") is True for item in assets.values())
     return {
         "status": (
-            "READY_FOR_MILESTONE_6_GPU_SMOKE"
-            if tools_ready and assets_ready
-            else "SETUP_REQUIRED"
+            "READY_FOR_MILESTONE_6_GPU_SMOKE" if tools_ready and assets_ready else "SETUP_REQUIRED"
         ),
         "tools": tools,
         "persistent_paths": {name: str(path) for name, path in paths.items()},
@@ -6495,6 +6841,159 @@ def doctor_stage2(workspace_root: Path) -> dict[str, Any]:
         "problems": problems,
         "gpu_execution_enabled": False,
         "next_command": "bash scripts/runpod_setup_stage2.sh",
+    }
+
+
+def run_offline_gpu_smoke(
+    workspace_root: Path,
+    *,
+    doctor_fn: Callable[[Path], dict[str, Any]] = doctor_stage2,
+    torch_module: Any | None = None,
+    dino_factory: Callable[[], Any] | None = None,
+    sam_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Load and exercise DINO then SAM2 sequentially with networking disabled."""
+    doctor = doctor_fn(workspace_root)
+    if doctor.get("status") != "READY_FOR_MILESTONE_6_GPU_SMOKE":
+        raise Stage2Error(
+            "STAGE2_SETUP_INCOMPLETE",
+            "Pinned Stage II assets are not ready for the real-GPU smoke test.",
+            details={"problems": doctor.get("problems", [])},
+            recovery="Run bash scripts/runpod_setup_stage2.sh, then retry doctor --load-models.",
+        )
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    if torch_module is None:
+        try:
+            import torch as torch_module
+        except ImportError as exc:
+            raise Stage2Error(
+                "TORCH_NOT_FOUND", "Torch is required for the real-GPU smoke test."
+            ) from exc
+    cuda = getattr(torch_module, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        raise Stage2Error(
+            "CUDA_UNAVAILABLE",
+            "A CUDA device is required for the Milestone 6 model smoke test.",
+            recovery="Start a CUDA-capable RunPod and rerun the persistent Stage II setup.",
+        )
+    device_index = 0
+    properties = cuda.get_device_properties(device_index)
+    capability = cuda.get_device_capability(device_index)
+    sam_precision = "bfloat16" if int(capability[0]) >= 8 else "float16"
+    device = {
+        "name": cuda.get_device_name(device_index),
+        "capability": tuple(int(value) for value in capability),
+        "total_memory_bytes": int(properties.total_memory),
+        "torch_version": str(getattr(torch_module, "__version__", "")),
+        "cuda_version": str(getattr(getattr(torch_module, "version", None), "cuda", "")),
+    }
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise Stage2Error(
+            "PILLOW_NOT_FOUND", "Pillow is required for the real-GPU smoke test."
+        ) from exc
+
+    paths = stage2_asset_paths(workspace_root)
+    dino_factory = dino_factory or (
+        lambda: TransformersGroundingDinoAdapter(
+            device="cuda",
+            model_path=paths["dino_weights"].parent,
+        )
+    )
+    sam_factory = sam_factory or (lambda **kwargs: MetaSam2VideoAdapter(**kwargs))
+    work_dir = paths["work_dir"] / "model-smoke"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dino_started = time.perf_counter()
+    cuda.empty_cache()
+    cuda.reset_peak_memory_stats()
+    dino = dino_factory()
+    synthetic = Image.new("RGB", (128, 96), (127, 127, 127))
+    dino_results = dino.infer_batch(
+        [synthetic],
+        prompt=DINO_PROMPT,
+        box_threshold=DINO_PROPOSAL_FLOOR,
+        text_threshold=DINO_TEXT_THRESHOLD,
+    )
+    cuda.synchronize()
+    dino_metrics = {
+        "model": _jsonable(getattr(dino, "identity", TransformersGroundingDinoAdapter.identity)),
+        "loaded": True,
+        "inference_completed": True,
+        "detections": len(dino_results[0]),
+        "runtime_seconds": time.perf_counter() - dino_started,
+        "peak_vram_bytes": int(cuda.max_memory_allocated()),
+    }
+    del dino, dino_results, synthetic
+    gc.collect()
+    cuda.empty_cache()
+    cuda.synchronize()
+    dino_residual_vram = int(cuda.memory_allocated())
+
+    sam_started = time.perf_counter()
+    cuda.reset_peak_memory_stats()
+    sam = sam_factory(checkpoint_path=paths["sam_checkpoint"], device="cuda")
+    sam_runtime = getattr(sam, "runtime_identity", None)
+    window = TemporalWindow(index=0, frame_start=0, frame_end=4)
+    prompt = SamPrompt(
+        prompt_id="gpu-smoke-box",
+        prompt_kind="manual",
+        anchor_frame=2,
+        box=(40.0, 24.0, 88.0, 72.0),
+        source_id="synthetic-smoke",
+    )
+    with tempfile.TemporaryDirectory(dir=work_dir, prefix="frames-") as temporary:
+        frame_dir = Path(temporary)
+        for frame_idx in range(window.n_frames):
+            frame = Image.new("RGB", (128, 96), (96, 96, 96))
+            draw = ImageDraw.Draw(frame)
+            offset = frame_idx - 2
+            draw.ellipse((48 + offset, 28, 80 + offset, 68), fill=(180, 180, 180))
+            frame.save(frame_dir / f"{frame_idx:06d}.jpg", format="JPEG", quality=95)
+        propagation = sam.propagate_window(
+            window_input=frame_dir,
+            window=window,
+            prompts=(prompt,),
+            width=128,
+            height=96,
+            precision=sam_precision,
+        )
+    cuda.synchronize()
+    if not propagation.forward_complete or not propagation.reverse_complete:
+        raise Stage2Error(
+            "SAM_GPU_SMOKE_INCOMPLETE",
+            "SAM2 did not complete both forward and reverse synthetic propagation.",
+        )
+    sam_metrics = {
+        "model": _jsonable(getattr(sam, "identity", MetaSam2VideoAdapter.identity)),
+        "runtime": _jsonable(sam_runtime),
+        "loaded": True,
+        "anchor_mask_completed": any(mask.frame_idx == 2 for mask in propagation.masks),
+        "forward_complete": propagation.forward_complete,
+        "reverse_complete": propagation.reverse_complete,
+        "mask_count": len(propagation.masks),
+        "precision": sam_precision,
+        "runtime_seconds": time.perf_counter() - sam_started,
+        "peak_vram_bytes": int(cuda.max_memory_allocated()),
+    }
+    if not sam_metrics["anchor_mask_completed"]:
+        raise Stage2Error("SAM_GPU_SMOKE_INCOMPLETE", "SAM2 did not return the anchor-frame mask.")
+    del sam, propagation
+    gc.collect()
+    cuda.empty_cache()
+    cuda.synchronize()
+    return {
+        "status": "PASS_OFFLINE_GPU_SMOKE",
+        "job_version": STAGE2_JOB_VERSION,
+        "code_version": STAGE2_CODE_VERSION,
+        "networking_disabled": True,
+        "models_loaded_sequentially": True,
+        "verified_assets": doctor.get("assets", {}),
+        "device": device,
+        "dino": dino_metrics,
+        "dino_residual_vram_before_sam_bytes": dino_residual_vram,
+        "sam": sam_metrics,
     }
 
 
@@ -6566,6 +7065,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     doctor = subcommands.add_parser("doctor", help="check persistent setup and pinned assets")
     doctor.add_argument("--workspace-root", type=Path, default=Path("/workspace"))
+    doctor.add_argument(
+        "--load-models",
+        action="store_true",
+        help="run the offline sequential DINO/SAM CUDA smoke test",
+    )
 
     smoke = subcommands.add_parser(
         "smoke", help="run the deterministic local workflow without GPU models"
@@ -6583,9 +7087,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sweep = subcommands.add_parser("sweep", help="plan the fixed DINO threshold sweep")
     sweep.add_argument("clip_id")
     sweep.add_argument("--work-dir", type=Path, default=Path("/workspace/stage2"))
-    sweep.add_argument(
-        "--thresholds", nargs="+", type=float, default=(0.15, 0.20, 0.25, 0.30)
-    )
+    sweep.add_argument("--thresholds", nargs="+", type=float, default=(0.15, 0.20, 0.25, 0.30))
     sweep.add_argument("--manual-seeds", type=Path)
     sweep.add_argument("--labels", type=Path)
 
@@ -6631,14 +7133,14 @@ def _paths_from_args(args: argparse.Namespace) -> RunPaths:
 def _deferred_gpu_error(command: str) -> Stage2Error:
     return Stage2Error(
         "REAL_GPU_EXECUTION_DEFERRED",
-        f"{command} is defined but real GPU execution remains locked until Milestone 6.",
+        f"{command} is defined but paid clip execution remains locked until the smoke-slice gate.",
         details={
-            "completed_boundary": "Milestone 5 operator workflow",
+            "completed_boundary": "Milestone 6 offline GPU smoke preparation",
             "reusable_layers": (),
         },
         recovery=(
-            "Run 'bash scripts/runpod_setup_stage2.sh', then use '--dry-run' to inspect "
-            "the command. Enable real execution only during the Milestone 6 GPU smoke test."
+            "Run 'bash scripts/runpod_setup_stage2.sh' on the CUDA pod, preserve its "
+            "gpu-smoke.json evidence, then use '--dry-run' to inspect the 30-60 second pilot."
         ),
     )
 
@@ -6662,8 +7164,7 @@ def _enrich_operator_error(args: argparse.Namespace, exc: Stage2Error) -> None:
         )
         exc.details.setdefault("reusable_layers", ())
         if exc.recovery is None and all(
-            hasattr(args, name)
-            for name in ("source_video", "stage1_video", "stage1_manifest")
+            hasattr(args, name) for name in ("source_video", "stage1_video", "stage1_manifest")
         ):
             exc.recovery = (
                 "Retry validation with: bash scripts/runpod_stage2.sh validate "
@@ -6714,7 +7215,11 @@ def main(argv: list[str] | None = None) -> int:
                 run_id=args.run_id,
             )
         elif args.command == "doctor":
-            result = doctor_stage2(args.workspace_root)
+            result = (
+                run_offline_gpu_smoke(args.workspace_root)
+                if args.load_models
+                else doctor_stage2(args.workspace_root)
+            )
         elif args.command == "run":
             if not args.fake:
                 raise _deferred_gpu_error("run")
@@ -6763,13 +7268,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             result = {"review_record": reference, "review": record}
         elif args.command == "release-check":
-            result = release_check(
-                _paths_from_args(args), release_root=args.release_root
-            )
+            result = release_check(_paths_from_args(args), release_root=args.release_root)
         else:
-            raise Stage2Error(
-                "UNKNOWN_COMMAND", f"Unsupported operator command: {args.command}"
-            )
+            raise Stage2Error("UNKNOWN_COMMAND", f"Unsupported operator command: {args.command}")
         payload = _jsonable(result)
         if args.json:
             print(json.dumps(payload, sort_keys=True))

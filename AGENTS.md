@@ -188,7 +188,7 @@ and pinned with a regression test:
 | Stage | Status |
 |---|---|
 | EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
-| Stage II DINO/SAM2 | Milestones 1-5 complete on `feature/stage2-deidentification`: contracts, DINO proposals/reuse, bounded SAM propagation/fallback shards, verified Stage I-only rendering, private review/release gates, and the persistent operator workflow. Official model adapters remain pinned and lazy. Continue with the Milestone 6 real-GPU smoke test and `GX010057` calibration in `STAGE2_DEIDENTIFICATION_PLAN.md`. |
+| Stage II DINO/SAM2 | Milestones 1-5 complete on `feature/stage2-deidentification`. Milestone 6 is in progress: the persistent offline CUDA smoke path, exact verified DINO snapshot binding, and source/frame-attested SAM window extraction are implemented and locally tested. The actual RunPod smoke, safe-window pilot, private `GX010057` answer sheet, full threshold sweep, and human acceptance remain pending. |
 | MediaPipe hands | Code complete, unit-tested, proven working (Metal-accelerated, fast). Never run against real *redacted* output — only a synthetic test clip. |
 | VLM captioning | Code complete, unit-tested. `models.toml` still has placeholder model IDs / $0.00 prices — cannot run for real until filled in with two real models from different labs. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
@@ -215,10 +215,17 @@ reviews, fail-closed release checks, explicit stop/resume/recompute, the full
 operator command surface, and verified persistent setup. The Stage II job is
 now version `0.5.0` with code version `milestone-5`.
 
-Continue with **Milestone 6 — real-GPU smoke test and full `GX010057`
-calibration** in `STAGE2_DEIDENTIFICATION_PLAN.md`. Run the persistent setup on
-the pod, verify offline CUDA/model loading, attest extracted frame payloads,
-select the safe SAM window size, and only then begin the full threshold sweep.
+The in-progress Milestone 6 preparation reports job version `0.6.0` and code
+version `milestone-6`; those identifiers do not mean the real calibration gate
+has passed.
+
+Continue **Milestone 6 — real-GPU smoke test and full `GX010057`
+calibration** in `STAGE2_DEIDENTIFICATION_PLAN.md`. The local implementation now
+forces the persistent setup to run DINO then SAM2 offline on CUDA and records
+`/workspace/models/stage2/gpu-smoke.json`; real SAM directories are exact,
+source-bound, frame-hashed payloads. Run that setup on the pod, review the
+30-60 second smoke slice, select the safe SAM window size, and only then begin
+the full threshold sweep.
 
 Review concerns intentionally carried into later milestones:
 

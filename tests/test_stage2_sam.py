@@ -58,7 +58,9 @@ def _dino_artifact(stage2_job, tmp_path, stage1, proposals=()):
         source: sum(1 for proposal in proposals if proposal.source == source)
         for source in ("full-frame-only", "tiled-only", "shared")
     }
-    anchors = tuple(sorted({0, stage1.source_video.n_frames - 1, *(p.frame_idx for p in proposals)}))
+    anchors = tuple(
+        sorted({0, stage1.source_video.n_frames - 1, *(p.frame_idx for p in proposals)})
+    )
     meta = stage2_job.DinoArtifactMeta(
         schema_version=1,
         artifact_type="dino_proposals",
@@ -122,9 +124,7 @@ def _generate(
     stage1 = stage1 or _stage1(stage2_job)
     adapter = adapter or stage2_job.FakeSamAdapter()
     config = config or _config(stage2_job, adapter)
-    dino_ref, dino_meta = _dino_artifact(
-        stage2_job, tmp_path / "inputs", stage1, proposals
-    )
+    dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path / "inputs", stage1, proposals)
     paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
     result = stage2_job.generate_sam_mask_shards(
         stage1=stage1,
@@ -153,10 +153,13 @@ def test_temporal_windows_cover_edges_with_exact_overlap(
     windows = stage2_job.temporal_windows(n_frames, size, overlap)
     assert [(window.frame_start, window.frame_end) for window in windows] == expected
     assert [window.index for window in windows] == list(range(len(windows)))
-    assert max(
-        sum(window.frame_start <= frame_idx <= window.frame_end for window in windows)
-        for frame_idx in range(n_frames)
-    ) <= 2
+    assert (
+        max(
+            sum(window.frame_start <= frame_idx <= window.frame_end for window in windows)
+            for frame_idx in range(n_frames)
+        )
+        <= 2
+    )
 
 
 @pytest.mark.parametrize("size,overlap", [(0, 0), (10, 10), (10, -1), (10, 6)])
@@ -197,7 +200,7 @@ def test_fake_adapter_propagates_forward_and_reverse_and_keeps_anchor_fallback(
     assert result.review_flags == ()
 
 
-def test_complete_shards_reuse_without_model_or_frame_loader_calls(stage2_job, tmp_path):
+def test_complete_shard_reuse_revalidates_payload_without_model_calls(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job)
     proposal = _proposal(stage2_job, frame_idx=5)
     first_adapter = stage2_job.FakeSamAdapter()
@@ -211,12 +214,11 @@ def test_complete_shards_reuse_without_model_or_frame_loader_calls(stage2_job, t
     assert first.generated_window_count == 3
     assert first_adapter.calls == 1
     second_adapter = stage2_job.FakeSamAdapter()
-    loader_called = False
+    loaded_windows = []
 
-    def forbidden_loader(_window):
-        nonlocal loader_called
-        loader_called = True
-        raise AssertionError("reused shards must not decode frames")
+    def attesting_loader(window):
+        loaded_windows.append(window)
+        return _window_input(stage2_job, stage1, window)
 
     second = stage2_job.generate_sam_mask_shards(
         stage1=stage1,
@@ -225,13 +227,13 @@ def test_complete_shards_reuse_without_model_or_frame_loader_calls(stage2_job, t
         dino_meta=dino_meta,
         config=config,
         adapter=second_adapter,
-        window_loader=forbidden_loader,
+        window_loader=attesting_loader,
     )
     assert second.reused_window_count == 3
     assert second.generated_window_count == 0
     assert second.shards == first.shards
     assert second_adapter.calls == 0
-    assert loader_called is False
+    assert loaded_windows == [stage2_job.temporal_windows(20, 10, 2)[0]]
 
 
 def test_no_prompt_windows_are_persisted_without_running_sam(stage2_job, tmp_path):
@@ -239,9 +241,7 @@ def test_no_prompt_windows_are_persisted_without_running_sam(stage2_job, tmp_pat
     result, *_ = _generate(stage2_job, tmp_path, adapter=adapter)
     assert len(result.shards) == 3
     assert adapter.calls == 0
-    loaded = tuple(
-        stage2_job.load_sam_mask_shard(Path(ref.path)) for ref in result.shards
-    )
+    loaded = tuple(stage2_job.load_sam_mask_shard(Path(ref.path)) for ref in result.shards)
     assert stage2_job.union_sam_masks_for_frame(
         loaded, frame_idx=12, width=100, height=80
     ) == bytes(100 * 80)
@@ -250,9 +250,7 @@ def test_no_prompt_windows_are_persisted_without_running_sam(stage2_job, tmp_pat
 def test_wrong_window_source_is_never_sent_to_sam(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job, n_frames=10)
     proposal = _proposal(stage2_job, frame_idx=5)
-    dino_ref, dino_meta = _dino_artifact(
-        stage2_job, tmp_path / "inputs", stage1, (proposal,)
-    )
+    dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path / "inputs", stage1, (proposal,))
     paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
     adapter = stage2_job.FakeSamAdapter()
     result = stage2_job.generate_sam_mask_shards(
@@ -267,21 +265,15 @@ def test_wrong_window_source_is_never_sent_to_sam(stage2_job, tmp_path):
         ),
     )
     assert adapter.calls == 0
-    assert any(
-        flag.startswith("INVALID_SAM_WINDOW_INPUT") for flag in result.review_flags
-    )
+    assert any(flag.startswith("INVALID_SAM_WINDOW_INPUT") for flag in result.review_flags)
     loaded = stage2_job.load_sam_mask_shard(Path(result.shards[0].path))
     assert {mask.frame_idx for mask in loaded.masks} == set(range(10))
 
 
-def test_dino_artifact_from_another_source_is_rejected_before_sam(
-    stage2_job, tmp_path
-):
+def test_dino_artifact_from_another_source_is_rejected_before_sam(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job, n_frames=10)
     proposal = _proposal(stage2_job, frame_idx=5)
-    dino_ref, dino_meta = _dino_artifact(
-        stage2_job, tmp_path / "inputs", stage1, (proposal,)
-    )
+    dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path / "inputs", stage1, (proposal,))
     mismatched_stage1 = replace(
         stage1,
         source=replace(stage1.source, sha256="9" * 64),
@@ -339,9 +331,7 @@ def test_dino_artifact_from_another_source_is_rejected_before_sam(
 def test_pathological_sam_masks_are_rejected(stage2_job, raw, changes, reason):
     adapter = stage2_job.FakeSamAdapter()
     config = replace(_config(stage2_job, adapter), **changes)
-    prompt = stage2_job.SamPrompt(
-        "dino-p", "dino", 5, (40.0, 30.0, 60.0, 50.0), "p"
-    )
+    prompt = stage2_job.SamPrompt("dino-p", "dino", 5, (40.0, 30.0, 60.0, 50.0), "p")
     packed, rejection = stage2_job.assess_raw_sam_mask(
         stage2_job.RawSamMask(
             frame_idx=5,
@@ -434,12 +424,8 @@ def test_sam_failure_cannot_remove_dino_fallback(stage2_job, tmp_path):
     assert any(flag.startswith("SAM_INFERENCE_FAILED") for flag in result.review_flags)
     assert any(flag.startswith("SAM_FALLBACK_USED") for flag in result.review_flags)
     assert {mask.frame_idx for mask in loaded.masks} == set(range(10))
-    frame = stage2_job.union_sam_masks_for_frame(
-        (loaded,), frame_idx=9, width=100, height=80
-    )
-    assert sum(frame) > (proposal.box[2] - proposal.box[0]) * (
-        proposal.box[3] - proposal.box[1]
-    )
+    frame = stage2_job.union_sam_masks_for_frame((loaded,), frame_idx=9, width=100, height=80)
+    assert sum(frame) > (proposal.box[2] - proposal.box[0]) * (proposal.box[3] - proposal.box[1])
 
 
 def test_reused_fallback_shard_cannot_erase_required_review_flag(stage2_job, tmp_path):
@@ -457,9 +443,7 @@ def test_reused_fallback_shard_cannot_erase_required_review_flag(stage2_job, tmp
     path = Path(result.shards[0].path)
     loaded = stage2_job.load_sam_mask_shard(path)
     path.write_bytes(
-        stage2_job.encode_sam_mask_shard(
-            replace(loaded.meta, review_flags=()), loaded.masks
-        )
+        stage2_job.encode_sam_mask_shard(replace(loaded.meta, review_flags=()), loaded.masks)
     )
     with pytest.raises(stage2_job.Stage2Error) as caught:
         _generate(
@@ -471,10 +455,7 @@ def test_reused_fallback_shard_cannot_erase_required_review_flag(stage2_job, tmp
             config=config,
         )
     assert caught.value.code == "INVALID_SAM_SHARD"
-    assert any(
-        "required fallback" in problem
-        for problem in caught.value.details["problems"]
-    )
+    assert any("required fallback" in problem for problem in caught.value.details["problems"])
 
 
 def test_interrupted_forward_and_reverse_are_flagged_with_fallback(stage2_job, tmp_path):
@@ -533,9 +514,7 @@ def test_single_occluded_frame_uses_local_fallback_without_losing_other_sam_mask
 
 def test_manual_seed_change_invalidates_only_intersecting_window(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job)
-    first, paths, dino_ref, dino_meta, _, config = _generate(
-        stage2_job, tmp_path, stage1=stage1
-    )
+    first, paths, dino_ref, dino_meta, _, config = _generate(stage2_job, tmp_path, stage1=stage1)
     seed = stage2_job.ManualSeed(
         schema_version=1,
         seed_id="miss-1",
@@ -595,12 +574,8 @@ def test_overlapping_shards_union_masks_without_global_identity(stage2_job, tmp_
         _proposal(stage2_job, frame_idx=12, box=(70.0, 50.0, 80.0, 60.0)),
     )
     result, *_ = _generate(stage2_job, tmp_path, stage1=stage1, proposals=proposals)
-    loaded = tuple(
-        stage2_job.load_sam_mask_shard(Path(ref.path)) for ref in result.shards
-    )
-    frame = stage2_job.union_sam_masks_for_frame(
-        loaded, frame_idx=8, width=100, height=80
-    )
+    loaded = tuple(stage2_job.load_sam_mask_shard(Path(ref.path)) for ref in result.shards)
+    frame = stage2_job.union_sam_masks_for_frame(loaded, frame_idx=8, width=100, height=80)
     assert frame[15 * 100 + 15] == 1
     assert frame[55 * 100 + 75] == 1
 
@@ -637,9 +612,7 @@ def test_noncanonical_or_tampered_shard_is_rejected(stage2_job, tmp_path):
     assert caught.value.code == "INVALID_SAM_SHARD"
 
 
-def test_real_adapter_first_frame_prompt_does_not_require_reverse_output(
-    stage2_job, tmp_path
-):
+def test_real_adapter_first_frame_prompt_does_not_require_reverse_output(stage2_job, tmp_path):
     class Predictor:
         def __init__(self):
             self.reverse_calls = 0
@@ -709,13 +682,9 @@ def test_frame_union_fails_when_no_shard_covers_frame(stage2_job):
 
 def test_frame_union_rejects_wrong_dimensions(stage2_job, tmp_path):
     result, *_ = _generate(stage2_job, tmp_path)
-    loaded = tuple(
-        stage2_job.load_sam_mask_shard(Path(ref.path)) for ref in result.shards
-    )
+    loaded = tuple(stage2_job.load_sam_mask_shard(Path(ref.path)) for ref in result.shards)
     with pytest.raises(stage2_job.Stage2Error) as caught:
-        stage2_job.union_sam_masks_for_frame(
-            loaded, frame_idx=0, width=99, height=80
-        )
+        stage2_job.union_sam_masks_for_frame(loaded, frame_idx=0, width=99, height=80)
     assert caught.value.code == "SAM_FRAME_SIZE_MISMATCH"
 
 
@@ -774,9 +743,7 @@ def test_every_sam_meaning_change_changes_window_fingerprint(stage2_job, tmp_pat
         {"sha256": "9" * 64},
     ],
 )
-def test_every_sam_model_identity_field_changes_fingerprint(
-    stage2_job, tmp_path, model_change
-):
+def test_every_sam_model_identity_field_changes_fingerprint(stage2_job, tmp_path, model_change):
     stage1 = _stage1(stage2_job)
     proposal = _proposal(stage2_job, frame_idx=5)
     dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path, stage1, (proposal,))
@@ -840,9 +807,7 @@ def test_sam_runtime_identity_changes_window_fingerprint(stage2_job, tmp_path):
 def test_wrong_sam_runtime_identity_fails_before_window_loading(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job, n_frames=10)
     proposal = _proposal(stage2_job, frame_idx=5)
-    dino_ref, dino_meta = _dino_artifact(
-        stage2_job, tmp_path / "inputs", stage1, (proposal,)
-    )
+    dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path / "inputs", stage1, (proposal,))
     paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
     adapter = stage2_job.FakeSamAdapter()
     config = replace(
@@ -957,9 +922,7 @@ def test_verified_sam_runtime_hashes_config_code_and_execution_stack(
     assert identity.cuda_version == "12.4"
 
 
-def test_verified_sam_runtime_rejects_revision_and_config_drift(
-    stage2_job, tmp_path
-):
+def test_verified_sam_runtime_rejects_revision_and_config_drift(stage2_job, tmp_path):
     package_root = tmp_path / "sam2"
     config = package_root / stage2_job.SAM_MODEL_CONFIG
     config.parent.mkdir(parents=True)
@@ -1010,8 +973,7 @@ def test_installed_sam_revision_uses_vcs_metadata_and_checks_repository(
         lambda _name: Distribution(stage2_job.SAM_RUNTIME_REPOSITORY),
     )
     assert (
-        stage2_job.installed_sam_runtime_revision(package_root)
-        == stage2_job.SAM_RUNTIME_REVISION
+        stage2_job.installed_sam_runtime_revision(package_root) == stage2_job.SAM_RUNTIME_REVISION
     )
     monkeypatch.setattr(
         stage2_job.importlib_metadata,
@@ -1031,9 +993,7 @@ def test_real_adapter_rejects_wrong_checkpoint_before_import(stage2_job, tmp_pat
     assert caught.value.code == "SAM_CHECKPOINT_HASH_MISMATCH"
 
 
-def test_real_adapter_dependency_failure_is_actionable_and_lazy(
-    stage2_job, tmp_path, monkeypatch
-):
+def test_real_adapter_dependency_failure_is_actionable_and_lazy(stage2_job, tmp_path, monkeypatch):
     checkpoint = tmp_path / "sam.pt"
     checkpoint.write_bytes(b"placeholder")
     monkeypatch.setattr(

@@ -622,3 +622,14 @@ def test_real_adapter_dependency_failure_is_actionable_and_lazy(stage2_job, monk
         stage2_job.TransformersGroundingDinoAdapter()
     assert caught.value.code == "DINO_DEPENDENCIES_MISSING"
     assert "setup" in caught.value.recovery.lower()
+
+
+def test_real_adapter_rejects_unverified_persistent_snapshot_before_import(
+    stage2_job, tmp_path
+):
+    snapshot = tmp_path / "dino"
+    snapshot.mkdir()
+    (snapshot / "model.safetensors").write_bytes(b"not the pinned checkpoint")
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.TransformersGroundingDinoAdapter(model_path=snapshot)
+    assert caught.value.code == "DINO_CHECKPOINT_HASH_MISMATCH"
