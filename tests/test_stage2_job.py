@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -426,7 +427,10 @@ def test_fake_pipeline_is_deterministic_resumable_and_not_review_accepted(stage2
         probe_fn=probe,
     )
     paths = stage2_job.build_run_paths(work, "milestone-1", "GX010057")
-    before = {path: path.read_bytes() for path in (paths.dino, paths.sam_shard, paths.render)}
+    sam_paths = tuple(Path(ref.path) for ref in first.sam_mask_shards)
+    before = {
+        path: path.read_bytes() for path in (paths.dino, *sam_paths, paths.render)
+    }
     second = stage2_job.run_fake_pipeline(
         source_video=source,
         stage1_video=stage1,

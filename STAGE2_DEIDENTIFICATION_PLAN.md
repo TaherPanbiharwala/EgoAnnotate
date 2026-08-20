@@ -1,6 +1,6 @@
 # Stage II EgoBlur + DINO/SAM2 De-identification Plan
 
-Status: Milestones 1-2 complete; Milestone 3 next
+Status: Milestones 1-3 complete; Milestone 4 next
 
 Saved: 2026-08-18; milestone structure updated 2026-08-20
 
@@ -8,7 +8,7 @@ Saved: 2026-08-18; milestone structure updated 2026-08-20
 |---|---|
 | 1. Contracts, validation, and local skeleton | Complete — 2026-08-20 |
 | 2. DINO proposal generation and reuse | Complete — 2026-08-20 |
-| 3. SAM2 propagation and mask shards | Not started |
+| 3. SAM2 propagation and mask shards | Complete — 2026-08-20 |
 | 4. Rendering and technical verification | Not started |
 | 5. Labels, review workflow, and operator UX | Not started |
 | 6. Real-GPU smoke test and `GX010057` calibration | Not started |
@@ -68,6 +68,20 @@ Add `--json` before the subcommand for machine-readable output. A fake run recor
 - The final immutable DINO artifact records the source/model/prompt/preprocessing/tiling/anchor/NMS fingerprint, proposal IDs and scores, source counts, suppressed counts, runtime, peak VRAM, and checkpoint hash.
 - Operating thresholds `0.15`-`0.30` select from the same stored `0.10` proposal artifact and report accepted/rejected counts. A requested threshold below `0.10` requires DINO recomputation.
 - `fake-run` now exercises this complete orchestration locally. The real Transformers adapter is lazy, cache-only, and not yet exposed by a production command; dependency installation, asset verification, and GPU execution remain deferred to the setup/smoke milestones.
+
+## Milestone 3 SAM2 and mask-shard contract
+
+- The Meta SAM2.1 Hiera Large model is pinned to `facebook/sam2.1-hiera-large` revision `665f8e2ad61cf5f53d65644ff27c8ee525124610`, using the official `sam2.1_hiera_large.pt` SHA-256 `2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318`.
+- SAM work is divided into deterministic bounded overlapping windows. Window size and overlap are required, fingerprinted inputs; the production values remain deliberately unfrozen until the Milestone 6 RunPod memory pilot.
+- Every accepted DINO proposal and intersecting manual seed becomes a box prompt with a window-local SAM object ID. The adapter propagates from the prompt anchors in both forward and reverse time. Cross-window identity is neither required nor inferred.
+- Every decoded SAM window is bound to the validated original-video hash, exact frame range, and display dimensions before the adapter can see it. A wrong or unverifiable window is discarded in favor of flagged DINO/manual fallback coverage.
+- A padded DINO or manual box is always stored on its anchor frame. Every missing, malformed, empty, undersized, off-prompt, exploding, near-full-frame, failed, or interrupted SAM result retains a padded fallback for the affected frame and creates a review flag.
+- Shards enforce complete per-prompt window coverage: every prompt has at least one valid SAM or fallback mask on every frame in its local window. A suspicious SAM mask cannot erase a valid fallback or count as a clean pass.
+- Each window is stored as a deterministic immutable compressed NumPy archive (`.npz`). Metadata and bounding-box-cropped, bit-packed binary masks carry canonical keys, per-mask hashes, frame indices, prompt provenance, local object IDs, metrics, and review flags. Reuse revalidates the entire canonical archive.
+- Operating-threshold changes reuse the immutable DINO artifact but produce a distinct SAM shard set. Manual-seed changes invalidate only windows intersecting the changed seed; all other window shards remain byte-identical and reusable.
+- DINO, SAM, and render fingerprints carry independent layer code versions. Advancing SAM implementation code therefore does not make an unchanged Milestone 2 DINO artifact stale.
+- Overlap reconstruction unions only the shards covering the requested frame; it never builds a clip-wide dense mask map. The complete shard layout is validated before downstream rendering.
+- `fake-run` now exercises the complete DINO-to-SAM orchestration. The real Meta adapter is lazy and requires an already verified local checkpoint/frame window; setup, frame extraction, dependency installation, and real GPU execution remain deferred to Milestones 5-6.
 
 ## Architecture
 

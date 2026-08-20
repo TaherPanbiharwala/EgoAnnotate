@@ -4,34 +4,42 @@
 # ///
 """Stage II face de-identification job.
 
-Milestone 1 intentionally contains no real Grounding DINO or SAM2 imports.
-It defines and tests the local contracts, validates EgoBlur artifacts, writes
-crash-safe state, and offers deterministic fake adapters for exercising the
-pipeline without a GPU. Later milestones extend this same self-contained
-PEP-723 job because GPU jobs may not share a Python environment.
+Milestones 1-3 define the fail-closed local contracts, DINO proposal layer,
+and bounded SAM2 mask-shard layer. Heavy model imports remain lazy so the
+contracts and deterministic fake adapters can be exercised without a GPU.
+Later milestones expose the real GPU command and renderer in this same
+self-contained PEP-723 job because GPU jobs may not share an environment.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import contextlib
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 STAGE2_SCHEMA_VERSION = 1
-STAGE2_CODE_VERSION = "milestone-2"
-STAGE2_JOB_VERSION = "0.2.0"
+STAGE2_CODE_VERSION = "milestone-3"
+STAGE2_JOB_VERSION = "0.3.0"
+DINO_CODE_VERSION = "milestone-2"
+SAM_CODE_VERSION = "milestone-3"
+RENDER_CODE_VERSION = "milestone-1"
 
 DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
 DINO_MODEL_REVISION = "e76a695ed7ae1032a61530cce4b4e9b65f4e368b"
@@ -42,6 +50,18 @@ DINO_TEXT_THRESHOLD = 0.25
 DINO_ANCHOR_SPACING = 20
 DINO_TILE_OVERLAP = 0.20
 DINO_NMS_IOU = 0.70
+
+SAM_MODEL_ID = "facebook/sam2.1-hiera-large"
+SAM_MODEL_REVISION = "665f8e2ad61cf5f53d65644ff27c8ee525124610"
+SAM_MODEL_WEIGHTS_SHA256 = "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318"
+SAM_FALLBACK_PADDING_SCALE = 0.15
+SAM_FALLBACK_MIN_PADDING_PX = 4
+SAM_MIN_MASK_PIXELS = 4
+SAM_MIN_PROMPT_AREA_RATIO = 0.05
+SAM_MAX_PROMPT_AREA_RATIO = 16.0
+SAM_MAX_FRAME_AREA_RATIO = 0.65
+SAM_ANCHOR_NEIGHBORHOOD_SCALE = 2.0
+SAM_MIN_ANCHOR_NEIGHBORHOOD_FRACTION = 0.50
 
 EXPECTED_STAGE1 = {
     "gen": "2",
@@ -234,16 +254,116 @@ class DinoThresholdSelection:
 
 
 @dataclass(slots=True, frozen=True)
+class TemporalWindow:
+    index: int
+    frame_start: int
+    frame_end: int
+
+    @property
+    def n_frames(self) -> int:
+        return self.frame_end - self.frame_start + 1
+
+
+@dataclass(slots=True, frozen=True)
+class SamGenerationConfig:
+    model: ModelIdentity
+    accepted_proposal_threshold: float
+    window_size: int
+    window_overlap: int
+    precision: str = "bfloat16"
+    fallback_padding_scale: float = SAM_FALLBACK_PADDING_SCALE
+    fallback_min_padding_px: int = SAM_FALLBACK_MIN_PADDING_PX
+    min_mask_pixels: int = SAM_MIN_MASK_PIXELS
+    min_prompt_area_ratio: float = SAM_MIN_PROMPT_AREA_RATIO
+    max_prompt_area_ratio: float = SAM_MAX_PROMPT_AREA_RATIO
+    max_frame_area_ratio: float = SAM_MAX_FRAME_AREA_RATIO
+    anchor_neighborhood_scale: float = SAM_ANCHOR_NEIGHBORHOOD_SCALE
+    min_anchor_neighborhood_fraction: float = SAM_MIN_ANCHOR_NEIGHBORHOOD_FRACTION
+
+
+@dataclass(slots=True, frozen=True)
+class SamPrompt:
+    prompt_id: str
+    prompt_kind: str
+    anchor_frame: int
+    box: tuple[float, float, float, float]
+    source_id: str
+
+
+@dataclass(slots=True, frozen=True)
+class SamWindowInput:
+    source_sha256: str
+    frame_start: int
+    frame_end: int
+    frame_width: int
+    frame_height: int
+    payload: Any
+
+
+@dataclass(slots=True, frozen=True)
+class RawSamMask:
+    frame_idx: int
+    prompt_id: str
+    crop_box: tuple[int, int, int, int]
+    pixels: bytes
+    direction: str
+
+
+@dataclass(slots=True, frozen=True)
+class SamPropagationResult:
+    masks: tuple[RawSamMask, ...]
+    forward_complete: bool
+    reverse_complete: bool
+    runtime_seconds: float = 0.0
+    peak_vram_bytes: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class PackedMask:
+    key: str
+    frame_idx: int
+    prompt_id: str
+    source: str
+    anchor_frame: int
+    crop_box: tuple[int, int, int, int]
+    packed_bits: bytes
+    area_pixels: int
+
+
+@dataclass(slots=True, frozen=True)
 class SamMaskShardMeta:
     schema_version: int
     artifact_type: str
     fingerprint: str
     dino_artifact_sha256: str
+    dino_fingerprint: str
     model: ModelIdentity
+    accepted_proposal_threshold: float
     frame_start: int
     frame_end: int
+    frame_width: int
+    frame_height: int
     window: dict[str, Any]
+    precision: str
+    prompts: tuple[dict[str, Any], ...]
     masks: tuple[dict[str, Any], ...]
+    review_flags: tuple[str, ...]
+    metrics: dict[str, Any]
+
+
+@dataclass(slots=True, frozen=True)
+class LoadedSamMaskShard:
+    artifact: ArtifactRef
+    meta: SamMaskShardMeta
+    masks: tuple[PackedMask, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SamGenerationResult:
+    shards: tuple[ArtifactRef, ...]
+    metas: tuple[SamMaskShardMeta, ...]
+    reused_window_count: int
+    generated_window_count: int
     review_flags: tuple[str, ...]
 
 
@@ -335,7 +455,7 @@ class RunPaths:
     manifest: Path
     dino: Path
     dino_checkpoint: Path
-    sam_shard: Path
+    sam_dir: Path
     render: Path
 
 
@@ -370,9 +490,14 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 
 def fingerprint(kind: str, payload: dict[str, Any]) -> str:
+    layer_code_version = {
+        "dino": DINO_CODE_VERSION,
+        "sam": SAM_CODE_VERSION,
+        "render": RENDER_CODE_VERSION,
+    }.get(kind, STAGE2_CODE_VERSION)
     envelope = {
         "schema_version": STAGE2_SCHEMA_VERSION,
-        "code_version": STAGE2_CODE_VERSION,
+        "code_version": layer_code_version,
         "kind": kind,
         "payload": payload,
     }
@@ -434,6 +559,15 @@ def artifact_ref(path: Path) -> ArtifactRef:
             recovery="Stop the writer or transfer, then retry with a stable input file.",
         )
     return ArtifactRef(path=str(path), sha256=digest, bytes=size)
+
+
+def artifact_set_sha256(artifacts: tuple[ArtifactRef, ...]) -> str:
+    if not artifacts:
+        raise Stage2Error("EMPTY_ARTIFACT_SET", "Artifact set must not be empty.")
+    payload = tuple(
+        {"sha256": artifact.sha256, "bytes": artifact.bytes} for artifact in artifacts
+    )
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 def resolve_input_file(path: Path, label: str) -> Path:
@@ -508,6 +642,34 @@ def write_immutable_json(path: Path, value: Any) -> ArtifactRef:
     return artifact_ref(path)
 
 
+def write_immutable_bytes(path: Path, content: bytes) -> ArtifactRef:
+    if not content:
+        raise Stage2Error("EMPTY_ARTIFACT", f"Refusing to write an empty artifact: {path}")
+    if path.exists():
+        try:
+            actual = path.read_bytes()
+        except OSError as exc:
+            raise Stage2Error(
+                "ARTIFACT_READ_FAILED",
+                f"Could not verify existing artifact {path}",
+                details={"cause": str(exc)},
+            ) from exc
+        if actual != content:
+            raise Stage2Error(
+                "IMMUTABLE_ARTIFACT_CONFLICT",
+                f"Existing immutable artifact does not match this run: {path}",
+                details={
+                    "path": str(path),
+                    "existing_sha256": hashlib.sha256(actual).hexdigest(),
+                    "expected_sha256": hashlib.sha256(content).hexdigest(),
+                },
+                recovery="Use a new run ID or explicitly invalidate the affected layer.",
+            )
+    else:
+        atomic_write_bytes(path, content)
+    return artifact_ref(path)
+
+
 def read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -544,7 +706,7 @@ def build_run_paths(work_dir: Path, run_id: str, clip_id: str) -> RunPaths:
         manifest=root / "processing.manifest.json",
         dino=root / "dino" / "artifact.json",
         dino_checkpoint=root / "dino" / "checkpoint.jsonl",
-        sam_shard=root / "sam" / "window-000000.json",
+        sam_dir=root / "sam",
         render=root / "render" / "artifact.json",
     )
 
@@ -1903,6 +2065,1529 @@ class TransformersGroundingDinoAdapter:
         return 0
 
 
+def validate_sam_config(config: SamGenerationConfig) -> None:
+    problems: list[str] = []
+    if not math.isfinite(config.accepted_proposal_threshold) or not (
+        DINO_PROPOSAL_FLOOR <= config.accepted_proposal_threshold <= 1.0
+    ):
+        problems.append(
+            "accepted_proposal_threshold must be finite and in "
+            f"[{DINO_PROPOSAL_FLOOR}, 1]"
+        )
+    if config.window_size < 1:
+        problems.append("window_size must be at least 1")
+    if not 0 <= config.window_overlap < config.window_size:
+        problems.append("window_overlap must be in [0, window_size)")
+    elif config.window_overlap * 2 > config.window_size:
+        problems.append("window_overlap must be at most half of window_size")
+    if config.precision not in {"float32", "float16", "bfloat16"}:
+        problems.append("precision must be float32, float16, or bfloat16")
+    for name, value, lower, upper in (
+        ("fallback_padding_scale", config.fallback_padding_scale, 0.0, 2.0),
+        ("min_prompt_area_ratio", config.min_prompt_area_ratio, 0.0, 1.0),
+        ("min_anchor_neighborhood_fraction", config.min_anchor_neighborhood_fraction, 0.0, 1.0),
+    ):
+        if not math.isfinite(value) or not lower <= value <= upper:
+            problems.append(f"{name} must be finite and in [{lower}, {upper}]")
+    if not math.isfinite(config.max_frame_area_ratio) or not 0.0 < config.max_frame_area_ratio <= 1.0:
+        problems.append("max_frame_area_ratio must be finite and in (0, 1]")
+    if not math.isfinite(config.max_prompt_area_ratio) or config.max_prompt_area_ratio < 1.0:
+        problems.append("max_prompt_area_ratio must be finite and at least 1")
+    if not math.isfinite(config.anchor_neighborhood_scale) or config.anchor_neighborhood_scale < 1.0:
+        problems.append("anchor_neighborhood_scale must be finite and at least 1")
+    if config.fallback_min_padding_px < 0:
+        problems.append("fallback_min_padding_px must be non-negative")
+    if config.min_mask_pixels < 1:
+        problems.append("min_mask_pixels must be at least 1")
+    if not re.fullmatch(r"[0-9a-f]{64}", config.model.sha256):
+        problems.append("model.sha256 must be a lowercase 64-character SHA-256")
+    if problems:
+        raise Stage2Error(
+            "INVALID_SAM_CONFIG",
+            "SAM configuration is invalid.",
+            details={"problems": problems},
+        )
+
+
+def temporal_windows(
+    n_frames: int, window_size: int, window_overlap: int
+) -> tuple[TemporalWindow, ...]:
+    if (
+        n_frames < 1
+        or window_size < 1
+        or not 0 <= window_overlap < window_size
+        or window_overlap * 2 > window_size
+    ):
+        raise Stage2Error(
+            "INVALID_SAM_WINDOW_LAYOUT",
+            "Frame count, window size, or overlap is invalid.",
+        )
+    step = window_size - window_overlap
+    windows: list[TemporalWindow] = []
+    start = 0
+    while start < n_frames:
+        end = min(n_frames - 1, start + window_size - 1)
+        windows.append(TemporalWindow(len(windows), start, end))
+        if end == n_frames - 1:
+            break
+        start += step
+    return tuple(windows)
+
+
+def _valid_frame_box(
+    box: tuple[float, float, float, float], width: int, height: int
+) -> bool:
+    return (
+        len(box) == 4
+        and all(math.isfinite(value) for value in box)
+        and 0.0 <= box[0] < box[2] <= width
+        and 0.0 <= box[1] < box[3] <= height
+    )
+
+
+def padded_box(
+    box: tuple[float, float, float, float],
+    *,
+    width: int,
+    height: int,
+    scale: float,
+    min_padding_px: int,
+) -> tuple[int, int, int, int]:
+    if not _valid_frame_box(box, width, height):
+        raise Stage2Error("INVALID_SAM_PROMPT", f"Prompt box is outside the frame: {box!r}")
+    pad_x = max(float(min_padding_px), (box[2] - box[0]) * scale)
+    pad_y = max(float(min_padding_px), (box[3] - box[1]) * scale)
+    return (
+        max(0, math.floor(box[0] - pad_x)),
+        max(0, math.floor(box[1] - pad_y)),
+        min(width, math.ceil(box[2] + pad_x)),
+        min(height, math.ceil(box[3] + pad_y)),
+    )
+
+
+def validate_manual_seeds(
+    seeds: tuple[ManualSeed, ...], stage1: StageIInput
+) -> tuple[ManualSeed, ...]:
+    seen: set[str] = set()
+    ordered = sorted(seeds, key=lambda seed: (seed.frame_idx, seed.seed_id))
+    for seed in ordered:
+        problems = []
+        if seed.schema_version != STAGE2_SCHEMA_VERSION:
+            problems.append("schema_version")
+        if seed.clip_id != stage1.clip_id:
+            problems.append("clip_id")
+        if not _SAFE_COMPONENT.fullmatch(seed.seed_id) or seed.seed_id in {".", ".."}:
+            problems.append("seed_id")
+        if seed.seed_id in seen:
+            problems.append("duplicate seed_id")
+        if not 0 <= seed.frame_idx < stage1.source_video.n_frames:
+            problems.append("frame_idx")
+        if not _valid_frame_box(
+            seed.box,
+            stage1.source_video.display_width,
+            stage1.source_video.display_height,
+        ):
+            problems.append("box")
+        if not seed.reason.strip():
+            problems.append("reason")
+        if problems:
+            raise Stage2Error(
+                "INVALID_MANUAL_SEED",
+                f"Manual seed {seed.seed_id!r} is invalid.",
+                details={"problems": problems},
+            )
+        seen.add(seed.seed_id)
+    return tuple(ordered)
+
+
+def sam_prompts_for_window(
+    window: TemporalWindow,
+    proposals: tuple[Proposal, ...],
+    manual_seeds: tuple[ManualSeed, ...],
+) -> tuple[SamPrompt, ...]:
+    prompts = [
+        SamPrompt(
+            prompt_id=f"dino-{proposal.proposal_id}",
+            prompt_kind="dino",
+            anchor_frame=proposal.frame_idx,
+            box=proposal.box,
+            source_id=proposal.proposal_id,
+        )
+        for proposal in proposals
+        if window.frame_start <= proposal.frame_idx <= window.frame_end
+    ]
+    prompts.extend(
+        SamPrompt(
+            prompt_id=f"manual-{seed.seed_id}",
+            prompt_kind="manual",
+            anchor_frame=seed.frame_idx,
+            box=seed.box,
+            source_id=seed.seed_id,
+        )
+        for seed in manual_seeds
+        if window.frame_start <= seed.frame_idx <= window.frame_end
+    )
+    prompts.sort(key=lambda prompt: (prompt.anchor_frame, prompt.prompt_kind, prompt.source_id))
+    if len({prompt.prompt_id for prompt in prompts}) != len(prompts):
+        raise Stage2Error("INVALID_SAM_PROMPT", "SAM prompt IDs are not unique within a window.")
+    return tuple(prompts)
+
+
+def _sam_prompt_records(prompts: tuple[SamPrompt, ...]) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        {**_jsonable(prompt), "local_object_id": index + 1}
+        for index, prompt in enumerate(prompts)
+    )
+
+
+def sam_window_fingerprint_payload(
+    *,
+    dino_artifact: ArtifactRef,
+    dino_meta: DinoArtifactMeta,
+    config: SamGenerationConfig,
+    window: TemporalWindow,
+    prompts: tuple[SamPrompt, ...],
+) -> dict[str, Any]:
+    return {
+        "dino_artifact_sha256": dino_artifact.sha256,
+        "dino_fingerprint": dino_meta.fingerprint,
+        "model": _jsonable(config.model),
+        "accepted_proposal_threshold": config.accepted_proposal_threshold,
+        "prompt_conversion": "global-xyxy-box-to-local-object",
+        "window": _jsonable(window),
+        "window_layout": {
+            "size": config.window_size,
+            "overlap": config.window_overlap,
+        },
+        "precision": config.precision,
+        "fallback": {
+            "padding_scale": config.fallback_padding_scale,
+            "min_padding_px": config.fallback_min_padding_px,
+        },
+        "validation": {
+            "min_mask_pixels": config.min_mask_pixels,
+            "min_prompt_area_ratio": config.min_prompt_area_ratio,
+            "max_prompt_area_ratio": config.max_prompt_area_ratio,
+            "max_frame_area_ratio": config.max_frame_area_ratio,
+            "anchor_neighborhood_scale": config.anchor_neighborhood_scale,
+            "min_anchor_neighborhood_fraction": config.min_anchor_neighborhood_fraction,
+        },
+        "prompts": _sam_prompt_records(prompts),
+    }
+
+
+def sam_shard_path(paths: RunPaths, window: TemporalWindow, fingerprint_value: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint_value):
+        raise Stage2Error("INVALID_SAM_FINGERPRINT", "SAM fingerprint is not a SHA-256.")
+    return paths.sam_dir / (
+        f"window-{window.frame_start:06d}-{window.frame_end:06d}-{fingerprint_value}.npz"
+    )
+
+
+def validate_sam_window_input(
+    value: Any, *, stage1: StageIInput, window: TemporalWindow
+) -> SamWindowInput:
+    if not isinstance(value, SamWindowInput):
+        raise Stage2Error(
+            "INVALID_SAM_WINDOW_INPUT",
+            "SAM window loader must return source-bound window metadata.",
+        )
+    expected = (
+        stage1.source.sha256,
+        window.frame_start,
+        window.frame_end,
+        stage1.source_video.display_width,
+        stage1.source_video.display_height,
+    )
+    actual = (
+        value.source_sha256,
+        value.frame_start,
+        value.frame_end,
+        value.frame_width,
+        value.frame_height,
+    )
+    if actual != expected:
+        raise Stage2Error(
+            "INVALID_SAM_WINDOW_INPUT",
+            "SAM window does not match the validated original source and frame range.",
+            details={"expected": expected, "actual": actual},
+        )
+    return value
+
+
+def _pack_bits(values: bytes) -> bytes:
+    packed = bytearray((len(values) + 7) // 8)
+    for index, value in enumerate(values):
+        if value not in (0, 1):
+            raise Stage2Error("INVALID_SAM_MASK", "Mask pixels must be binary 0/1 bytes.")
+        if value:
+            packed[index // 8] |= 1 << (7 - index % 8)
+    return bytes(packed)
+
+
+def _validate_packed_bits(packed: bytes, size: int) -> None:
+    if size < 0 or len(packed) != (size + 7) // 8:
+        raise Stage2Error("INVALID_SAM_SHARD", "Packed mask length is inconsistent.")
+    if size % 8 and packed and packed[-1] & ((1 << (8 - size % 8)) - 1):
+        raise Stage2Error("INVALID_SAM_SHARD", "Packed mask has nonzero padding bits.")
+
+
+def _unpack_bits(packed: bytes, size: int) -> bytes:
+    _validate_packed_bits(packed, size)
+    return bytes(
+        (packed[index // 8] >> (7 - index % 8)) & 1 for index in range(size)
+    )
+
+
+def _packed_bit(packed: bytes, index: int) -> int:
+    return (packed[index // 8] >> (7 - index % 8)) & 1
+
+
+def _packed_ones(size: int) -> bytes:
+    if size < 0:
+        raise Stage2Error("INVALID_SAM_SHARD", "Packed mask size cannot be negative.")
+    complete, remaining = divmod(size, 8)
+    tail = bytes([0xFF << (8 - remaining) & 0xFF]) if remaining else b""
+    return b"\xff" * complete + tail
+
+
+def _packed_mask_key(
+    *,
+    frame_idx: int,
+    prompt_id: str,
+    source: str,
+    anchor_frame: int,
+    crop_box: tuple[int, int, int, int],
+    packed_bits: bytes,
+) -> str:
+    payload = {
+        "frame_idx": frame_idx,
+        "prompt_id": prompt_id,
+        "source": source,
+        "anchor_frame": anchor_frame,
+        "crop_box": crop_box,
+        "packed_sha256": hashlib.sha256(packed_bits).hexdigest(),
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()[:24]
+
+
+def rectangle_packed_mask(
+    *,
+    frame_idx: int,
+    prompt: SamPrompt,
+    crop_box: tuple[int, int, int, int],
+    source: str,
+) -> PackedMask:
+    x1, y1, x2, y2 = crop_box
+    area = (x2 - x1) * (y2 - y1)
+    packed = _packed_ones(area)
+    return PackedMask(
+        key=_packed_mask_key(
+            frame_idx=frame_idx,
+            prompt_id=prompt.prompt_id,
+            source=source,
+            anchor_frame=prompt.anchor_frame,
+            crop_box=crop_box,
+            packed_bits=packed,
+        ),
+        frame_idx=frame_idx,
+        prompt_id=prompt.prompt_id,
+        source=source,
+        anchor_frame=prompt.anchor_frame,
+        crop_box=crop_box,
+        packed_bits=packed,
+        area_pixels=area,
+    )
+
+
+def _tighten_raw_mask(
+    raw: RawSamMask, *, width: int, height: int
+) -> tuple[tuple[int, int, int, int], bytes, int]:
+    try:
+        x1, y1, x2, y2 = (int(value) for value in raw.crop_box)
+    except (TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_SAM_MASK", "SAM mask crop is malformed.") from exc
+    if (x1, y1, x2, y2) != raw.crop_box or not (
+        0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height
+    ):
+        raise Stage2Error("INVALID_SAM_MASK", "SAM mask crop is outside the frame.")
+    crop_width = x2 - x1
+    crop_height = y2 - y1
+    if not isinstance(raw.pixels, bytes) or len(raw.pixels) != crop_width * crop_height:
+        raise Stage2Error("INVALID_SAM_MASK", "SAM mask pixel count is inconsistent.")
+    nonzero_count = 0
+    local_x1 = crop_width
+    local_y1 = crop_height
+    local_x2 = 0
+    local_y2 = 0
+    for index, value in enumerate(raw.pixels):
+        if value not in (0, 1):
+            raise Stage2Error("INVALID_SAM_MASK", "SAM mask pixels are not binary.")
+        if value:
+            x = index % crop_width
+            y = index // crop_width
+            nonzero_count += 1
+            local_x1 = min(local_x1, x)
+            local_y1 = min(local_y1, y)
+            local_x2 = max(local_x2, x + 1)
+            local_y2 = max(local_y2, y + 1)
+    if nonzero_count == 0:
+        return (x1, y1, x1, y1), b"", 0
+    tightened = bytearray()
+    for row in range(local_y1, local_y2):
+        start = row * crop_width + local_x1
+        tightened.extend(raw.pixels[start : start + (local_x2 - local_x1)])
+    return (
+        (x1 + local_x1, y1 + local_y1, x1 + local_x2, y1 + local_y2),
+        bytes(tightened),
+        nonzero_count,
+    )
+
+
+def _expanded_neighborhood(
+    box: tuple[float, float, float, float], width: int, height: int, scale: float
+) -> tuple[int, int, int, int]:
+    box_width = box[2] - box[0]
+    box_height = box[3] - box[1]
+    extra_x = box_width * (scale - 1.0) / 2.0
+    extra_y = box_height * (scale - 1.0) / 2.0
+    return (
+        max(0, math.floor(box[0] - extra_x)),
+        max(0, math.floor(box[1] - extra_y)),
+        min(width, math.ceil(box[2] + extra_x)),
+        min(height, math.ceil(box[3] + extra_y)),
+    )
+
+
+def assess_raw_sam_mask(
+    raw: RawSamMask,
+    *,
+    prompt: SamPrompt,
+    config: SamGenerationConfig,
+    width: int,
+    height: int,
+) -> tuple[PackedMask | None, str | None]:
+    if raw.direction not in {"anchor", "forward", "reverse"}:
+        return None, "SAM_MASK_DIRECTION_INVALID"
+    try:
+        crop_box, pixels, area = _tighten_raw_mask(raw, width=width, height=height)
+    except Stage2Error:
+        return None, "SAM_MASK_MALFORMED"
+    if area == 0:
+        return None, "SAM_MASK_EMPTY"
+    prompt_area = (prompt.box[2] - prompt.box[0]) * (prompt.box[3] - prompt.box[1])
+    minimum = max(config.min_mask_pixels, math.ceil(prompt_area * config.min_prompt_area_ratio))
+    if area < minimum:
+        return None, "SAM_MASK_UNDERSIZED"
+    if area > prompt_area * config.max_prompt_area_ratio:
+        return None, "SAM_MASK_EXPLODED"
+    if area >= width * height * config.max_frame_area_ratio:
+        return None, "SAM_MASK_NEAR_FULL_FRAME"
+    if raw.frame_idx == prompt.anchor_frame:
+        neighborhood = _expanded_neighborhood(
+            prompt.box, width, height, config.anchor_neighborhood_scale
+        )
+        crop_width = crop_box[2] - crop_box[0]
+        inside = 0
+        for index, value in enumerate(pixels):
+            if not value:
+                continue
+            x = crop_box[0] + index % crop_width
+            y = crop_box[1] + index // crop_width
+            if neighborhood[0] <= x < neighborhood[2] and neighborhood[1] <= y < neighborhood[3]:
+                inside += 1
+        if inside / area < config.min_anchor_neighborhood_fraction:
+            return None, "SAM_MASK_OFF_PROMPT"
+    packed = _pack_bits(pixels)
+    source = f"sam2-{raw.direction}"
+    return (
+        PackedMask(
+            key=_packed_mask_key(
+                frame_idx=raw.frame_idx,
+                prompt_id=prompt.prompt_id,
+                source=source,
+                anchor_frame=prompt.anchor_frame,
+                crop_box=crop_box,
+                packed_bits=packed,
+            ),
+            frame_idx=raw.frame_idx,
+            prompt_id=prompt.prompt_id,
+            source=source,
+            anchor_frame=prompt.anchor_frame,
+            crop_box=crop_box,
+            packed_bits=packed,
+            area_pixels=area,
+        ),
+        None,
+    )
+
+
+def reassess_packed_sam_mask(
+    mask: PackedMask,
+    *,
+    prompt: SamPrompt,
+    config: SamGenerationConfig,
+    width: int,
+    height: int,
+) -> str | None:
+    direction = mask.source.removeprefix("sam2-")
+    if direction not in {"anchor", "forward", "reverse"}:
+        return "SAM_MASK_DIRECTION_INVALID"
+    x1, y1, x2, y2 = mask.crop_box
+    crop_width = x2 - x1
+    crop_height = y2 - y1
+    size = crop_width * crop_height
+    try:
+        _validate_packed_bits(mask.packed_bits, size)
+    except Stage2Error:
+        return "SAM_MASK_MALFORMED"
+    if mask.area_pixels < 1:
+        return "SAM_MASK_EMPTY"
+    prompt_area = (prompt.box[2] - prompt.box[0]) * (prompt.box[3] - prompt.box[1])
+    minimum = max(config.min_mask_pixels, math.ceil(prompt_area * config.min_prompt_area_ratio))
+    if mask.area_pixels < minimum:
+        return "SAM_MASK_UNDERSIZED"
+    if mask.area_pixels > prompt_area * config.max_prompt_area_ratio:
+        return "SAM_MASK_EXPLODED"
+    if mask.area_pixels >= width * height * config.max_frame_area_ratio:
+        return "SAM_MASK_NEAR_FULL_FRAME"
+    top = any(_packed_bit(mask.packed_bits, index) for index in range(crop_width))
+    bottom_start = (crop_height - 1) * crop_width
+    bottom = any(
+        _packed_bit(mask.packed_bits, bottom_start + index) for index in range(crop_width)
+    )
+    left = any(
+        _packed_bit(mask.packed_bits, row * crop_width) for row in range(crop_height)
+    )
+    right = any(
+        _packed_bit(mask.packed_bits, row * crop_width + crop_width - 1)
+        for row in range(crop_height)
+    )
+    if not (top and bottom and left and right):
+        return "SAM_MASK_MALFORMED"
+    if mask.frame_idx == prompt.anchor_frame:
+        neighborhood = _expanded_neighborhood(
+            prompt.box, width, height, config.anchor_neighborhood_scale
+        )
+        overlap_x1 = max(x1, neighborhood[0])
+        overlap_y1 = max(y1, neighborhood[1])
+        overlap_x2 = min(x2, neighborhood[2])
+        overlap_y2 = min(y2, neighborhood[3])
+        inside = 0
+        for y in range(overlap_y1, overlap_y2):
+            row_start = (y - y1) * crop_width
+            for x in range(overlap_x1, overlap_x2):
+                inside += _packed_bit(mask.packed_bits, row_start + x - x1)
+        if inside / mask.area_pixels < config.min_anchor_neighborhood_fraction:
+            return "SAM_MASK_OFF_PROMPT"
+    return None
+
+
+def _mask_record(mask: PackedMask) -> dict[str, Any]:
+    return {
+        "key": mask.key,
+        "frame_idx": mask.frame_idx,
+        "prompt_id": mask.prompt_id,
+        "source": mask.source,
+        "anchor_frame": mask.anchor_frame,
+        "crop_box": mask.crop_box,
+        "shape": (
+            mask.crop_box[3] - mask.crop_box[1],
+            mask.crop_box[2] - mask.crop_box[0],
+        ),
+        "area_pixels": mask.area_pixels,
+        "packed_bytes": len(mask.packed_bits),
+        "packed_sha256": hashlib.sha256(mask.packed_bits).hexdigest(),
+    }
+
+
+def _npy_uint8_bytes(values: bytes) -> bytes:
+    header = repr(
+        {
+            "descr": "|u1",
+            "fortran_order": False,
+            "shape": (len(values),),
+        }
+    ).encode("latin1")
+    prefix_size = 6 + 2 + 2
+    padding = (16 - ((prefix_size + len(header) + 1) % 16)) % 16
+    header += b" " * padding + b"\n"
+    if len(header) > 65535:
+        raise Stage2Error("INVALID_SAM_SHARD", "NumPy header is unexpectedly large.")
+    return b"\x93NUMPY" + b"\x01\x00" + struct.pack("<H", len(header)) + header + values
+
+
+def _read_npy_uint8(content: bytes) -> bytes:
+    if len(content) < 10 or content[:8] != b"\x93NUMPY\x01\x00":
+        raise Stage2Error("INVALID_SAM_SHARD", "Shard member is not NumPy v1.0 data.")
+    header_length = struct.unpack("<H", content[8:10])[0]
+    header_end = 10 + header_length
+    if header_end > len(content):
+        raise Stage2Error("INVALID_SAM_SHARD", "NumPy shard member has a torn header.")
+    try:
+        header = ast.literal_eval(content[10:header_end].decode("latin1").strip())
+    except (SyntaxError, ValueError, UnicodeDecodeError) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", "NumPy shard header is malformed.") from exc
+    if not isinstance(header, dict) or header.get("descr") != "|u1":
+        raise Stage2Error("INVALID_SAM_SHARD", "Shard arrays must use uint8 data.")
+    if header.get("fortran_order") is not False:
+        raise Stage2Error("INVALID_SAM_SHARD", "Shard arrays must be C-contiguous.")
+    shape = header.get("shape")
+    if not isinstance(shape, tuple) or len(shape) != 1 or not isinstance(shape[0], int):
+        raise Stage2Error("INVALID_SAM_SHARD", "Shard arrays must be one-dimensional.")
+    values = content[header_end:]
+    if shape[0] < 0 or len(values) != shape[0]:
+        raise Stage2Error("INVALID_SAM_SHARD", "NumPy shard shape does not match its bytes.")
+    return values
+
+
+def encode_sam_mask_shard(meta: SamMaskShardMeta, masks: tuple[PackedMask, ...]) -> bytes:
+    by_key = {mask.key: mask for mask in masks}
+    if len(by_key) != len(masks):
+        raise Stage2Error("INVALID_SAM_SHARD", "Mask keys must be unique within a shard.")
+    if tuple(record["key"] for record in meta.masks) != tuple(sorted(by_key)):
+        raise Stage2Error("INVALID_SAM_SHARD", "Mask metadata and arrays are out of order.")
+    buffer = io.BytesIO()
+    try:
+        with zipfile.ZipFile(
+            buffer, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as archive:
+            members = [("metadata.npy", _npy_uint8_bytes(canonical_json_bytes(meta)))]
+            members.extend(
+                (f"{key}.npy", _npy_uint8_bytes(by_key[key].packed_bits))
+                for key in sorted(by_key)
+            )
+            for name, content in members:
+                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o600 << 16
+                archive.writestr(info, content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise Stage2Error("SAM_SHARD_ENCODE_FAILED", "Could not encode SAM mask shard.") from exc
+    return buffer.getvalue()
+
+
+def _sam_model_identity_from_dict(raw: dict[str, Any]) -> ModelIdentity:
+    try:
+        return ModelIdentity(
+            name=str(raw["name"]), revision=str(raw["revision"]), sha256=str(raw["sha256"])
+        )
+    except (KeyError, TypeError) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored SAM model identity is malformed.") from exc
+
+
+def _sam_mask_record_from_dict(raw: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return {
+            "key": str(raw["key"]),
+            "frame_idx": int(raw["frame_idx"]),
+            "prompt_id": str(raw["prompt_id"]),
+            "source": str(raw["source"]),
+            "anchor_frame": int(raw["anchor_frame"]),
+            "crop_box": tuple(int(value) for value in raw["crop_box"]),
+            "shape": tuple(int(value) for value in raw["shape"]),
+            "area_pixels": int(raw["area_pixels"]),
+            "packed_bytes": int(raw["packed_bytes"]),
+            "packed_sha256": str(raw["packed_sha256"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored mask record is malformed.") from exc
+
+
+def sam_meta_from_dict(raw: dict[str, Any]) -> SamMaskShardMeta:
+    try:
+        meta = SamMaskShardMeta(
+            schema_version=int(raw["schema_version"]),
+            artifact_type=str(raw["artifact_type"]),
+            fingerprint=str(raw["fingerprint"]),
+            dino_artifact_sha256=str(raw["dino_artifact_sha256"]),
+            dino_fingerprint=str(raw["dino_fingerprint"]),
+            model=_sam_model_identity_from_dict(raw["model"]),
+            accepted_proposal_threshold=float(raw["accepted_proposal_threshold"]),
+            frame_start=int(raw["frame_start"]),
+            frame_end=int(raw["frame_end"]),
+            frame_width=int(raw["frame_width"]),
+            frame_height=int(raw["frame_height"]),
+            window=dict(raw["window"]),
+            precision=str(raw["precision"]),
+            prompts=tuple(dict(value) for value in raw["prompts"]),
+            masks=tuple(_sam_mask_record_from_dict(value) for value in raw["masks"]),
+            review_flags=tuple(str(value) for value in raw["review_flags"]),
+            metrics=dict(raw["metrics"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored SAM shard metadata is malformed.") from exc
+    if meta.schema_version != STAGE2_SCHEMA_VERSION or meta.artifact_type != "sam_mask_shard":
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored SAM shard is incompatible.")
+    return meta
+
+
+def _packed_mask_from_record(record: dict[str, Any], packed_bits: bytes) -> PackedMask:
+    try:
+        crop_box = tuple(int(value) for value in record["crop_box"])
+        mask = PackedMask(
+            key=str(record["key"]),
+            frame_idx=int(record["frame_idx"]),
+            prompt_id=str(record["prompt_id"]),
+            source=str(record["source"]),
+            anchor_frame=int(record["anchor_frame"]),
+            crop_box=crop_box,
+            packed_bits=packed_bits,
+            area_pixels=int(record["area_pixels"]),
+        )
+        shape = tuple(int(value) for value in record["shape"])
+        packed_bytes = int(record["packed_bytes"])
+        packed_sha256 = str(record["packed_sha256"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored mask record is malformed.") from exc
+    if len(crop_box) != 4 or shape != (crop_box[3] - crop_box[1], crop_box[2] - crop_box[0]):
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored mask crop and shape disagree.")
+    size = shape[0] * shape[1]
+    _validate_packed_bits(packed_bits, size)
+    if (
+        packed_bytes != len(packed_bits)
+        or packed_sha256 != hashlib.sha256(packed_bits).hexdigest()
+        or mask.area_pixels != sum(value.bit_count() for value in packed_bits)
+        or mask.area_pixels < 1
+    ):
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored mask integrity check failed.")
+    expected_key = _packed_mask_key(
+        frame_idx=mask.frame_idx,
+        prompt_id=mask.prompt_id,
+        source=mask.source,
+        anchor_frame=mask.anchor_frame,
+        crop_box=mask.crop_box,
+        packed_bits=mask.packed_bits,
+    )
+    if mask.key != expected_key:
+        raise Stage2Error("INVALID_SAM_SHARD", "Stored mask key is not canonical.")
+    return mask
+
+
+def load_sam_mask_shard(
+    path: Path, *, expected_artifact: ArtifactRef | None = None
+) -> LoadedSamMaskShard:
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_file():
+            raise OSError("not a regular file")
+        before = file_stamp(resolved)
+        content = resolved.read_bytes()
+        after = file_stamp(resolved)
+        if before != after:
+            raise Stage2Error(
+                "INPUT_CHANGED_DURING_READ", "SAM shard changed while it was being read."
+            )
+        actual_ref = ArtifactRef(
+            path=str(resolved),
+            sha256=hashlib.sha256(content).hexdigest(),
+            bytes=len(content),
+        )
+        if not content:
+            raise Stage2Error("INVALID_SAM_SHARD", "SAM shard is empty.")
+        if expected_artifact is not None and actual_ref != expected_artifact:
+            raise Stage2Error(
+                "INVALID_SAM_SHARD", "SAM shard hash or size changed after recording."
+            )
+        with zipfile.ZipFile(io.BytesIO(content), mode="r") as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)) or "metadata.npy" not in names:
+                raise Stage2Error("INVALID_SAM_SHARD", "SAM shard members are incomplete or duplicate.")
+            metadata_bytes = _read_npy_uint8(archive.read("metadata.npy"))
+            try:
+                raw_meta = json.loads(metadata_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise Stage2Error("INVALID_SAM_SHARD", "SAM shard metadata is not valid JSON.") from exc
+            if not isinstance(raw_meta, dict):
+                raise Stage2Error("INVALID_SAM_SHARD", "SAM shard metadata must be an object.")
+            meta = sam_meta_from_dict(raw_meta)
+            expected_names = {"metadata.npy"}
+            masks = []
+            for record in meta.masks:
+                key = str(record.get("key", ""))
+                member = f"{key}.npy"
+                expected_names.add(member)
+                if member not in names:
+                    raise Stage2Error("INVALID_SAM_SHARD", f"SAM shard is missing {member}.")
+                packed = _read_npy_uint8(archive.read(member))
+                masks.append(_packed_mask_from_record(record, packed))
+            if set(names) != expected_names:
+                raise Stage2Error("INVALID_SAM_SHARD", "SAM shard contains unrecorded members.")
+    except Stage2Error:
+        raise
+    except (OSError, KeyError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", f"Could not read SAM shard {path}.") from exc
+    mask_tuple = tuple(masks)
+    if encode_sam_mask_shard(meta, mask_tuple) != content:
+        raise Stage2Error("INVALID_SAM_SHARD", "SAM shard is not canonically encoded.")
+    return LoadedSamMaskShard(artifact=actual_ref, meta=meta, masks=mask_tuple)
+
+
+def _sam_review_flag(
+    code: str,
+    window: TemporalWindow,
+    *,
+    prompt_id: str | None = None,
+    frame_idx: int | None = None,
+    detail: str | None = None,
+) -> str:
+    parts = [code, f"window={window.index}"]
+    if prompt_id is not None:
+        parts.append(f"prompt={prompt_id}")
+    if frame_idx is not None:
+        parts.append(f"frame={frame_idx}")
+    if detail is not None:
+        parts.append(detail)
+    return "|".join(parts)
+
+
+def _compact_frame_ranges(frames: list[int]) -> str:
+    if not frames:
+        return ""
+    ranges: list[str] = []
+    start = previous = frames[0]
+    for frame_idx in frames[1:]:
+        if frame_idx == previous + 1:
+            previous = frame_idx
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = frame_idx
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def build_sam_mask_shard(
+    *,
+    dino_artifact: ArtifactRef,
+    dino_meta: DinoArtifactMeta,
+    config: SamGenerationConfig,
+    window: TemporalWindow,
+    prompts: tuple[SamPrompt, ...],
+    fingerprint_value: str,
+    propagation: SamPropagationResult | None,
+    propagation_failure: str | None,
+    width: int,
+    height: int,
+) -> tuple[SamMaskShardMeta, tuple[PackedMask, ...]]:
+    prompt_by_id = {prompt.prompt_id: prompt for prompt in prompts}
+    review_flags: set[str] = set()
+    masks_by_key: dict[str, PackedMask] = {}
+    valid_prompt_frames: set[tuple[str, int]] = set()
+    rejected_count = 0
+    if propagation_failure is not None:
+        review_flags.add(_sam_review_flag(propagation_failure, window))
+    if propagation is not None:
+        raw_masks: tuple[Any, ...] | list[Any]
+        if not isinstance(propagation.masks, (tuple, list)):
+            raw_masks = ()
+            review_flags.add(_sam_review_flag("SAM_OUTPUT_MALFORMED", window))
+        else:
+            raw_masks = propagation.masks
+        if not propagation.forward_complete:
+            review_flags.add(_sam_review_flag("SAM_FORWARD_INTERRUPTED", window))
+        if not propagation.reverse_complete:
+            review_flags.add(_sam_review_flag("SAM_REVERSE_INTERRUPTED", window))
+        for raw in raw_masks:
+            if not isinstance(raw, RawSamMask):
+                rejected_count += 1
+                review_flags.add(_sam_review_flag("SAM_MASK_MALFORMED", window))
+                continue
+            prompt = prompt_by_id.get(raw.prompt_id)
+            if prompt is None:
+                rejected_count += 1
+                review_flags.add(
+                    _sam_review_flag(
+                        "SAM_UNKNOWN_OBJECT", window, prompt_id=raw.prompt_id, frame_idx=raw.frame_idx
+                    )
+                )
+                continue
+            if not window.frame_start <= raw.frame_idx <= window.frame_end:
+                rejected_count += 1
+                review_flags.add(
+                    _sam_review_flag(
+                        "SAM_MASK_OUTSIDE_WINDOW",
+                        window,
+                        prompt_id=raw.prompt_id,
+                        frame_idx=raw.frame_idx,
+                    )
+                )
+                continue
+            packed, rejection = assess_raw_sam_mask(
+                raw,
+                prompt=prompt,
+                config=config,
+                width=width,
+                height=height,
+            )
+            if packed is None:
+                rejected_count += 1
+                review_flags.add(
+                    _sam_review_flag(
+                        rejection or "SAM_MASK_REJECTED",
+                        window,
+                        prompt_id=raw.prompt_id,
+                        frame_idx=raw.frame_idx,
+                    )
+                )
+                continue
+            masks_by_key.setdefault(packed.key, packed)
+            valid_prompt_frames.add((packed.prompt_id, packed.frame_idx))
+
+    fallback_count = 0
+    for prompt in prompts:
+        fallback_crop = padded_box(
+            prompt.box,
+            width=width,
+            height=height,
+            scale=config.fallback_padding_scale,
+            min_padding_px=config.fallback_min_padding_px,
+        )
+        fallback_source = (
+            "dino-fallback" if prompt.prompt_kind == "dino" else "manual-fallback"
+        )
+        anchor_fallback = rectangle_packed_mask(
+            frame_idx=prompt.anchor_frame,
+            prompt=prompt,
+            crop_box=fallback_crop,
+            source=fallback_source,
+        )
+        masks_by_key.setdefault(anchor_fallback.key, anchor_fallback)
+        missing_frames = []
+        for frame_idx in range(window.frame_start, window.frame_end + 1):
+            if (prompt.prompt_id, frame_idx) in valid_prompt_frames:
+                continue
+            missing_frames.append(frame_idx)
+            fallback = rectangle_packed_mask(
+                frame_idx=frame_idx,
+                prompt=prompt,
+                crop_box=fallback_crop,
+                source=fallback_source,
+            )
+            if fallback.key not in masks_by_key:
+                masks_by_key[fallback.key] = fallback
+                fallback_count += 1
+        if missing_frames:
+            review_flags.add(
+                _sam_review_flag(
+                    "SAM_FALLBACK_USED",
+                    window,
+                    prompt_id=prompt.prompt_id,
+                    detail=(
+                        f"ranges={_compact_frame_ranges(missing_frames)}|count={len(missing_frames)}"
+                    ),
+                )
+            )
+
+    masks = tuple(
+        sorted(
+            masks_by_key.values(),
+            key=lambda mask: (mask.key),
+        )
+    )
+    records = tuple(_mask_record(mask) for mask in masks)
+    try:
+        runtime_seconds = float(propagation.runtime_seconds) if propagation is not None else 0.0
+        peak_vram_bytes = int(propagation.peak_vram_bytes) if propagation is not None else 0
+    except (TypeError, ValueError):
+        runtime_seconds = 0.0
+        peak_vram_bytes = 0
+        review_flags.add(_sam_review_flag("SAM_METRICS_MALFORMED", window))
+    if not math.isfinite(runtime_seconds) or runtime_seconds < 0 or peak_vram_bytes < 0:
+        runtime_seconds = 0.0
+        peak_vram_bytes = 0
+        review_flags.add(_sam_review_flag("SAM_METRICS_MALFORMED", window))
+    metrics = {
+        "n_prompts": len(prompts),
+        "n_valid_sam_masks": sum(1 for mask in masks if mask.source.startswith("sam2-")),
+        "n_rejected_sam_masks": rejected_count,
+        "n_fallback_masks": sum(1 for mask in masks if mask.source.endswith("fallback")),
+        "n_missing_frame_fallbacks": fallback_count,
+        "n_manual_fallback_masks": sum(
+            1 for mask in masks if mask.source == "manual-fallback"
+        ),
+        "n_masks": len(masks),
+        "mask_area_pixels_unioned_later": sum(mask.area_pixels for mask in masks),
+        "runtime_seconds": runtime_seconds,
+        "peak_vram_bytes": peak_vram_bytes,
+    }
+    meta = SamMaskShardMeta(
+        schema_version=STAGE2_SCHEMA_VERSION,
+        artifact_type="sam_mask_shard",
+        fingerprint=fingerprint_value,
+        dino_artifact_sha256=dino_artifact.sha256,
+        dino_fingerprint=dino_meta.fingerprint,
+        model=config.model,
+        accepted_proposal_threshold=config.accepted_proposal_threshold,
+        frame_start=window.frame_start,
+        frame_end=window.frame_end,
+        frame_width=width,
+        frame_height=height,
+        window={
+            "index": window.index,
+            "size": config.window_size,
+            "overlap": config.window_overlap,
+        },
+        precision=config.precision,
+        prompts=_sam_prompt_records(prompts),
+        masks=records,
+        review_flags=tuple(sorted(review_flags)),
+        metrics=metrics,
+    )
+    return meta, masks
+
+
+def validate_sam_mask_shard(
+    loaded: LoadedSamMaskShard,
+    *,
+    dino_artifact: ArtifactRef,
+    dino_meta: DinoArtifactMeta,
+    config: SamGenerationConfig,
+    window: TemporalWindow,
+    prompts: tuple[SamPrompt, ...],
+    fingerprint_value: str,
+    width: int,
+    height: int,
+) -> None:
+    meta = loaded.meta
+    expected = {
+        "fingerprint": fingerprint_value,
+        "dino_artifact_sha256": dino_artifact.sha256,
+        "dino_fingerprint": dino_meta.fingerprint,
+        "model": config.model,
+        "accepted_proposal_threshold": config.accepted_proposal_threshold,
+        "frame_start": window.frame_start,
+        "frame_end": window.frame_end,
+        "frame_width": width,
+        "frame_height": height,
+        "window": {
+            "index": window.index,
+            "size": config.window_size,
+            "overlap": config.window_overlap,
+        },
+        "precision": config.precision,
+        "prompts": _sam_prompt_records(prompts),
+    }
+    problems: list[str] = []
+    for field_name, expected_value in expected.items():
+        if getattr(meta, field_name) != expected_value:
+            problems.append(
+                f"{field_name}: expected {expected_value!r}, got {getattr(meta, field_name)!r}"
+            )
+    records = tuple(_mask_record(mask) for mask in loaded.masks)
+    if meta.masks != records:
+        problems.append("mask records do not match packed arrays")
+    prompt_by_id = {prompt.prompt_id: prompt for prompt in prompts}
+    prompt_frames: set[tuple[str, int]] = set()
+    anchor_fallbacks: set[str] = set()
+    valid_sources = {
+        "sam2-anchor",
+        "sam2-forward",
+        "sam2-reverse",
+        "dino-fallback",
+        "manual-fallback",
+    }
+    for mask in loaded.masks:
+        prompt = prompt_by_id.get(mask.prompt_id)
+        if prompt is None:
+            problems.append(f"mask {mask.key} references unknown prompt {mask.prompt_id}")
+            continue
+        if not window.frame_start <= mask.frame_idx <= window.frame_end:
+            problems.append(f"mask {mask.key} is outside its window")
+        if mask.anchor_frame != prompt.anchor_frame:
+            problems.append(f"mask {mask.key} has the wrong anchor frame")
+        if mask.source not in valid_sources:
+            problems.append(f"mask {mask.key} has invalid source {mask.source}")
+        x1, y1, x2, y2 = mask.crop_box
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            problems.append(f"mask {mask.key} crop is outside the frame")
+            continue
+        mask_size = (x2 - x1) * (y2 - y1)
+        if mask.source.endswith("fallback"):
+            expected_crop = padded_box(
+                prompt.box,
+                width=width,
+                height=height,
+                scale=config.fallback_padding_scale,
+                min_padding_px=config.fallback_min_padding_px,
+            )
+            if (
+                mask.crop_box != expected_crop
+                or mask.area_pixels != mask_size
+                or mask.packed_bits != _packed_ones(mask_size)
+            ):
+                problems.append(f"fallback mask {mask.key} is not the full padded prompt box")
+        elif mask.source.startswith("sam2-"):
+            rejection = reassess_packed_sam_mask(
+                mask,
+                prompt=prompt,
+                config=config,
+                width=width,
+                height=height,
+            )
+            if rejection is not None:
+                problems.append(f"stored SAM mask {mask.key} no longer passes validation")
+        prompt_frames.add((mask.prompt_id, mask.frame_idx))
+        expected_fallback = (
+            "dino-fallback" if prompt.prompt_kind == "dino" else "manual-fallback"
+        )
+        if mask.frame_idx == prompt.anchor_frame and mask.source == expected_fallback:
+            anchor_fallbacks.add(prompt.prompt_id)
+    for prompt in prompts:
+        if prompt.prompt_id not in anchor_fallbacks:
+            problems.append(f"prompt {prompt.prompt_id} has no immutable anchor fallback")
+        for frame_idx in range(window.frame_start, window.frame_end + 1):
+            if (prompt.prompt_id, frame_idx) not in prompt_frames:
+                problems.append(
+                    f"prompt {prompt.prompt_id} has no SAM or fallback mask at frame {frame_idx}"
+                )
+                break
+    expected_metrics = {
+        "n_prompts": len(prompts),
+        "n_valid_sam_masks": sum(
+            1 for mask in loaded.masks if mask.source.startswith("sam2-")
+        ),
+        "n_fallback_masks": sum(
+            1 for mask in loaded.masks if mask.source.endswith("fallback")
+        ),
+        "n_masks": len(loaded.masks),
+        "mask_area_pixels_unioned_later": sum(mask.area_pixels for mask in loaded.masks),
+        "n_manual_fallback_masks": sum(
+            1 for mask in loaded.masks if mask.source == "manual-fallback"
+        ),
+    }
+    for name, expected_value in expected_metrics.items():
+        if meta.metrics.get(name) != expected_value:
+            problems.append(f"metrics.{name} does not match shard contents")
+    for name in ("n_rejected_sam_masks", "n_missing_frame_fallbacks", "peak_vram_bytes"):
+        value = meta.metrics.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            problems.append(f"metrics.{name} must be a non-negative integer")
+    runtime = meta.metrics.get("runtime_seconds")
+    if not isinstance(runtime, (int, float)) or isinstance(runtime, bool) or not math.isfinite(runtime) or runtime < 0:
+        problems.append("metrics.runtime_seconds must be finite and non-negative")
+    if problems:
+        raise Stage2Error(
+            "INVALID_SAM_SHARD",
+            "SAM shard failed provenance or privacy validation.",
+            details={"problems": problems},
+            recovery="Explicitly recompute the affected SAM window.",
+        )
+
+
+def validate_sam_shard_set(
+    metas: tuple[SamMaskShardMeta, ...],
+    *,
+    n_frames: int,
+    window_size: int,
+    window_overlap: int,
+) -> None:
+    expected = temporal_windows(n_frames, window_size, window_overlap)
+    actual = tuple(
+        (meta.window.get("index"), meta.frame_start, meta.frame_end) for meta in metas
+    )
+    expected_ranges = tuple(
+        (window.index, window.frame_start, window.frame_end) for window in expected
+    )
+    if actual != expected_ranges:
+        raise Stage2Error(
+            "INCOMPLETE_SAM_SHARD_SET",
+            "SAM shard windows do not exactly cover the clip.",
+            details={"expected": expected_ranges, "actual": actual},
+        )
+
+
+def generate_sam_mask_shards(
+    *,
+    stage1: StageIInput,
+    paths: RunPaths,
+    dino_artifact: ArtifactRef,
+    dino_meta: DinoArtifactMeta,
+    config: SamGenerationConfig,
+    adapter: Any,
+    window_loader: Callable[[TemporalWindow], Any],
+    manual_seeds: tuple[ManualSeed, ...] = (),
+) -> SamGenerationResult:
+    validate_sam_config(config)
+    dino_path = Path(dino_artifact.path)
+    before_dino_read = file_stamp(dino_path)
+    stored_dino_meta = dino_meta_from_dict(read_json(dino_path))
+    after_dino_read = file_stamp(dino_path)
+    actual_dino_ref = artifact_ref(dino_path)
+    if before_dino_read != after_dino_read:
+        raise Stage2Error(
+            "DINO_ARTIFACT_CHANGED",
+            "DINO artifact changed while SAM was validating it.",
+        )
+    if actual_dino_ref != dino_artifact:
+        raise Stage2Error(
+            "DINO_ARTIFACT_CHANGED",
+            "DINO artifact changed before SAM processing.",
+        )
+    if stored_dino_meta != dino_meta:
+        raise Stage2Error(
+            "INVALID_DINO_ARTIFACT",
+            "Provided DINO metadata does not match its immutable artifact.",
+        )
+    if getattr(adapter, "identity", None) != config.model:
+        raise Stage2Error(
+            "SAM_MODEL_IDENTITY_MISMATCH",
+            "Loaded SAM adapter identity does not match the fingerprinted configuration.",
+        )
+    selection = select_dino_proposals(dino_meta, config.accepted_proposal_threshold)
+    seeds = validate_manual_seeds(manual_seeds, stage1)
+    windows = temporal_windows(
+        stage1.source_video.n_frames, config.window_size, config.window_overlap
+    )
+    shard_refs: list[ArtifactRef] = []
+    metas: list[SamMaskShardMeta] = []
+    reused = 0
+    generated = 0
+    for window in windows:
+        prompts = sam_prompts_for_window(window, selection.accepted, seeds)
+        fingerprint_payload = sam_window_fingerprint_payload(
+            dino_artifact=dino_artifact,
+            dino_meta=dino_meta,
+            config=config,
+            window=window,
+            prompts=prompts,
+        )
+        fingerprint_value = sam_fingerprint(fingerprint_payload)
+        shard_path = sam_shard_path(paths, window, fingerprint_value)
+        if shard_path.exists():
+            loaded = load_sam_mask_shard(shard_path)
+            validate_sam_mask_shard(
+                loaded,
+                dino_artifact=dino_artifact,
+                dino_meta=dino_meta,
+                config=config,
+                window=window,
+                prompts=prompts,
+                fingerprint_value=fingerprint_value,
+                width=stage1.source_video.display_width,
+                height=stage1.source_video.display_height,
+            )
+            shard_refs.append(loaded.artifact)
+            metas.append(loaded.meta)
+            reused += 1
+            continue
+
+        propagation: SamPropagationResult | None = None
+        propagation_failure: str | None = None
+        if prompts:
+            try:
+                window_input = validate_sam_window_input(
+                    window_loader(window), stage1=stage1, window=window
+                )
+            except Stage2Error as exc:
+                propagation_failure = exc.code
+            except Exception:
+                propagation_failure = "SAM_WINDOW_LOAD_FAILED"
+            else:
+                try:
+                    candidate = adapter.propagate_window(
+                        window_input=window_input.payload,
+                        window=window,
+                        prompts=prompts,
+                        width=stage1.source_video.display_width,
+                        height=stage1.source_video.display_height,
+                        precision=config.precision,
+                    )
+                    if not isinstance(candidate, SamPropagationResult):
+                        raise TypeError("adapter returned an unknown result type")
+                    propagation = candidate
+                except Exception:
+                    propagation_failure = "SAM_INFERENCE_FAILED"
+        else:
+            propagation = SamPropagationResult(
+                masks=(), forward_complete=True, reverse_complete=True
+            )
+        meta, masks = build_sam_mask_shard(
+            dino_artifact=dino_artifact,
+            dino_meta=dino_meta,
+            config=config,
+            window=window,
+            prompts=prompts,
+            fingerprint_value=fingerprint_value,
+            propagation=propagation,
+            propagation_failure=propagation_failure,
+            width=stage1.source_video.display_width,
+            height=stage1.source_video.display_height,
+        )
+        encoded = encode_sam_mask_shard(meta, masks)
+        shard_ref = write_immutable_bytes(shard_path, encoded)
+        loaded = load_sam_mask_shard(shard_path, expected_artifact=shard_ref)
+        validate_sam_mask_shard(
+            loaded,
+            dino_artifact=dino_artifact,
+            dino_meta=dino_meta,
+            config=config,
+            window=window,
+            prompts=prompts,
+            fingerprint_value=fingerprint_value,
+            width=stage1.source_video.display_width,
+            height=stage1.source_video.display_height,
+        )
+        shard_refs.append(shard_ref)
+        metas.append(loaded.meta)
+        generated += 1
+    meta_tuple = tuple(metas)
+    validate_sam_shard_set(
+        meta_tuple,
+        n_frames=stage1.source_video.n_frames,
+        window_size=config.window_size,
+        window_overlap=config.window_overlap,
+    )
+    return SamGenerationResult(
+        shards=tuple(shard_refs),
+        metas=meta_tuple,
+        reused_window_count=reused,
+        generated_window_count=generated,
+        review_flags=tuple(
+            sorted({flag for meta in meta_tuple for flag in meta.review_flags})
+        ),
+    )
+
+
+def union_sam_masks_for_frame(
+    shards: tuple[LoadedSamMaskShard, ...],
+    *,
+    frame_idx: int,
+    width: int,
+    height: int,
+) -> bytes:
+    relevant = tuple(
+        shard for shard in shards if shard.meta.frame_start <= frame_idx <= shard.meta.frame_end
+    )
+    if not relevant:
+        raise Stage2Error(
+            "SAM_SHARD_COVERAGE_GAP", f"No SAM shard covers frame {frame_idx}."
+        )
+    if width < 1 or height < 1 or any(
+        shard.meta.frame_width != width or shard.meta.frame_height != height
+        for shard in relevant
+    ):
+        raise Stage2Error(
+            "SAM_FRAME_SIZE_MISMATCH",
+            "SAM shard frame dimensions do not match the requested render frame.",
+        )
+    output = bytearray(width * height)
+    for shard in relevant:
+        for mask in shard.masks:
+            if mask.frame_idx != frame_idx:
+                continue
+            x1, y1, x2, y2 = mask.crop_box
+            crop_width = x2 - x1
+            crop_height = y2 - y1
+            pixels = _unpack_bits(mask.packed_bits, crop_width * crop_height)
+            for row in range(crop_height):
+                source_start = row * crop_width
+                destination_start = (y1 + row) * width + x1
+                for column, value in enumerate(
+                    pixels[source_start : source_start + crop_width]
+                ):
+                    if value:
+                        output[destination_start + column] = 1
+    return bytes(output)
+
+
+class MetaSam2VideoAdapter:
+    """Lazy boundary around Meta's official SAM2.1 video predictor.
+
+    The checkpoint and config must already exist locally and be verified by
+    setup. A window input is a directory of sequential JPEG frames whose
+    local index zero corresponds to ``window.frame_start``.
+    """
+
+    identity = ModelIdentity(
+        name=SAM_MODEL_ID,
+        revision=SAM_MODEL_REVISION,
+        sha256=SAM_MODEL_WEIGHTS_SHA256,
+    )
+
+    def __init__(
+        self,
+        *,
+        checkpoint_path: Path,
+        model_config: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
+        device: str = "cuda",
+    ) -> None:
+        checkpoint_path = resolve_input_file(checkpoint_path, "SAM2.1 checkpoint")
+        if sha256_file(checkpoint_path) != SAM_MODEL_WEIGHTS_SHA256:
+            raise Stage2Error(
+                "SAM_CHECKPOINT_HASH_MISMATCH",
+                "SAM2.1 checkpoint hash does not match the pinned model.",
+            )
+        try:
+            import torch
+            from sam2.build_sam import build_sam2_video_predictor
+        except ImportError as exc:
+            raise Stage2Error(
+                "SAM_DEPENDENCIES_MISSING",
+                "SAM2 runtime dependencies are not installed.",
+                recovery="Run the Stage II setup command before real SAM inference.",
+            ) from exc
+        self._torch = torch
+        self.device = device
+        try:
+            self.predictor = build_sam2_video_predictor(
+                model_config,
+                str(checkpoint_path),
+                device=device,
+                mode="eval",
+            )
+        except Exception as exc:
+            raise Stage2Error(
+                "SAM_MODEL_LOAD_FAILED",
+                "Pinned SAM2.1 Hiera Large model could not be loaded.",
+                details={"cause": str(exc)},
+                recovery="Run the Stage II setup model-load check.",
+            ) from exc
+
+    def _raw_masks_from_output(
+        self,
+        *,
+        frame_idx: int,
+        object_ids: Any,
+        logits: Any,
+        id_to_prompt: dict[int, SamPrompt],
+        direction: str,
+        width: int,
+        height: int,
+    ) -> tuple[RawSamMask, ...]:
+        masks = []
+        for position, object_id in enumerate(object_ids):
+            prompt = id_to_prompt.get(int(object_id))
+            if prompt is None:
+                continue
+            binary = (logits[position, 0] > 0).to(dtype=self._torch.uint8).cpu()
+            if tuple(binary.shape) != (height, width):
+                raise Stage2Error("INVALID_SAM_OUTPUT", "SAM returned the wrong mask dimensions.")
+            nonzero = binary.nonzero(as_tuple=False)
+            if nonzero.numel() == 0:
+                crop_box = (0, 0, 1, 1)
+                pixels = b"\x00"
+            else:
+                y1 = int(nonzero[:, 0].min().item())
+                y2 = int(nonzero[:, 0].max().item()) + 1
+                x1 = int(nonzero[:, 1].min().item())
+                x2 = int(nonzero[:, 1].max().item()) + 1
+                crop_box = (x1, y1, x2, y2)
+                pixels = bytes(binary[y1:y2, x1:x2].contiguous().view(-1).tolist())
+            masks.append(
+                RawSamMask(
+                    frame_idx=frame_idx,
+                    prompt_id=prompt.prompt_id,
+                    crop_box=crop_box,
+                    pixels=pixels,
+                    direction=direction,
+                )
+            )
+        return tuple(masks)
+
+    def propagate_window(
+        self,
+        *,
+        window_input: Any,
+        window: TemporalWindow,
+        prompts: tuple[SamPrompt, ...],
+        width: int,
+        height: int,
+        precision: str,
+    ) -> SamPropagationResult:
+        if not prompts:
+            return SamPropagationResult(
+                masks=(), forward_complete=True, reverse_complete=True
+            )
+        frame_dir = Path(window_input).resolve(strict=True)
+        if not frame_dir.is_dir():
+            raise Stage2Error("INVALID_SAM_WINDOW", "SAM window input must be a frame directory.")
+        dtype = {
+            "float32": self._torch.float32,
+            "float16": self._torch.float16,
+            "bfloat16": self._torch.bfloat16,
+        }[precision]
+        if self.device.startswith("cuda") and self._torch.cuda.is_available():
+            self._torch.cuda.reset_peak_memory_stats()
+            autocast = self._torch.autocast("cuda", dtype=dtype)
+        else:
+            autocast = contextlib.nullcontext()
+        started = time.perf_counter()
+        masks: list[RawSamMask] = []
+        forward_seen: set[int] = set()
+        reverse_seen: set[int] = set()
+        state = None
+        try:
+            with self._torch.inference_mode(), autocast:
+                state = self.predictor.init_state(video_path=str(frame_dir))
+                id_to_prompt = {
+                    index + 1: prompt for index, prompt in enumerate(prompts)
+                }
+                for object_id, prompt in id_to_prompt.items():
+                    self.predictor.add_new_points_or_box(
+                        inference_state=state,
+                        frame_idx=prompt.anchor_frame - window.frame_start,
+                        obj_id=object_id,
+                        box=prompt.box,
+                    )
+                earliest = min(prompt.anchor_frame for prompt in prompts) - window.frame_start
+                latest = max(prompt.anchor_frame for prompt in prompts) - window.frame_start
+                for local_frame, object_ids, logits in self.predictor.propagate_in_video(
+                    state,
+                    start_frame_idx=earliest,
+                    max_frame_num_to_track=window.n_frames - earliest,
+                    reverse=False,
+                ):
+                    global_frame = window.frame_start + int(local_frame)
+                    forward_seen.add(global_frame)
+                    masks.extend(
+                        self._raw_masks_from_output(
+                            frame_idx=global_frame,
+                            object_ids=object_ids,
+                            logits=logits,
+                            id_to_prompt=id_to_prompt,
+                            direction="forward",
+                            width=width,
+                            height=height,
+                        )
+                    )
+                for local_frame, object_ids, logits in self.predictor.propagate_in_video(
+                    state,
+                    start_frame_idx=latest,
+                    max_frame_num_to_track=latest + 1,
+                    reverse=True,
+                ):
+                    global_frame = window.frame_start + int(local_frame)
+                    reverse_seen.add(global_frame)
+                    masks.extend(
+                        self._raw_masks_from_output(
+                            frame_idx=global_frame,
+                            object_ids=object_ids,
+                            logits=logits,
+                            id_to_prompt=id_to_prompt,
+                            direction="reverse",
+                            width=width,
+                            height=height,
+                        )
+                    )
+        finally:
+            if state is not None:
+                reset = getattr(self.predictor, "reset_state", None)
+                if callable(reset):
+                    reset(state)
+        peak_vram = 0
+        if self.device.startswith("cuda") and self._torch.cuda.is_available():
+            peak_vram = int(self._torch.cuda.max_memory_allocated())
+        expected_forward = set(range(window.frame_start + earliest, window.frame_end + 1))
+        expected_reverse = set(range(window.frame_start, window.frame_start + latest + 1))
+        return SamPropagationResult(
+            masks=tuple(masks),
+            forward_complete=expected_forward.issubset(forward_seen),
+            reverse_complete=expected_reverse.issubset(reverse_seen),
+            runtime_seconds=time.perf_counter() - started,
+            peak_vram_bytes=peak_vram,
+        )
+
+
 @dataclass(slots=True, frozen=True)
 class FakeImage:
     width: int
@@ -1974,7 +3659,56 @@ class FakeDinoAdapter:
 
 
 class FakeSamAdapter:
-    identity = ModelIdentity(name="fake-sam2", revision="milestone-1", sha256="a" * 64)
+    identity = ModelIdentity(name="fake-sam2", revision="milestone-3", sha256="a" * 64)
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.windows: list[TemporalWindow] = []
+
+    def propagate_window(
+        self,
+        *,
+        window_input: Any,
+        window: TemporalWindow,
+        prompts: tuple[SamPrompt, ...],
+        width: int,
+        height: int,
+        precision: str,
+    ) -> SamPropagationResult:
+        del window_input, precision
+        self.calls += 1
+        self.windows.append(window)
+        masks = []
+        for prompt in prompts:
+            x1 = max(0, math.floor(prompt.box[0]))
+            y1 = max(0, math.floor(prompt.box[1]))
+            x2 = min(width, math.ceil(prompt.box[2]))
+            y2 = min(height, math.ceil(prompt.box[3]))
+            pixels = b"\x01" * ((x2 - x1) * (y2 - y1))
+            for frame_idx in range(window.frame_start, window.frame_end + 1):
+                direction = (
+                    "anchor"
+                    if frame_idx == prompt.anchor_frame
+                    else "forward"
+                    if frame_idx > prompt.anchor_frame
+                    else "reverse"
+                )
+                masks.append(
+                    RawSamMask(
+                        frame_idx=frame_idx,
+                        prompt_id=prompt.prompt_id,
+                        crop_box=(x1, y1, x2, y2),
+                        pixels=pixels,
+                        direction=direction,
+                    )
+                )
+        return SamPropagationResult(
+            masks=tuple(masks),
+            forward_complete=True,
+            reverse_complete=True,
+            runtime_seconds=0.0,
+            peak_vram_bytes=0,
+        )
 
     def propagate(
         self, proposals: tuple[Proposal, ...], frame_start: int, frame_end: int
@@ -2055,8 +3789,6 @@ def run_fake_pipeline(
         ),
     )
     dino_ref = dino_result.artifact
-    proposals = dino_result.meta.proposals
-    fake_frame_end = min(validated.source_video.n_frames - 1, 9)
     advance_state(
         paths.state,
         run_id=run_id,
@@ -2068,30 +3800,30 @@ def run_fake_pipeline(
     )
 
     sam = FakeSamAdapter()
-    sam_payload = {
-        "dino_artifact_sha256": dino_ref.sha256,
-        "model": _jsonable(sam.identity),
-        "accepted_proposal_threshold": 0.20,
-        "window": {
-            "start": 0,
-            "end": min(validated.source_video.n_frames - 1, 9),
-            "note": "bounded fake smoke window",
-        },
-        "manual_seeds_sha256": None,
-    }
-    sam_meta = SamMaskShardMeta(
-        schema_version=STAGE2_SCHEMA_VERSION,
-        artifact_type="sam_mask_shard",
-        fingerprint=sam_fingerprint(sam_payload),
-        dino_artifact_sha256=dino_ref.sha256,
-        model=sam.identity,
-        frame_start=0,
-        frame_end=fake_frame_end,
-        window={"mode": "fake", "overlap": 0},
-        masks=sam.propagate(proposals, 0, fake_frame_end),
-        review_flags=(),
+    sam_result = generate_sam_mask_shards(
+        stage1=validated,
+        paths=paths,
+        dino_artifact=dino_ref,
+        dino_meta=dino_result.meta,
+        config=SamGenerationConfig(
+            model=sam.identity,
+            accepted_proposal_threshold=0.20,
+            window_size=min(10, validated.source_video.n_frames),
+            window_overlap=min(2, max(0, validated.source_video.n_frames - 1)),
+            precision="float32",
+        ),
+        adapter=sam,
+        window_loader=lambda window: SamWindowInput(
+            source_sha256=validated.source.sha256,
+            frame_start=window.frame_start,
+            frame_end=window.frame_end,
+            frame_width=validated.source_video.display_width,
+            frame_height=validated.source_video.display_height,
+            payload=None,
+        ),
     )
-    sam_ref = write_immutable_json(paths.sam_shard, sam_meta)
+    sam_refs = sam_result.shards
+    mask_set_sha256 = artifact_set_sha256(sam_refs)
     advance_state(
         paths.state,
         run_id=run_id,
@@ -2104,7 +3836,7 @@ def run_fake_pipeline(
 
     render_payload = {
         "stage1_video_sha256": validated.stage1_video.sha256,
-        "mask_set_sha256": sam_ref.sha256,
+        "mask_set_sha256": mask_set_sha256,
         "dilation": {"pixels_at_1080p": 8},
         "encoder": {"mode": "fake-no-video"},
     }
@@ -2115,7 +3847,7 @@ def run_fake_pipeline(
             "mode": "fake",
             "clip_id": validated.clip_id,
             "stage1_video_sha256": validated.stage1_video.sha256,
-            "mask_set_sha256": sam_ref.sha256,
+            "mask_set_sha256": mask_set_sha256,
         },
     )
     render_meta = RenderArtifactMeta(
@@ -2123,7 +3855,7 @@ def run_fake_pipeline(
         artifact_type="render",
         fingerprint=render_fingerprint(render_payload),
         stage1_video_sha256=validated.stage1_video.sha256,
-        mask_set_sha256=sam_ref.sha256,
+        mask_set_sha256=mask_set_sha256,
         output=fake_output,
         encoder={"mode": "fake-no-video"},
         verification={"mode": "fake", "passed": True, "publishable": False},
@@ -2150,7 +3882,7 @@ def run_fake_pipeline(
         review_status="NOT_REVIEWABLE_FAKE",
         stage1=validated,
         dino_artifact=dino_ref,
-        sam_mask_shards=(sam_ref,),
+        sam_mask_shards=sam_refs,
         render_artifact=render_ref,
     )
     write_immutable_json(paths.manifest, manifest)
