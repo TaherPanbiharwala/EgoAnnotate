@@ -124,6 +124,42 @@ def test_nonzero_legacy_integrity_findings_do_not_reject_proven_stage1(stage2_jo
     assert any("23216" in warning for warning in result.warnings)
 
 
+def test_zero_redaction_needs_review_clip_is_valid_stage2_input(stage2_job, tmp_path):
+    source, stage1, manifest_path, manifest = _inputs(
+        stage2_job, tmp_path, status="NEEDS_REVIEW", violations=0
+    )
+    zero_reason = (
+        "ZERO frames had a FACE redacted and nothing corroborates that — "
+        "detection may have failed silently. Check before shipping."
+    )
+    manifest["audit"]["fill_integrity_checked"] = 0
+    manifest["audit"]["status_reasons"] = [zero_reason]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    result = stage2_job.validate_stage1(
+        source,
+        stage1,
+        manifest_path,
+        probe_fn=_probe(stage2_job, source, stage1),
+    )
+    assert result.stage1_status == "NEEDS_REVIEW"
+    assert result.stage1_audit_reasons == (zero_reason,)
+
+
+def test_zero_integrity_checks_without_zero_redaction_reason_fail(stage2_job, tmp_path):
+    source, stage1, manifest_path, manifest = _inputs(stage2_job, tmp_path)
+    manifest["audit"]["fill_integrity_checked"] = 0
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.validate_stage1(
+            source,
+            stage1,
+            manifest_path,
+            probe_fn=_probe(stage2_job, source, stage1),
+        )
+    assert caught.value.code == "STAGE1_VALIDATION_FAILED"
+    assert any("may be zero only" in item for item in caught.value.details["problems"])
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
@@ -293,6 +329,17 @@ def test_run_and_clip_ids_cannot_escape_the_work_directory(stage2_job, tmp_path,
     assert caught.value.code == "UNSAFE_PATH_COMPONENT"
 
 
+def test_run_paths_reject_preexisting_symlink_escape(stage2_job, tmp_path):
+    work = tmp_path / "work"
+    outside = tmp_path / "outside"
+    work.mkdir()
+    outside.mkdir()
+    (work / "runs").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.build_run_paths(work, "run", "clip")
+    assert caught.value.code == "UNSAFE_OUTPUT_LOCATION"
+
+
 def test_layered_fingerprints_are_stable_and_scoped(stage2_job):
     dino = {"source": "a", "prompt": "face.", "threshold": 0.10}
     first = stage2_job.dino_fingerprint(dino)
@@ -449,12 +496,87 @@ def test_fake_pipeline_is_deterministic_resumable_and_not_review_accepted(stage2
     assert json.loads(paths.manifest.read_text())["mode"] == "fake"
 
 
-def test_fake_adapters_are_repeatable(stage2_job):
-    dino = stage2_job.FakeDinoAdapter()
-    proposals = dino.detect(20, 1920, 1080)
-    assert proposals == dino.detect(20, 1920, 1080)
-    sam = stage2_job.FakeSamAdapter()
-    assert sam.propagate(proposals, 18, 22) == sam.propagate(proposals, 18, 22)
+def test_fake_run_cli_accepts_real_three_frame_fixture(stage2_job, tmp_path, capsys):
+    ffmpeg = stage2_job.shutil.which("ffmpeg")
+    if ffmpeg is None or stage2_job.shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg and ffprobe are required for the real fixture acceptance test")
+    source, stage1, manifest_path, manifest = _inputs(stage2_job, tmp_path / "inputs")
+    completed = stage2_job.subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=100x80:r=30:d=0.1",
+            "-frames:v",
+            "3",
+            "-c:v",
+            "mpeg4",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+            str(source),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    stage1.write_bytes(source.read_bytes())
+    facts = stage2_job.probe_video(source)
+    manifest["source"].update(
+        {
+            "sha256": stage2_job.sha256_file(source),
+            "width": facts.display_width,
+            "height": facts.display_height,
+            "fps": facts.fps,
+            "n_frames": facts.n_frames,
+            "duration_s": facts.duration_s,
+            "rotation": facts.rotation,
+        }
+    )
+    manifest["output"].update(
+        {
+            "sha256": stage2_job.sha256_file(stage1),
+            "bytes": stage1.stat().st_size,
+        }
+    )
+    manifest["audit"].update(
+        {
+            "fill_integrity_checked": 0,
+            "fill_integrity_violations": 0,
+            "fill_integrity_frames": facts.n_frames,
+            "status_reasons": [
+                "ZERO frames had a FACE redacted and nothing corroborates that — "
+                "detection may have failed silently. Check before shipping."
+            ],
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    work = tmp_path / "work"
+    exit_code = stage2_job.main(
+        [
+            "--json",
+            "fake-run",
+            "--source-video",
+            str(source),
+            "--stage1-video",
+            str(stage1),
+            "--stage1-manifest",
+            str(manifest_path),
+            "--work-dir",
+            str(work),
+            "--run-id",
+            "three-frame-fixture",
+        ]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["processing_state"] == "PROCESSING_COMPLETE"
+    assert output["review_status"] == "NOT_REVIEWABLE_FAKE"
 
 
 def test_schema_records_keep_review_separate_from_processing(stage2_job):

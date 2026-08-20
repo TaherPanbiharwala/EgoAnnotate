@@ -700,14 +700,30 @@ def build_run_paths(work_dir: Path, run_id: str, clip_id: str) -> RunPaths:
     clip_id = safe_component(clip_id, "clip_id")
     work_dir = work_dir.expanduser().resolve()
     root = work_dir / "runs" / run_id / clip_id
+    for candidate in (work_dir / "runs", work_dir / "runs" / run_id, root):
+        if candidate.is_symlink():
+            raise Stage2Error(
+                "UNSAFE_OUTPUT_LOCATION",
+                f"Stage II output path contains a symbolic link: {candidate}",
+                recovery="Remove the symbolic link or choose a different work directory.",
+            )
+    resolved_root = root.resolve(strict=False)
+    try:
+        resolved_root.relative_to(work_dir)
+    except ValueError as exc:
+        raise Stage2Error(
+            "UNSAFE_OUTPUT_LOCATION",
+            "Stage II output path escapes the selected work directory.",
+            details={"work_dir": str(work_dir), "output": str(resolved_root)},
+        ) from exc
     return RunPaths(
-        root=root,
-        state=root / "state.json",
-        manifest=root / "processing.manifest.json",
-        dino=root / "dino" / "artifact.json",
-        dino_checkpoint=root / "dino" / "checkpoint.jsonl",
-        sam_dir=root / "sam",
-        render=root / "render" / "artifact.json",
+        root=resolved_root,
+        state=resolved_root / "state.json",
+        manifest=resolved_root / "processing.manifest.json",
+        dino=resolved_root / "dino" / "artifact.json",
+        dino_checkpoint=resolved_root / "dino" / "checkpoint.jsonl",
+        sam_dir=resolved_root / "sam",
+        render=resolved_root / "render" / "artifact.json",
     )
 
 
@@ -718,7 +734,7 @@ def _parse_rate(value: str | None, *, path: Path, field_name: str) -> float:
             f"ffprobe omitted {field_name} for {path}",
         )
     try:
-        numerator, denominator = (value.split("/") + ["1"])[:2]
+        numerator, denominator = [*value.split("/"), "1"][:2]
         result = float(numerator) / float(denominator)
     except (ValueError, ZeroDivisionError) as exc:
         raise Stage2Error(
@@ -965,8 +981,10 @@ def validate_stage1(
     if audit.get("integrity_ran") is not True:
         problems.append("audit.integrity_ran must be true")
     checked = audit.get("fill_integrity_checked")
-    if not isinstance(checked, int) or checked <= 0:
-        problems.append(f"audit.fill_integrity_checked must be positive, got {checked!r}")
+    if not isinstance(checked, int) or isinstance(checked, bool) or checked < 0:
+        problems.append(
+            f"audit.fill_integrity_checked must be a non-negative integer, got {checked!r}"
+        )
     integrity_frames = audit.get("fill_integrity_frames")
     if integrity_frames != source_facts.n_frames:
         problems.append(
@@ -978,6 +996,14 @@ def validate_stage1(
     if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
         problems.append("audit.status_reasons must be a list of strings")
         reasons = []
+    if checked == 0 and (
+        status != "NEEDS_REVIEW"
+        or not any("ZERO frames had a FACE redacted" in reason for reason in reasons)
+    ):
+        problems.append(
+            "audit.fill_integrity_checked may be zero only for a NEEDS_REVIEW clip "
+            "with EgoBlur's zero-face-redaction review reason"
+        )
     if status == "NEEDS_REVIEW":
         warnings.extend(f"Stage I review reason: {reason}" for reason in reasons)
     violations = audit.get("fill_integrity_violations")
@@ -2135,13 +2161,18 @@ def temporal_windows(
 
 
 def _valid_frame_box(
-    box: tuple[float, float, float, float], width: int, height: int
+    box: Any, width: int, height: int
 ) -> bool:
+    if not isinstance(box, (tuple, list)) or len(box) != 4 or any(
+        not isinstance(value, (int, float)) or isinstance(value, bool)
+        for value in box
+    ):
+        return False
+    x1, y1, x2, y2 = box
     return (
-        len(box) == 4
-        and all(math.isfinite(value) for value in box)
-        and 0.0 <= box[0] < box[2] <= width
-        and 0.0 <= box[1] < box[3] <= height
+        all(math.isfinite(value) for value in (x1, y1, x2, y2))
+        and 0.0 <= x1 < x2 <= width
+        and 0.0 <= y1 < y2 <= height
     )
 
 
@@ -2169,18 +2200,34 @@ def validate_manual_seeds(
     seeds: tuple[ManualSeed, ...], stage1: StageIInput
 ) -> tuple[ManualSeed, ...]:
     seen: set[str] = set()
-    ordered = sorted(seeds, key=lambda seed: (seed.frame_idx, seed.seed_id))
-    for seed in ordered:
+    validated: list[ManualSeed] = []
+    for seed in seeds:
+        if not isinstance(seed, ManualSeed):
+            raise Stage2Error(
+                "INVALID_MANUAL_SEED",
+                "Manual seeds must use the versioned ManualSeed schema.",
+            )
         problems = []
-        if seed.schema_version != STAGE2_SCHEMA_VERSION:
+        if (
+            not isinstance(seed.schema_version, int)
+            or isinstance(seed.schema_version, bool)
+            or seed.schema_version != STAGE2_SCHEMA_VERSION
+        ):
             problems.append("schema_version")
         if seed.clip_id != stage1.clip_id:
             problems.append("clip_id")
-        if not _SAFE_COMPONENT.fullmatch(seed.seed_id) or seed.seed_id in {".", ".."}:
+        if not isinstance(seed.seed_id, str):
             problems.append("seed_id")
-        if seed.seed_id in seen:
-            problems.append("duplicate seed_id")
-        if not 0 <= seed.frame_idx < stage1.source_video.n_frames:
+        else:
+            if not _SAFE_COMPONENT.fullmatch(seed.seed_id) or seed.seed_id in {".", ".."}:
+                problems.append("seed_id")
+            if seed.seed_id in seen:
+                problems.append("duplicate seed_id")
+        if (
+            not isinstance(seed.frame_idx, int)
+            or isinstance(seed.frame_idx, bool)
+            or not 0 <= seed.frame_idx < stage1.source_video.n_frames
+        ):
             problems.append("frame_idx")
         if not _valid_frame_box(
             seed.box,
@@ -2188,7 +2235,7 @@ def validate_manual_seeds(
             stage1.source_video.display_height,
         ):
             problems.append("box")
-        if not seed.reason.strip():
+        if not isinstance(seed.reason, str) or not seed.reason.strip():
             problems.append("reason")
         if problems:
             raise Stage2Error(
@@ -2197,7 +2244,8 @@ def validate_manual_seeds(
                 details={"problems": problems},
             )
         seen.add(seed.seed_id)
-    return tuple(ordered)
+        validated.append(seed)
+    return tuple(sorted(validated, key=lambda seed: (seed.frame_idx, seed.seed_id)))
 
 
 def sam_prompts_for_window(
@@ -3800,6 +3848,7 @@ def run_fake_pipeline(
     )
 
     sam = FakeSamAdapter()
+    sam_window_size = min(10, validated.source_video.n_frames)
     sam_result = generate_sam_mask_shards(
         stage1=validated,
         paths=paths,
