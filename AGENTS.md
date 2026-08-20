@@ -3,8 +3,9 @@
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
 repo cold. Written 2026-08-11 and updated on the Stage II feature branch on
 2026-08-20. The branch includes clean `master` baseline **`9acfe07`** plus
-the Stage II plan and Milestone 1 implementation. 318 tests pass
-(`uv run --extra test pytest tests/ -q`). Run `git status` and read
+the Stage II plan and Milestones 1-2 implementation. The full suite is
+**356 tests** as of this update (`uv run --extra test pytest tests/ -q`).
+Run `git status` and read
 `STAGE2_DEIDENTIFICATION_PLAN.md` before changing either GPU stage.
 
 If you're an agent starting a fresh session here, read this whole file
@@ -50,11 +51,13 @@ jobs/10_blur_egoblur.py     first GPU job. Self-contained PEP 723 script
                              tested and heavily reviewed — read its module
                              docstring before changing anything in it.
 jobs/20_deidentify_stage2.py
-                             Stage II self-contained PEP 723 job. Milestone 1
-                             currently contains schemas, strict Stage I
-                             validation, layered fingerprints, atomic state,
-                             immutable artifacts, and deterministic fake
-                             DINO/SAM adapters — no real models yet.
+                             Stage II self-contained PEP 723 job. Milestones
+                             1-2 contain schemas, strict Stage I validation,
+                             layered fingerprints, atomic state, immutable
+                             artifacts, full/tiled DINO orchestration, anchor
+                             checkpoints, threshold reuse, and deterministic
+                             fake DINO/SAM adapters. The real DINO adapter is
+                             lazy/cache-only; no production model command yet.
 jobs/_contract.py           the shard-metadata contract other future GPU
                              jobs (hand-pose, depth, SLAM) will vendor by
                              copy — NOT imported (see PEP 723 section).
@@ -96,7 +99,7 @@ models.toml                 VLM model registry. Ships with placeholder
                              entries; needs 2 real models from DIFFERENT
                              labs (see file's own comments on why) before
                              any real captioning run.
-tests/                       pytest, 318 tests. Run before AND after any
+tests/                       pytest suite (356 tests). Run before AND after any
                              change: `uv run --extra test pytest tests/ -q`
 handover.md                  a PREVIOUS session's own continuation notes.
                              Tracked in git (not gitignored) — read it,
@@ -171,7 +174,7 @@ and pinned with a regression test:
 | Stage | Status |
 |---|---|
 | EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
-| Stage II DINO/SAM2 | Milestone 1 complete on `feature/stage2-deidentification`: schemas, Stage I validation, fingerprints, atomic state/immutable artifacts, fake adapters, and local commands. No real DINO/SAM inference or publishable rendering exists yet. Continue with Milestone 2 in `STAGE2_DEIDENTIFICATION_PLAN.md`. |
+| Stage II DINO/SAM2 | Milestones 1-2 complete on `feature/stage2-deidentification`: contracts plus full/tiled DINO proposal orchestration, per-anchor resume, provenance/NMS metrics, threshold reuse, and a pinned lazy official adapter. No real DINO/SAM inference or publishable rendering exists yet. Continue with Milestone 3 in `STAGE2_DEIDENTIFICATION_PLAN.md`. |
 | MediaPipe hands | Code complete, unit-tested, proven working (Metal-accelerated, fast). Never run against real *redacted* output — only a synthetic test clip. |
 | VLM captioning | Code complete, unit-tested. `models.toml` still has placeholder model IDs / $0.00 prices — cannot run for real until filled in with two real models from different labs. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |

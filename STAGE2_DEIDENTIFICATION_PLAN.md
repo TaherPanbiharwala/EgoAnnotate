@@ -1,13 +1,13 @@
 # Stage II EgoBlur + DINO/SAM2 De-identification Plan
 
-Status: Milestone 1 complete; Milestone 2 next
+Status: Milestones 1-2 complete; Milestone 3 next
 
 Saved: 2026-08-18; milestone structure updated 2026-08-20
 
 | Milestone | Status |
 |---|---|
 | 1. Contracts, validation, and local skeleton | Complete — 2026-08-20 |
-| 2. DINO proposal generation and reuse | Not started |
+| 2. DINO proposal generation and reuse | Complete — 2026-08-20 |
 | 3. SAM2 propagation and mask shards | Not started |
 | 4. Rendering and technical verification | Not started |
 | 5. Labels, review workflow, and operator UX | Not started |
@@ -58,6 +58,16 @@ bash scripts/runpod_stage2.sh status \
 ```
 
 Add `--json` before the subcommand for machine-readable output. A fake run records `NOT_RUN_FAKE` and `NOT_REVIEWABLE_FAKE`; it may never be accepted or released.
+
+## Milestone 2 DINO contract
+
+- The official model identity is pinned to `IDEA-Research/grounding-dino-base` revision `e76a695ed7ae1032a61530cce4b4e9b65f4e368b`, using `model.safetensors` SHA-256 `5548f844c928c4b6f411fa8cbcc2bfa8dbbba437cb1d513975519f93c2a9ed21`.
+- Anchors are frame `0`, every `20` frames, and the final frame. Every anchor uses the full frame plus four 2x2 tiles with 20% adjacent-tile overlap.
+- DINO retains boxes at or above `0.10`, uses text threshold `0.25`, and unions duplicate full/tiled proposals with conservative `0.70` IoU NMS. Every kept proposal records whether it was full-frame-only, tiled-only, or shared.
+- Each completed anchor is fsynced to a fingerprinted JSONL checkpoint. Compatible resume skips completed anchors; a torn final row is repaired; corruption before the final row or any fingerprint mismatch fails closed.
+- The final immutable DINO artifact records the source/model/prompt/preprocessing/tiling/anchor/NMS fingerprint, proposal IDs and scores, source counts, suppressed counts, runtime, peak VRAM, and checkpoint hash.
+- Operating thresholds `0.15`-`0.30` select from the same stored `0.10` proposal artifact and report accepted/rejected counts. A requested threshold below `0.10` requires DINO recomputation.
+- `fake-run` now exercises this complete orchestration locally. The real Transformers adapter is lazy, cache-only, and not yet exposed by a production command; dependency installation, asset verification, and GPU execution remain deferred to the setup/smoke milestones.
 
 ## Architecture
 

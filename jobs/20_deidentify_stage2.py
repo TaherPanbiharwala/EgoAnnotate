@@ -23,14 +23,25 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 STAGE2_SCHEMA_VERSION = 1
-STAGE2_CODE_VERSION = "milestone-1"
-STAGE2_JOB_VERSION = "0.1.0"
+STAGE2_CODE_VERSION = "milestone-2"
+STAGE2_JOB_VERSION = "0.2.0"
+
+DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
+DINO_MODEL_REVISION = "e76a695ed7ae1032a61530cce4b4e9b65f4e368b"
+DINO_MODEL_WEIGHTS_SHA256 = "5548f844c928c4b6f411fa8cbcc2bfa8dbbba437cb1d513975519f93c2a9ed21"
+DINO_PROMPT = "face."
+DINO_PROPOSAL_FLOOR = 0.10
+DINO_TEXT_THRESHOLD = 0.25
+DINO_ANCHOR_SPACING = 20
+DINO_TILE_OVERLAP = 0.20
+DINO_NMS_IOU = 0.70
 
 EXPECTED_STAGE1 = {
     "gen": "2",
@@ -131,6 +142,52 @@ class Proposal:
     box: tuple[float, float, float, float]
     score: float
     source: str
+    label: str = "face"
+    proposal_id: str = ""
+    origins: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class RawDinoDetection:
+    box: tuple[float, float, float, float]
+    score: float
+    label: str = "face"
+
+
+@dataclass(slots=True, frozen=True)
+class DinoGenerationConfig:
+    model: ModelIdentity
+    prompt: str = DINO_PROMPT
+    proposal_floor: float = DINO_PROPOSAL_FLOOR
+    text_threshold: float = DINO_TEXT_THRESHOLD
+    anchor_spacing: int = DINO_ANCHOR_SPACING
+    tile_rows: int = 2
+    tile_cols: int = 2
+    tile_overlap: float = DINO_TILE_OVERLAP
+    nms_iou: float = DINO_NMS_IOU
+    view_batch_size: int = 1
+    preprocessing: tuple[tuple[str, Any], ...] = (
+        ("color", "RGB"),
+        ("resize", "model-default"),
+        ("normalization", "model-default"),
+    )
+
+
+@dataclass(slots=True, frozen=True)
+class Tile:
+    origin: str
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+    @property
+    def width(self) -> int:
+        return self.x2 - self.x1
+
+    @property
+    def height(self) -> int:
+        return self.y2 - self.y1
 
 
 @dataclass(slots=True, frozen=True)
@@ -142,8 +199,38 @@ class DinoArtifactMeta:
     model: ModelIdentity
     prompt: str
     proposal_floor: float
+    text_threshold: float
+    anchor_spacing: int
+    anchor_frames: tuple[int, ...]
+    tiling: dict[str, Any]
+    nms_iou: float
     preprocessing: dict[str, Any]
     proposals: tuple[Proposal, ...]
+    metrics: dict[str, Any]
+
+
+@dataclass(slots=True, frozen=True)
+class DinoGenerationResult:
+    artifact: ArtifactRef
+    meta: DinoArtifactMeta
+    reused_final_artifact: bool
+    reused_anchor_count: int
+    generated_anchor_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class DinoThresholdSelection:
+    threshold: float
+    accepted: tuple[Proposal, ...]
+    rejected: tuple[Proposal, ...]
+
+    @property
+    def metrics(self) -> dict[str, int | float]:
+        return {
+            "threshold": self.threshold,
+            "n_accepted": len(self.accepted),
+            "n_rejected": len(self.rejected),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -247,6 +334,7 @@ class RunPaths:
     state: Path
     manifest: Path
     dino: Path
+    dino_checkpoint: Path
     sam_shard: Path
     render: Path
 
@@ -264,9 +352,21 @@ def _jsonable(value: Any) -> Any:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        _jsonable(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    try:
+        encoded = json.dumps(
+            _jsonable(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise Stage2Error(
+            "INVALID_JSON_VALUE",
+            "Artifact data is not finite or JSON-serializable.",
+            details={"cause": str(exc)},
+        ) from exc
+    return encoded.encode("utf-8")
 
 
 def fingerprint(kind: str, payload: dict[str, Any]) -> str:
@@ -443,6 +543,7 @@ def build_run_paths(work_dir: Path, run_id: str, clip_id: str) -> RunPaths:
         state=root / "state.json",
         manifest=root / "processing.manifest.json",
         dino=root / "dino" / "artifact.json",
+        dino_checkpoint=root / "dino" / "checkpoint.jsonl",
         sam_shard=root / "sam" / "window-000000.json",
         render=root / "render" / "artifact.json",
     )
@@ -893,10 +994,970 @@ def advance_state(
     )
 
 
+def validate_dino_config(config: DinoGenerationConfig) -> None:
+    problems = []
+    if not config.prompt.strip() or not config.prompt.endswith("."):
+        problems.append("prompt must be non-empty and end with a period")
+    for name, value in (
+        ("proposal_floor", config.proposal_floor),
+        ("text_threshold", config.text_threshold),
+        ("nms_iou", config.nms_iou),
+    ):
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            problems.append(f"{name} must be finite and in (0, 1], got {value!r}")
+    if config.anchor_spacing < 1:
+        problems.append("anchor_spacing must be at least 1")
+    if config.tile_rows < 1 or config.tile_cols < 1:
+        problems.append("tile_rows and tile_cols must be at least 1")
+    if not math.isfinite(config.tile_overlap) or not 0.0 <= config.tile_overlap < 1.0:
+        problems.append("tile_overlap must be finite and in [0, 1)")
+    if config.view_batch_size < 1:
+        problems.append("view_batch_size must be at least 1")
+    preprocessing_keys = [key for key, _value in config.preprocessing]
+    if len(preprocessing_keys) != len(set(preprocessing_keys)):
+        problems.append("preprocessing keys must be unique")
+    if not re.fullmatch(r"[0-9a-f]{64}", config.model.sha256):
+        problems.append("model.sha256 must be a lowercase 64-character SHA-256")
+    if problems:
+        raise Stage2Error(
+            "INVALID_DINO_CONFIG",
+            "DINO configuration is invalid.",
+            details={"problems": problems},
+        )
+
+
+def anchor_schedule(n_frames: int, spacing: int) -> tuple[int, ...]:
+    if n_frames < 1:
+        raise Stage2Error("INVALID_ANCHOR_SCHEDULE", "n_frames must be at least 1")
+    if spacing < 1:
+        raise Stage2Error("INVALID_ANCHOR_SCHEDULE", "anchor spacing must be at least 1")
+    anchors = list(range(0, n_frames, spacing))
+    if anchors[-1] != n_frames - 1:
+        anchors.append(n_frames - 1)
+    return tuple(anchors)
+
+
+def _axis_windows(length: int, count: int, overlap: float) -> tuple[tuple[int, int], ...]:
+    if length < count:
+        raise Stage2Error(
+            "INVALID_TILE_LAYOUT",
+            f"Cannot split length {length} into {count} positive tiles.",
+        )
+    if count == 1:
+        return ((0, length),)
+    tile_size = min(length, math.ceil(length / (count - (count - 1) * overlap)))
+    travel = length - tile_size
+    starts = [round(index * travel / (count - 1)) for index in range(count)]
+    starts[0] = 0
+    starts[-1] = travel
+    return tuple((start, start + tile_size) for start in starts)
+
+
+def tile_layout(
+    width: int,
+    height: int,
+    *,
+    rows: int = 2,
+    cols: int = 2,
+    overlap: float = DINO_TILE_OVERLAP,
+) -> tuple[Tile, ...]:
+    if width < 1 or height < 1:
+        raise Stage2Error("INVALID_TILE_LAYOUT", "Frame dimensions must be positive.")
+    if rows < 1 or cols < 1 or not 0.0 <= overlap < 1.0:
+        raise Stage2Error("INVALID_TILE_LAYOUT", "Rows, columns, or overlap are invalid.")
+    x_windows = _axis_windows(width, cols, overlap)
+    y_windows = _axis_windows(height, rows, overlap)
+    return tuple(
+        Tile(
+            origin=f"tile-r{row}-c{col}",
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+        )
+        for row, (y1, y2) in enumerate(y_windows)
+        for col, (x1, x2) in enumerate(x_windows)
+    )
+
+
+def _image_size(image: Any) -> tuple[int, int]:
+    size = getattr(image, "size", None)
+    if not isinstance(size, (tuple, list)) or len(size) != 2:
+        raise Stage2Error(
+            "INVALID_FRAME",
+            "Decoded frame must expose PIL-compatible size=(width, height).",
+        )
+    width, height = int(size[0]), int(size[1])
+    if width < 1 or height < 1:
+        raise Stage2Error("INVALID_FRAME", f"Decoded frame has invalid size {size!r}")
+    return width, height
+
+
+def frame_views(
+    image: Any, *, rows: int, cols: int, overlap: float
+) -> tuple[tuple[Tile, Any], ...]:
+    width, height = _image_size(image)
+    full = Tile(origin="full-frame", x1=0, y1=0, x2=width, y2=height)
+    views: list[tuple[Tile, Any]] = [(full, image)]
+    for tile in tile_layout(width, height, rows=rows, cols=cols, overlap=overlap):
+        try:
+            crop = image.crop((tile.x1, tile.y1, tile.x2, tile.y2))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise Stage2Error(
+                "INVALID_FRAME",
+                "Decoded frame does not support PIL-compatible crop().",
+            ) from exc
+        if _image_size(crop) != (tile.width, tile.height):
+            raise Stage2Error(
+                "INVALID_FRAME",
+                f"Crop {tile.origin} returned the wrong dimensions.",
+            )
+        views.append((tile, crop))
+    return tuple(views)
+
+
+def _box_area(box: tuple[float, float, float, float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def box_iou(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    x1 = max(first[0], second[0])
+    y1 = max(first[1], second[1])
+    x2 = min(first[2], second[2])
+    y2 = min(first[3], second[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = _box_area(first) + _box_area(second) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _source_class(origins: tuple[str, ...]) -> str:
+    has_full = "full-frame" in origins
+    has_tile = any(origin.startswith("tile-") for origin in origins)
+    if has_full and has_tile:
+        return "shared"
+    if has_full:
+        return "full-frame-only"
+    return "tiled-only"
+
+
+def _proposal_id(proposal: Proposal) -> str:
+    payload = {
+        "frame_idx": proposal.frame_idx,
+        "box": proposal.box,
+        "score": proposal.score,
+        "label": proposal.label,
+        "origins": proposal.origins,
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()[:24]
+
+
+def _finalize_proposal(proposal: Proposal) -> Proposal:
+    origins = tuple(sorted(set(proposal.origins)))
+    if not origins or any(
+        origin != "full-frame" and not re.fullmatch(r"tile-r\d+-c\d+", origin)
+        for origin in origins
+    ):
+        raise Stage2Error(
+            "INVALID_DINO_OUTPUT",
+            f"DINO proposal has invalid origins: {proposal.origins!r}",
+        )
+    updated = replace(proposal, source=_source_class(origins), origins=origins, proposal_id="")
+    return replace(updated, proposal_id=_proposal_id(updated))
+
+
+def map_raw_detection(
+    raw: RawDinoDetection,
+    *,
+    frame_idx: int,
+    tile: Tile,
+    frame_width: int,
+    frame_height: int,
+    proposal_floor: float,
+) -> Proposal | None:
+    try:
+        score = float(raw.score)
+        local = tuple(float(value) for value in raw.box)
+    except (TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_DINO_OUTPUT", "DINO returned non-numeric output.") from exc
+    if len(local) != 4 or not all(math.isfinite(value) for value in (*local, score)):
+        raise Stage2Error("INVALID_DINO_OUTPUT", "DINO returned non-finite box/score values.")
+    if not 0.0 <= score <= 1.0:
+        raise Stage2Error("INVALID_DINO_OUTPUT", f"DINO returned score outside [0, 1]: {score}")
+    if score < proposal_floor:
+        return None
+    x1 = min(max(local[0], 0.0), float(tile.width))
+    y1 = min(max(local[1], 0.0), float(tile.height))
+    x2 = min(max(local[2], 0.0), float(tile.width))
+    y2 = min(max(local[3], 0.0), float(tile.height))
+    if x2 <= x1 or y2 <= y1:
+        raise Stage2Error(
+            "INVALID_DINO_OUTPUT",
+            f"DINO returned a degenerate/outside box {raw.box!r} for {tile.origin}.",
+        )
+    global_box = (
+        min(max(x1 + tile.x1, 0.0), float(frame_width)),
+        min(max(y1 + tile.y1, 0.0), float(frame_height)),
+        min(max(x2 + tile.x1, 0.0), float(frame_width)),
+        min(max(y2 + tile.y1, 0.0), float(frame_height)),
+    )
+    label = str(raw.label).strip() or "face"
+    return _finalize_proposal(
+        Proposal(
+            frame_idx=frame_idx,
+            box=global_box,
+            score=score,
+            source="",
+            label=label,
+            origins=(tile.origin,),
+        )
+    )
+
+
+def union_nms(proposals: tuple[Proposal, ...], iou_threshold: float) -> tuple[Proposal, ...]:
+    if not 0.0 < iou_threshold <= 1.0:
+        raise Stage2Error("INVALID_DINO_CONFIG", "NMS IoU must be in (0, 1].")
+    ordered = sorted(
+        proposals,
+        key=lambda proposal: (
+            proposal.frame_idx,
+            -proposal.score,
+            0 if "full-frame" in proposal.origins else 1,
+            proposal.box,
+            proposal.label,
+        ),
+    )
+    kept: list[Proposal] = []
+    for candidate in ordered:
+        duplicate_index = next(
+            (
+                index
+                for index, existing in enumerate(kept)
+                if existing.frame_idx == candidate.frame_idx
+                and existing.label == candidate.label
+                and box_iou(existing.box, candidate.box) > iou_threshold
+            ),
+            None,
+        )
+        if duplicate_index is None:
+            kept.append(_finalize_proposal(candidate))
+            continue
+        existing = kept[duplicate_index]
+        kept[duplicate_index] = _finalize_proposal(
+            replace(existing, origins=existing.origins + candidate.origins)
+        )
+    return tuple(
+        sorted(kept, key=lambda proposal: (proposal.frame_idx, -proposal.score, proposal.proposal_id))
+    )
+
+
+def dino_fingerprint_payload(
+    stage1: StageIInput,
+    config: DinoGenerationConfig,
+    anchors: tuple[int, ...],
+) -> dict[str, Any]:
+    return {
+        "source_sha256": stage1.source.sha256,
+        "source_video": _jsonable(stage1.source_video),
+        "model": _jsonable(config.model),
+        "prompt": config.prompt,
+        "proposal_floor": config.proposal_floor,
+        "text_threshold": config.text_threshold,
+        "anchor_spacing": config.anchor_spacing,
+        "anchor_frames": anchors,
+        "tiling": {
+            "rows": config.tile_rows,
+            "cols": config.tile_cols,
+            "overlap": config.tile_overlap,
+        },
+        "nms_iou": config.nms_iou,
+        "view_batch_size": config.view_batch_size,
+        "preprocessing": dict(config.preprocessing),
+    }
+
+
+def _proposal_from_dict(raw: dict[str, Any]) -> Proposal:
+    try:
+        proposal = Proposal(
+            frame_idx=int(raw["frame_idx"]),
+            box=tuple(float(value) for value in raw["box"]),
+            score=float(raw["score"]),
+            source=str(raw["source"]),
+            label=str(raw.get("label", "face")),
+            proposal_id=str(raw["proposal_id"]),
+            origins=tuple(str(value) for value in raw["origins"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_DINO_ARTIFACT", "A stored DINO proposal is malformed.") from exc
+    try:
+        canonical = _finalize_proposal(proposal)
+    except Stage2Error as exc:
+        raise Stage2Error(
+            "INVALID_DINO_ARTIFACT",
+            f"Stored DINO proposal {proposal.proposal_id!r} has invalid provenance.",
+        ) from exc
+    if len(proposal.box) != 4 or proposal != canonical:
+        raise Stage2Error(
+            "INVALID_DINO_ARTIFACT",
+            f"Stored DINO proposal {proposal.proposal_id!r} failed canonical validation.",
+        )
+    return proposal
+
+
+def _model_identity_from_dict(raw: dict[str, Any]) -> ModelIdentity:
+    try:
+        return ModelIdentity(
+            name=str(raw["name"]), revision=str(raw["revision"]), sha256=str(raw["sha256"])
+        )
+    except (KeyError, TypeError) as exc:
+        raise Stage2Error("INVALID_DINO_ARTIFACT", "Stored model identity is malformed.") from exc
+
+
+def dino_meta_from_dict(raw: dict[str, Any]) -> DinoArtifactMeta:
+    try:
+        meta = DinoArtifactMeta(
+            schema_version=int(raw["schema_version"]),
+            artifact_type=str(raw["artifact_type"]),
+            fingerprint=str(raw["fingerprint"]),
+            source_sha256=str(raw["source_sha256"]),
+            model=_model_identity_from_dict(raw["model"]),
+            prompt=str(raw["prompt"]),
+            proposal_floor=float(raw["proposal_floor"]),
+            text_threshold=float(raw["text_threshold"]),
+            anchor_spacing=int(raw["anchor_spacing"]),
+            anchor_frames=tuple(int(value) for value in raw["anchor_frames"]),
+            tiling=dict(raw["tiling"]),
+            nms_iou=float(raw["nms_iou"]),
+            preprocessing=dict(raw["preprocessing"]),
+            proposals=tuple(_proposal_from_dict(value) for value in raw["proposals"]),
+            metrics=dict(raw["metrics"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, Stage2Error):
+            raise
+        raise Stage2Error("INVALID_DINO_ARTIFACT", "Stored DINO artifact is malformed.") from exc
+    if meta.schema_version != STAGE2_SCHEMA_VERSION or meta.artifact_type != "dino_proposals":
+        raise Stage2Error("INVALID_DINO_ARTIFACT", "Stored DINO artifact is incompatible.")
+    return meta
+
+
+def validate_dino_meta(
+    meta: DinoArtifactMeta,
+    *,
+    stage1: StageIInput,
+    config: DinoGenerationConfig,
+    anchors: tuple[int, ...],
+    fingerprint_value: str,
+) -> None:
+    problems: list[str] = []
+    expected_tiling = {
+        "rows": config.tile_rows,
+        "cols": config.tile_cols,
+        "overlap": config.tile_overlap,
+    }
+    expected = {
+        "fingerprint": fingerprint_value,
+        "source_sha256": stage1.source.sha256,
+        "model": config.model,
+        "prompt": config.prompt,
+        "proposal_floor": config.proposal_floor,
+        "text_threshold": config.text_threshold,
+        "anchor_spacing": config.anchor_spacing,
+        "anchor_frames": anchors,
+        "tiling": expected_tiling,
+        "nms_iou": config.nms_iou,
+        "preprocessing": dict(config.preprocessing),
+    }
+    for name, expected_value in expected.items():
+        if getattr(meta, name) != expected_value:
+            problems.append(
+                f"{name}: expected {expected_value!r}, got {getattr(meta, name)!r}"
+            )
+    seen_ids: set[str] = set()
+    source_counts = {"full-frame-only": 0, "tiled-only": 0, "shared": 0}
+    for proposal in meta.proposals:
+        if proposal.frame_idx not in anchors:
+            problems.append(f"proposal {proposal.proposal_id} uses a non-anchor frame")
+        if not math.isfinite(proposal.score) or not config.proposal_floor <= proposal.score <= 1.0:
+            problems.append(f"proposal {proposal.proposal_id} score is outside stored bounds")
+        x1, y1, x2, y2 = proposal.box
+        if not (
+            all(math.isfinite(value) for value in proposal.box)
+            and 0.0 <= x1 < x2 <= stage1.source_video.display_width
+            and 0.0 <= y1 < y2 <= stage1.source_video.display_height
+        ):
+            problems.append(f"proposal {proposal.proposal_id} box is outside the source frame")
+        if proposal.proposal_id in seen_ids:
+            problems.append(f"duplicate proposal id {proposal.proposal_id}")
+        seen_ids.add(proposal.proposal_id)
+        if proposal.source not in source_counts:
+            problems.append(f"proposal {proposal.proposal_id} has invalid source class")
+        else:
+            source_counts[proposal.source] += 1
+    if meta.metrics.get("n_anchors") != len(anchors):
+        problems.append("metrics.n_anchors does not match the anchor schedule")
+    if meta.metrics.get("n_proposals") != len(meta.proposals):
+        problems.append("metrics.n_proposals does not match the proposal list")
+    if meta.metrics.get("source_counts") != source_counts:
+        problems.append("metrics.source_counts does not match proposal provenance")
+    if problems:
+        raise Stage2Error(
+            "INVALID_DINO_ARTIFACT",
+            "Stored DINO artifact failed provenance validation.",
+            details={"problems": problems},
+            recovery="Explicitly recompute from the DINO layer.",
+        )
+
+
+def select_dino_proposals(
+    meta: DinoArtifactMeta, operating_threshold: float
+) -> DinoThresholdSelection:
+    if not math.isfinite(operating_threshold) or not meta.proposal_floor <= operating_threshold <= 1.0:
+        raise Stage2Error(
+            "INVALID_DINO_OPERATING_THRESHOLD",
+            "DINO operating threshold must be finite and no lower than the stored proposal floor.",
+            details={
+                "proposal_floor": meta.proposal_floor,
+                "operating_threshold": operating_threshold,
+            },
+            recovery="Recompute DINO with a lower proposal floor before selecting this threshold.",
+        )
+    accepted = tuple(proposal for proposal in meta.proposals if proposal.score >= operating_threshold)
+    rejected = tuple(proposal for proposal in meta.proposals if proposal.score < operating_threshold)
+    return DinoThresholdSelection(
+        threshold=operating_threshold,
+        accepted=accepted,
+        rejected=rejected,
+    )
+
+
+def _checkpoint_header(fingerprint_value: str) -> dict[str, Any]:
+    return {
+        "record_type": "header",
+        "schema_version": STAGE2_SCHEMA_VERSION,
+        "fingerprint": fingerprint_value,
+    }
+
+
+def _checkpoint_row_from_dict(raw: dict[str, Any]) -> dict[str, Any]:
+    try:
+        if raw["record_type"] != "anchor":
+            raise ValueError("not an anchor row")
+        row = {
+            "record_type": "anchor",
+            "frame_idx": int(raw["frame_idx"]),
+            "proposals": tuple(_proposal_from_dict(value) for value in raw["proposals"]),
+            "metrics": dict(raw["metrics"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, Stage2Error):
+            raise
+        raise Stage2Error("INVALID_DINO_CHECKPOINT", "DINO checkpoint row is malformed.") from exc
+    if any(proposal.frame_idx != row["frame_idx"] for proposal in row["proposals"]):
+        raise Stage2Error(
+            "INVALID_DINO_CHECKPOINT",
+            f"Checkpoint anchor {row['frame_idx']} contains proposals from another frame.",
+        )
+    return row
+
+
+def _write_checkpoint_records(path: Path, records: list[dict[str, Any]]) -> None:
+    content = b"".join(canonical_json_bytes(record) + b"\n" for record in records)
+    atomic_write_bytes(path, content)
+
+
+def load_dino_checkpoint(
+    path: Path,
+    *,
+    fingerprint_value: str,
+    anchors: tuple[int, ...],
+) -> dict[int, dict[str, Any]]:
+    header = _checkpoint_header(fingerprint_value)
+    if not path.exists():
+        _write_checkpoint_records(path, [header])
+        return {}
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise Stage2Error("INVALID_DINO_CHECKPOINT", f"Could not read {path}") from exc
+    raw_lines = content.splitlines()
+    if not raw_lines:
+        raise Stage2Error("INVALID_DINO_CHECKPOINT", f"DINO checkpoint is empty: {path}")
+    records: list[dict[str, Any]] = []
+    repaired_tail = False
+    for index, line in enumerate(raw_lines):
+        try:
+            record = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if index == len(raw_lines) - 1:
+                repaired_tail = True
+                break
+            raise Stage2Error(
+                "INVALID_DINO_CHECKPOINT",
+                f"DINO checkpoint has corruption before its final row: {path}",
+            ) from exc
+        if not isinstance(record, dict):
+            raise Stage2Error("INVALID_DINO_CHECKPOINT", "Checkpoint record must be an object.")
+        records.append(record)
+    if not records or records[0] != header:
+        actual = records[0] if records else None
+        raise Stage2Error(
+            "DINO_FINGERPRINT_MISMATCH",
+            "DINO checkpoint belongs to different inputs or settings.",
+            details={"expected_header": header, "actual_header": actual},
+            recovery="Use a new run ID or explicitly recompute from the DINO layer.",
+        )
+    rows: dict[int, dict[str, Any]] = {}
+    allowed_anchors = set(anchors)
+    for raw in records[1:]:
+        row = _checkpoint_row_from_dict(raw)
+        frame_idx = row["frame_idx"]
+        if frame_idx not in allowed_anchors:
+            raise Stage2Error(
+                "INVALID_DINO_CHECKPOINT",
+                f"Checkpoint contains unexpected anchor frame {frame_idx}.",
+            )
+        if frame_idx in rows:
+            raise Stage2Error(
+                "INVALID_DINO_CHECKPOINT",
+                f"Checkpoint contains duplicate anchor frame {frame_idx}.",
+            )
+        rows[frame_idx] = row
+    if repaired_tail or (content and not content.endswith(b"\n")):
+        repaired = [header]
+        repaired.extend(
+            {
+                "record_type": "anchor",
+                "frame_idx": row["frame_idx"],
+                "proposals": row["proposals"],
+                "metrics": row["metrics"],
+            }
+            for row in sorted(rows.values(), key=lambda value: value["frame_idx"])
+        )
+        _write_checkpoint_records(path, repaired)
+    return rows
+
+
+def append_dino_checkpoint(path: Path, row: dict[str, Any]) -> None:
+    encoded = canonical_json_bytes(row) + b"\n"
+    try:
+        with path.open("ab") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise Stage2Error(
+            "DINO_CHECKPOINT_WRITE_FAILED",
+            f"Could not persist DINO anchor checkpoint to {path}",
+        ) from exc
+
+
+def _adapter_peak_vram(adapter: Any) -> int:
+    getter = getattr(adapter, "peak_vram_bytes", None)
+    if not callable(getter):
+        return 0
+    value = int(getter())
+    return max(0, value)
+
+
+def _adapter_reset_peak_vram(adapter: Any) -> None:
+    resetter = getattr(adapter, "reset_peak_vram", None)
+    if callable(resetter):
+        resetter()
+
+
+def _run_dino_anchor(
+    *,
+    frame_idx: int,
+    image: Any,
+    adapter: Any,
+    config: DinoGenerationConfig,
+    expected_width: int,
+    expected_height: int,
+) -> tuple[tuple[Proposal, ...], dict[str, Any]]:
+    if _image_size(image) != (expected_width, expected_height):
+        raise Stage2Error(
+            "FRAME_SIZE_MISMATCH",
+            f"Frame {frame_idx} dimensions do not match the validated source video.",
+        )
+    views = frame_views(
+        image, rows=config.tile_rows, cols=config.tile_cols, overlap=config.tile_overlap
+    )
+    _adapter_reset_peak_vram(adapter)
+    started = time.perf_counter()
+    mapped: list[Proposal] = []
+    below_floor = 0
+    model_calls = 0
+    for start in range(0, len(views), config.view_batch_size):
+        batch = views[start : start + config.view_batch_size]
+        try:
+            results = adapter.infer_batch(
+                [view_image for _tile, view_image in batch],
+                prompt=config.prompt,
+                box_threshold=config.proposal_floor,
+                text_threshold=config.text_threshold,
+            )
+        except Stage2Error:
+            raise
+        except Exception as exc:
+            raise Stage2Error(
+                "DINO_INFERENCE_FAILED",
+                f"DINO inference failed at anchor frame {frame_idx}.",
+                details={"cause": str(exc)},
+            ) from exc
+        model_calls += 1
+        if not isinstance(results, (list, tuple)) or len(results) != len(batch):
+            raise Stage2Error(
+                "INVALID_DINO_OUTPUT",
+                "DINO adapter returned a different number of results than input views.",
+            )
+        for (tile, _view_image), detections in zip(batch, results, strict=True):
+            if not isinstance(detections, (list, tuple)):
+                raise Stage2Error("INVALID_DINO_OUTPUT", "DINO detections must be a sequence.")
+            for raw in detections:
+                if not isinstance(raw, RawDinoDetection):
+                    raise Stage2Error(
+                        "INVALID_DINO_OUTPUT", "DINO adapter returned an unknown detection type."
+                    )
+                proposal = map_raw_detection(
+                    raw,
+                    frame_idx=frame_idx,
+                    tile=tile,
+                    frame_width=expected_width,
+                    frame_height=expected_height,
+                    proposal_floor=config.proposal_floor,
+                )
+                if proposal is None:
+                    below_floor += 1
+                else:
+                    mapped.append(proposal)
+    proposals = union_nms(tuple(mapped), config.nms_iou)
+    source_counts = {
+        source: sum(1 for proposal in proposals if proposal.source == source)
+        for source in ("full-frame-only", "tiled-only", "shared")
+    }
+    metrics = {
+        "n_views": len(views),
+        "n_model_calls": model_calls,
+        "n_raw_proposals": len(mapped) + below_floor,
+        "n_below_floor": below_floor,
+        "n_before_nms": len(mapped),
+        "n_after_nms": len(proposals),
+        "n_nms_suppressed": len(mapped) - len(proposals),
+        "source_counts": source_counts,
+        "runtime_seconds": time.perf_counter() - started,
+        "peak_vram_bytes": _adapter_peak_vram(adapter),
+    }
+    return proposals, metrics
+
+
+def generate_dino_proposals(
+    *,
+    stage1: StageIInput,
+    paths: RunPaths,
+    config: DinoGenerationConfig,
+    adapter: Any,
+    frame_loader: Callable[[int], Any],
+) -> DinoGenerationResult:
+    validate_dino_config(config)
+    if getattr(adapter, "identity", None) != config.model:
+        raise Stage2Error(
+            "DINO_MODEL_IDENTITY_MISMATCH",
+            "Loaded DINO adapter identity does not match the fingerprinted configuration.",
+        )
+    anchors = anchor_schedule(stage1.source_video.n_frames, config.anchor_spacing)
+    fingerprint_payload = dino_fingerprint_payload(stage1, config, anchors)
+    fingerprint_value = dino_fingerprint(fingerprint_payload)
+
+    if paths.dino.exists():
+        meta = dino_meta_from_dict(read_json(paths.dino))
+        if meta.fingerprint != fingerprint_value:
+            raise Stage2Error(
+                "DINO_FINGERPRINT_MISMATCH",
+                "Existing DINO artifact belongs to different inputs or settings.",
+                details={"expected": fingerprint_value, "actual": meta.fingerprint},
+                recovery="Use a new run ID or explicitly recompute from the DINO layer.",
+            )
+        validate_dino_meta(
+            meta,
+            stage1=stage1,
+            config=config,
+            anchors=anchors,
+            fingerprint_value=fingerprint_value,
+        )
+        checkpoint_sha256 = meta.metrics.get("checkpoint_sha256")
+        if not isinstance(checkpoint_sha256, str) or not paths.dino_checkpoint.exists():
+            raise Stage2Error(
+                "INVALID_DINO_ARTIFACT",
+                "DINO artifact has no verifiable checkpoint provenance.",
+            )
+        if sha256_file(paths.dino_checkpoint) != checkpoint_sha256:
+            raise Stage2Error(
+                "INVALID_DINO_ARTIFACT",
+                "DINO checkpoint changed after the final artifact was created.",
+                recovery="Explicitly recompute from the DINO layer.",
+            )
+        return DinoGenerationResult(
+            artifact=artifact_ref(paths.dino),
+            meta=meta,
+            reused_final_artifact=True,
+            reused_anchor_count=len(anchors),
+            generated_anchor_count=0,
+        )
+
+    rows = load_dino_checkpoint(
+        paths.dino_checkpoint,
+        fingerprint_value=fingerprint_value,
+        anchors=anchors,
+    )
+    reused_anchor_count = len(rows)
+    for frame_idx in anchors:
+        if frame_idx in rows:
+            continue
+        try:
+            image = frame_loader(frame_idx)
+        except Stage2Error:
+            raise
+        except Exception as exc:
+            raise Stage2Error(
+                "FRAME_DECODE_FAILED",
+                f"Could not decode DINO anchor frame {frame_idx}.",
+                details={"cause": str(exc)},
+            ) from exc
+        proposals, metrics = _run_dino_anchor(
+            frame_idx=frame_idx,
+            image=image,
+            adapter=adapter,
+            config=config,
+            expected_width=stage1.source_video.display_width,
+            expected_height=stage1.source_video.display_height,
+        )
+        row = {
+            "record_type": "anchor",
+            "frame_idx": frame_idx,
+            "proposals": proposals,
+            "metrics": metrics,
+        }
+        append_dino_checkpoint(paths.dino_checkpoint, row)
+        rows[frame_idx] = _checkpoint_row_from_dict(_jsonable(row))
+
+    all_proposals = tuple(
+        proposal
+        for frame_idx in anchors
+        for proposal in rows[frame_idx]["proposals"]
+    )
+    anchor_metrics = [rows[frame_idx]["metrics"] for frame_idx in anchors]
+    source_counts = {
+        source: sum(1 for proposal in all_proposals if proposal.source == source)
+        for source in ("full-frame-only", "tiled-only", "shared")
+    }
+    metrics = {
+        "n_anchors": len(anchors),
+        "n_proposals": len(all_proposals),
+        "n_model_calls": sum(int(value.get("n_model_calls", 0)) for value in anchor_metrics),
+        "n_raw_proposals": sum(
+            int(value.get("n_raw_proposals", 0)) for value in anchor_metrics
+        ),
+        "n_below_floor": sum(int(value.get("n_below_floor", 0)) for value in anchor_metrics),
+        "n_nms_suppressed": sum(
+            int(value.get("n_nms_suppressed", 0)) for value in anchor_metrics
+        ),
+        "source_counts": source_counts,
+        "runtime_seconds": sum(
+            float(value.get("runtime_seconds", 0.0)) for value in anchor_metrics
+        ),
+        "peak_vram_bytes": max(
+            (int(value.get("peak_vram_bytes", 0)) for value in anchor_metrics), default=0
+        ),
+        "checkpoint_sha256": sha256_file(paths.dino_checkpoint),
+    }
+    meta = DinoArtifactMeta(
+        schema_version=STAGE2_SCHEMA_VERSION,
+        artifact_type="dino_proposals",
+        fingerprint=fingerprint_value,
+        source_sha256=stage1.source.sha256,
+        model=config.model,
+        prompt=config.prompt,
+        proposal_floor=config.proposal_floor,
+        text_threshold=config.text_threshold,
+        anchor_spacing=config.anchor_spacing,
+        anchor_frames=anchors,
+        tiling={
+            "rows": config.tile_rows,
+            "cols": config.tile_cols,
+            "overlap": config.tile_overlap,
+        },
+        nms_iou=config.nms_iou,
+        preprocessing=dict(config.preprocessing),
+        proposals=all_proposals,
+        metrics=metrics,
+    )
+    validate_dino_meta(
+        meta,
+        stage1=stage1,
+        config=config,
+        anchors=anchors,
+        fingerprint_value=fingerprint_value,
+    )
+    artifact = write_immutable_json(paths.dino, meta)
+    return DinoGenerationResult(
+        artifact=artifact,
+        meta=meta,
+        reused_final_artifact=False,
+        reused_anchor_count=reused_anchor_count,
+        generated_anchor_count=len(anchors) - reused_anchor_count,
+    )
+
+
+class TransformersGroundingDinoAdapter:
+    """Lazy official Transformers adapter; model files must already be cached.
+
+    Milestone 2 defines this boundary but does not install/download its GPU
+    dependencies. The Stage II setup milestone will pin the runtime and
+    verify the safetensors file before this adapter is exposed by a real run.
+    """
+
+    identity = ModelIdentity(
+        name=DINO_MODEL_ID,
+        revision=DINO_MODEL_REVISION,
+        sha256=DINO_MODEL_WEIGHTS_SHA256,
+    )
+
+    def __init__(self, *, device: str = "cuda", local_files_only: bool = True) -> None:
+        try:
+            import torch
+            from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+        except ImportError as exc:
+            raise Stage2Error(
+                "DINO_DEPENDENCIES_MISSING",
+                "Grounding DINO runtime dependencies are not installed.",
+                recovery="Run the Stage II setup command before real DINO inference.",
+            ) from exc
+        self._torch = torch
+        self.device = device
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                DINO_MODEL_ID,
+                revision=DINO_MODEL_REVISION,
+                local_files_only=local_files_only,
+            )
+            self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                DINO_MODEL_ID,
+                revision=DINO_MODEL_REVISION,
+                local_files_only=local_files_only,
+                use_safetensors=True,
+            ).to(device)
+            self.model.eval()
+        except Exception as exc:
+            raise Stage2Error(
+                "DINO_MODEL_LOAD_FAILED",
+                "Pinned Grounding DINO Base model could not be loaded from the local cache.",
+                details={"cause": str(exc), "revision": DINO_MODEL_REVISION},
+                recovery="Run the Stage II setup command to verify and prime model assets.",
+            ) from exc
+
+    def infer_batch(
+        self,
+        images: list[Any],
+        *,
+        prompt: str,
+        box_threshold: float,
+        text_threshold: float,
+    ) -> list[tuple[RawDinoDetection, ...]]:
+        text = [prompt] * len(images)
+        inputs = self.processor(images=images, text=text, return_tensors="pt", padding=True)
+        inputs = inputs.to(self.device)
+        with self._torch.inference_mode():
+            outputs = self.model(**inputs)
+        target_sizes = [(image.size[1], image.size[0]) for image in images]
+        results = self.processor.post_process_grounded_object_detection(
+            outputs,
+            input_ids=inputs.input_ids,
+            threshold=box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=target_sizes,
+            text_labels=[[prompt.rstrip(".")]] * len(images),
+        )
+        converted = []
+        for result in results:
+            boxes = result["boxes"].detach().cpu().tolist()
+            scores = result["scores"].detach().cpu().tolist()
+            labels = result.get("text_labels") or [prompt.rstrip(".")] * len(boxes)
+            converted.append(
+                tuple(
+                    RawDinoDetection(box=tuple(box), score=float(score), label=str(label))
+                    for box, score, label in zip(boxes, scores, labels, strict=True)
+                )
+            )
+        return converted
+
+    def reset_peak_vram(self) -> None:
+        if self.device.startswith("cuda") and self._torch.cuda.is_available():
+            self._torch.cuda.reset_peak_memory_stats()
+
+    def peak_vram_bytes(self) -> int:
+        if self.device.startswith("cuda") and self._torch.cuda.is_available():
+            return int(self._torch.cuda.max_memory_allocated())
+        return 0
+
+
+@dataclass(slots=True, frozen=True)
+class FakeImage:
+    width: int
+    height: int
+    crop_origin: tuple[int, int] = (0, 0)
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return self.width, self.height
+
+    def crop(self, box: tuple[int, int, int, int]) -> FakeImage:
+        x1, y1, x2, y2 = box
+        return FakeImage(
+            width=x2 - x1,
+            height=y2 - y1,
+            crop_origin=(self.crop_origin[0] + x1, self.crop_origin[1] + y1),
+        )
+
+
 class FakeDinoAdapter:
     identity = ModelIdentity(
-        name="fake-grounding-dino", revision="milestone-1", sha256="f" * 64
+        name="fake-grounding-dino", revision="milestone-2", sha256="f" * 64
     )
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def infer_batch(
+        self,
+        images: list[Any],
+        *,
+        prompt: str,
+        box_threshold: float,
+        text_threshold: float,
+    ) -> list[tuple[RawDinoDetection, ...]]:
+        del prompt, box_threshold, text_threshold
+        self.calls += 1
+        results = []
+        for image in images:
+            width, height = _image_size(image)
+            results.append(
+                (
+                    RawDinoDetection(
+                        box=(width * 0.4, height * 0.4, width * 0.6, height * 0.6),
+                        score=0.42,
+                    ),
+                )
+            )
+        return results
+
+    def reset_peak_vram(self) -> None:
+        return None
+
+    def peak_vram_bytes(self) -> int:
+        return 0
 
     def detect(self, frame_idx: int, width: int, height: int) -> tuple[Proposal, ...]:
         size = max(8.0, min(width, height) * 0.1)
@@ -974,37 +2035,28 @@ def run_fake_pipeline(
     )
 
     dino = FakeDinoAdapter()
-    fake_frame_end = min(validated.source_video.n_frames - 1, 9)
-    anchor_frames = tuple(sorted({0, fake_frame_end // 2, fake_frame_end}))
-    proposals = tuple(
-        proposal
-        for frame_idx in anchor_frames
-        for proposal in dino.detect(
-            frame_idx,
+    dino_config = DinoGenerationConfig(
+        model=dino.identity,
+        preprocessing=(
+            ("color", "synthetic-RGB"),
+            ("resize", "none"),
+            ("normalization", "none"),
+            ("frame_decoder", "fake-image"),
+        ),
+    )
+    dino_result = generate_dino_proposals(
+        stage1=validated,
+        paths=paths,
+        config=dino_config,
+        adapter=dino,
+        frame_loader=lambda _frame_idx: FakeImage(
             validated.source_video.display_width,
             validated.source_video.display_height,
-        )
+        ),
     )
-    dino_payload = {
-        "source_sha256": validated.source.sha256,
-        "model": _jsonable(dino.identity),
-        "prompt": "face.",
-        "proposal_floor": 0.10,
-        "preprocessing": {"mode": "fake", "tiling": "full-frame-only"},
-        "anchor_frames": anchor_frames,
-    }
-    dino_meta = DinoArtifactMeta(
-        schema_version=STAGE2_SCHEMA_VERSION,
-        artifact_type="dino_proposals",
-        fingerprint=dino_fingerprint(dino_payload),
-        source_sha256=validated.source.sha256,
-        model=dino.identity,
-        prompt="face.",
-        proposal_floor=0.10,
-        preprocessing={"mode": "fake", "tiling": "full-frame-only"},
-        proposals=proposals,
-    )
-    dino_ref = write_immutable_json(paths.dino, dino_meta)
+    dino_ref = dino_result.artifact
+    proposals = dino_result.meta.proposals
+    fake_frame_end = min(validated.source_video.n_frames - 1, 9)
     advance_state(
         paths.state,
         run_id=run_id,
