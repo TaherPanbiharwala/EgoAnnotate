@@ -1,16 +1,25 @@
 # Stage II EgoBlur + DINO/SAM2 De-identification Plan
 
-Status: ready for later implementation
+Status: implementation-ready and divided into reviewable milestones
 
-Saved: 2026-08-18
+Saved: 2026-08-18; milestone structure updated 2026-08-20
 
 ## Worktree and execution boundary
 
-- Create `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2` as a sibling Git worktree.
-- Use branch `feature/stage2-deidentification` based on clean `master` commit `545396050b5fcbe8fa8efdd2d2241d95e6176b4d`.
+- Work in `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2`, the dedicated sibling Git worktree.
+- Use branch `feature/stage2-deidentification`; current `master` through `9acfe07` has been merged into it.
 - Leave `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-batch` and `batch/16-clip-run` untouched.
 - Keep all implementation, tests, configuration, documentation, and commits in this one worktree.
 - Run EgoBlur and Stage II sequentially on the same RunPod GPU pod and persistent `/workspace` network volume, using separate locked PEP 723 environments.
+
+## Milestone delivery rules
+
+- Build milestones in order. A later milestone may start only after the previous milestone's acceptance gate passes.
+- Keep each milestone in its own small commit series so it can be reviewed and reverted independently.
+- Run the existing repository test suite at every milestone boundary. Also run that milestone's focused tests.
+- Do not require a GPU until Milestone 6. Milestones 1-5 must be testable locally with deterministic fake model adapters.
+- A milestone is complete only when its code, tests, manifest fields, operator documentation, and failure behavior are reviewed together.
+- Privacy or provenance failures block advancement. Convenience features may be deferred without weakening fail-closed behavior.
 
 ## Architecture
 
@@ -149,20 +158,124 @@ Before publication, watch every complete final clip at accelerated speed and ins
 - Mutation-test every privacy, fingerprint, resume, and fail-closed regression.
 - Run the existing full repository suite before and after implementation.
 
-## Rollout
+## Implementation milestones
 
-1. Create the dedicated worktree.
-2. Validate the current `GX010057` Stage I integrity report.
-3. Implement setup, pure contracts, and fake-model tests.
-4. Implement DINO proposals and checkpointing.
-5. Implement SAM windows, fallback masks, and mask shards.
-6. Implement rendering and media verification.
-7. Implement labels, evidence, review records, and manual-seed remediation.
-8. Run a 30-60 second real GPU smoke slice.
-9. Label the whole `GX010057` clip and render the four threshold candidates.
-10. Accept and freeze a production configuration.
-11. Canary one additional clip.
-12. Process the remaining clips under the accepted damage/resource stop ceilings and full-clip review contract.
+### Milestone 1 — Contracts, validation, and local skeleton
+
+**Build**
+
+- Add the self-contained Stage II PEP 723 job skeleton and thin runner command structure without loading real models.
+- Define versioned schemas for processing state, manifests, DINO artifacts, SAM mask shards, render artifacts, manual seeds, labels, and immutable review records.
+- Implement Stage I artifact validation, safe path handling, atomic writes, hashes, layered fingerprints, and state transitions.
+- Add deterministic fake DINO/SAM adapters and fixture videos so all later orchestration can be tested locally.
+
+**Review checkpoint**
+
+- Review public commands, schemas, fingerprint boundaries, safe storage paths, and fail-closed errors before model-specific logic is added.
+
+**Acceptance gate**
+
+- Invalid or incompatible Stage I input is rejected before GPU work; interrupted writes cannot appear complete; fake processing can resume deterministically; focused tests and the full repository suite pass.
+
+### Milestone 2 — DINO proposal generation and reuse
+
+**Build**
+
+- Implement full-frame plus overlapping 2x2 tiled DINO inference, coordinate conversion, proposal union/NMS, anchor scheduling, and immutable proposal artifacts.
+- Store all proposals down to the fixed `0.10` floor so thresholds `0.15`-`0.30` can reuse the same DINO computation.
+- Record model revision/hash, exact prompt, preprocessing, tiling, scores, accepted/rejected proposal counts, runtime, and peak VRAM fields.
+
+**Review checkpoint**
+
+- Inspect tiled coordinate mapping, border faces, duplicate proposals, threshold separation, checkpoint reuse, and DINO artifact provenance using fake adapters and hand-checkable fixtures.
+
+**Acceptance gate**
+
+- Identical inputs reuse byte-identifiable proposal artifacts; any DINO-affecting change invalidates them; operating-threshold changes at or above `0.10` do not rerun DINO; all mapping and boundary tests pass.
+
+### Milestone 3 — SAM2 propagation, fallback safety, and mask shards
+
+**Build**
+
+- Implement accepted DINO boxes as SAM2 prompts in bounded overlapping windows with forward and reverse propagation.
+- Validate masks for empty, undersized, off-prompt, interrupted, or near-full-frame expansion behavior.
+- Preserve padded DINO boxes whenever SAM fails, union valid SAM/manual masks, and persist immutable compressed per-window mask shards.
+- Implement targeted invalidation for threshold and manual-seed changes; keep object IDs local to a window.
+
+**Review checkpoint**
+
+- Review privacy behavior for occlusion, brief appearances, window boundaries, crossing faces, failed propagation, pathological masks, and manual-seed correction.
+
+**Acceptance gate**
+
+- A valid DINO fallback can never disappear because of SAM behavior; suspicious masks create review flags; overlapping shards reconstruct the expected masks without a clip-wide dense map; focused and full tests pass.
+
+### Milestone 4 — Rendering and technical verification
+
+**Build**
+
+- Stream Stage I frames as the only pixel source and apply the union of Stage II masks using constant YUV fill and scaled safety dilation.
+- Strip audio, subtitles, data streams, and metadata; encode to a temporary artifact; verify it; then promote it atomically.
+- Implement frame-count/timing, media/color, fill-integrity, complete-shard, manifest-hash, and stale-output checks.
+- Record added mask area, hand/tool overlap hooks, runtime, storage, encoder configuration, and outside-mask quality measurements.
+
+**Review checkpoint**
+
+- Compare decoded input/output frames, confirm that unmasked pixels came from Stage I, inspect mask edges after encoding, and test interruption/restart behavior.
+
+**Acceptance gate**
+
+- Frame synchronization is exact; required masks survive encoding; forbidden streams/metadata are absent; incomplete or unverifiable output is never promoted or marked `processing complete`; all ffmpeg and repository tests pass.
+
+### Milestone 5 — Private labels, review workflow, and operator UX
+
+**Build**
+
+- Implement the private versioned face-event label format, negative-example labels, manual seeds, evidence extracts, review flags, and `DO-NOT-SHIP` enforcement.
+- Implement `doctor`, `smoke`, `pilot`, `sweep`, `run`, `status`, `resume`, `stop`, `review`, and `release-check`, including dry-run/JSON output and actionable recovery errors.
+- Keep `processing_state`, automated `audit_status`, and immutable human `review_status` separate; bind acceptance to exact output and manifest hashes.
+- Add the idempotent Stage II RunPod setup path with persistent `/workspace` caches and verified model/checkpoint assets.
+
+**Review checkpoint**
+
+- Walk through setup, a failed run, resume, manual correction, rerender, review invalidation, and release check using fake models and synthetic evidence.
+
+**Acceptance gate**
+
+- Private artifacts cannot enter a release package; any correction invalidates earlier acceptance; errors identify reusable layers and exact recovery commands; the documented golden path works up to the real-GPU boundary.
+
+### Milestone 6 — Real-GPU smoke test and full `GX010057` calibration
+
+**Build/run**
+
+- Run setup and offline model-load checks on RunPod, then choose and freeze a safe SAM window size using a 30-60 second slice.
+- Validate the current `GX010057` Stage I artifacts and create the private full-clip answer sheet covering every face event and representative negatives.
+- Compute DINO proposals once, render complete candidates at `0.15`, `0.20`, `0.25`, and `0.30`, and collect all privacy, utility, quality, runtime, VRAM, disk, and cost metrics.
+- Apply the threshold-selection rule; if none passes, add manual seeds for every residual miss and rerun.
+
+**Review checkpoint**
+
+- Review the smoke slice before paying for the full sweep. Then compare Stage I and all four complete candidates against the same labels and inspect every failure/flag.
+
+**Acceptance gate**
+
+- The selected candidate has no unaccounted face event, no visible labeled frame below 95% conservative coverage, and no temporal hole; a human completes full-clip review; selected settings and measured ceilings are frozen in a versioned production configuration.
+
+### Milestone 7 — Canary and controlled production rollout
+
+**Build/run**
+
+- Process one additional representative clip using the frozen configuration and enforce the calibrated damage/resource stop ceilings.
+- Compare canary metrics with `GX010057`, inspect all flags, and watch the complete final clip before acceptance.
+- Only after canary acceptance, process remaining clips sequentially with per-clip immutable manifests, review records, and release checks.
+
+**Review checkpoint**
+
+- Review canary drift in recall evidence, false positives, mask area, hand/tool overlap, runtime, VRAM, storage, and cost before authorizing the remaining batch.
+
+**Acceptance gate**
+
+- Canary stays within frozen ceilings and is manually accepted; every production clip independently reaches `processing complete` and then `review accepted`; release packaging excludes every `DO-NOT-SHIP` artifact.
 
 ## Deferred
 
