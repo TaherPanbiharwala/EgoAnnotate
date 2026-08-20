@@ -7,13 +7,12 @@ pose, object masks, relative depth and camera pose — and reports real
 numbers for how good each field actually is, instead of just shipping a
 demo. Runs on one laptop plus a small amount of rented GPU time.
 
-> **Status: early build.** The core pipeline (frame extraction, hand
-> tracking, VLM captioning, storage) is implemented and tested. Segmentation,
-> the review UI, GPU perception layers (objects/depth/pose), and HF packaging
-> are in progress — see `docs/` and the task list in this repo for current
-> status. This README will grow a results table and a hero clip once real
-> footage has been annotated (currently blocked on Google Drive access — see
-> Known limitations below).
+> **Status: early build.** The core annotation pipeline and EgoBlur Stage I
+> are implemented and tested. Stage II de-identification now has validated
+> contracts, full/tiled DINO proposal reuse, bounded SAM2 propagation, and
+> fail-closed mask shards. Its final renderer, RunPod operator workflow, and
+> real-GPU calibration are not built yet. Segmentation, the review UI, and HF
+> packaging also remain in progress.
 
 ## Setup
 
@@ -30,10 +29,10 @@ uv sync
 ```
 
 `uv sync` creates a `.venv` and installs everything in `pyproject.toml`
-(MediaPipe, OpenCV, PyArrow, Pydantic, httpx). There is no separate GPU
-install step — the layers implemented so far (hand tracking, VLM captioning)
-run on CPU; the future GPU perception layers (objects/depth/pose) are
-isolated PEP 723 job scripts under `jobs/`, not part of this environment.
+(MediaPipe, OpenCV, PyArrow, Pydantic, httpx). Local hand tracking and VLM
+captioning do not require a GPU. EgoBlur and Stage II use isolated PEP 723
+jobs under `jobs/` because their Torch/CUDA environments are intentionally
+separate; the persistent Stage II RunPod setup command is still planned.
 
 ## Try it — no accounts, no GPU, no API key
 
@@ -150,7 +149,7 @@ uv run --with ruff ruff check src scripts jobs tests
 - `src/egoannote/store.py` — one SQLite database (laptop-only — GPU pods
   write immutable artifact shards, never a shared database file, so two
   machines can never silently overwrite each other's rows).
-- `tests/` — 103 tests, pytest, no GPU or network required. A large share are
+- `tests/` — pytest coverage with no GPU or network required. A large share are
   regression guards for specific bugs found in review; each names the defect
   it pins.
 
@@ -160,13 +159,14 @@ uv run --with ruff ruff check src scripts jobs tests
   design is finalized but deliberately not implemented until real hand-
   tracking data exists to calibrate its thresholds against. See that file's
   docstring for the full design and why it's staged this way.
-- The review UI, GPU perception layers (objects/depth/camera-pose), dataset
-  packaging, and the published benchmarks.
+- The Stage II renderer and technical verifier, real-GPU DINO/SAM2 calibration,
+  review UI, GPU perception layers (objects/depth/camera-pose), dataset
+  packaging, and published benchmarks.
 
 ## Known limitations (stated here, not buried)
 
-- No real egocentric footage has been processed yet — the source video is
-  on Google Drive and getting local access is an open item.
+- `GX010057` has been processed through EgoBlur while tuning Stage I, but no
+  real clip has completed Stage II DINO/SAM2 inference and rendering yet.
 - The annotation quality claims in the project plan are targets, not
   results, until real data runs through the pipeline.
 

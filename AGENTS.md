@@ -4,7 +4,7 @@ This file exists so any coding agent (Codex, Claude, etc.) can pick up this
 repo cold. Written 2026-08-11 and updated on the Stage II feature branch on
 2026-08-20. The branch includes clean `master` baseline **`9acfe07`** plus
 the Stage II plan and Milestones 1-3 implementation. The full suite is
-**397 tests** as of this update (`uv run --extra test pytest tests/ -q`).
+**verified by the current test command below** (`uv run --extra test pytest tests/ -q`).
 Run `git status` and read
 `STAGE2_DEIDENTIFICATION_PLAN.md` before changing either GPU stage.
 
@@ -58,7 +58,9 @@ jobs/20_deidentify_stage2.py
                              checkpoints, threshold reuse, bounded forward/
                              reverse SAM propagation, fail-closed DINO/manual
                              fallback, compressed per-window mask shards, and
-                             deterministic fake adapters. Real model adapters
+                             deterministic fake adapters. SAM shards bind the
+                             verified config, runtime source tree, Torch, and
+                             CUDA identities. Real model adapters
                              are lazy/cache-only; no production command yet.
 jobs/_contract.py           the shard-metadata contract other future GPU
                              jobs (hand-pose, depth, SLAM) will vendor by
@@ -101,7 +103,7 @@ models.toml                 VLM model registry. Ships with placeholder
                              entries; needs 2 real models from DIFFERENT
                              labs (see file's own comments on why) before
                              any real captioning run.
-tests/                       pytest suite (397 tests). Run before AND after any
+tests/                       pytest suite. Run the complete suite before AND after any
                              change: `uv run --extra test pytest tests/ -q`
 handover.md                  a PREVIOUS session's own continuation notes.
                              Tracked in git (not gitignored) — read it,
