@@ -1,360 +1,214 @@
-# egoannote — session handover
+# egoannote Stage II session handover
 
-Written 2026-08-11, substantially rewritten in a later session once the
-"do this first" item below was actually resolved (with evidence, not a
-visual spot-check) and two of the three remaining hysteresis blockers got
-fixed. Repo HEAD at time of writing: **`5cca081`** — but the working tree
-has real, tested, uncommitted changes on top of that (see "What's
-uncommitted right now" below); this is **not** a clean-tree handoff.
-279 tests passing (`uv run --extra test pytest tests/ -q`), including the
-uncommitted work.
+Updated 2026-08-20 for the next coding session.
 
-## The project, in one paragraph
+## Start here
 
-Solo portfolio project: salvaging a shelved egocentric-video-annotation
-startup into a public, forkable pipeline. Plan is to publish ~1.5h of the
-user's own GoPro footage (a family paint/hardware shop) as an annotated
-HuggingFace dataset, then write an honest post-mortem. Pipeline order:
-**EgoBlur (GPU, redacts faces/plates)** → MediaPipe hands (CPU/local) → VLM
-captioning (API) → segmentation (not yet implemented, deliberately).
+- Worktree: `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2`
+- Branch: `feature/stage2-deidentification`
+- Current HEAD before this handover edit: `c7b4005`
+- Base merged from `master`: `9acfe07`
+- Working tree was clean before this handover update.
+- Nothing from this branch has been pushed or merged into `master` by this
+  session.
 
-## "Do this first" — RESOLVED, with real evidence
+In a new chat, set the workspace to the worktree above, then read these files
+in order:
 
-The previous handoff's biggest open risk: `test-run-1` showed
-`fill_integrity_violations: 14096` (~65% of checked boxes), accepted as
-"probably encoder ringing, not a real leak" purely because the user
-watched the output video and it looked fine — never independently
-confirmed. That confirmation has now actually happened.
+1. `AGENTS.md`
+2. `STAGE2_DEIDENTIFICATION_PLAN.md`
+3. this `handover.md`
+4. the module docstring and command parser in `jobs/20_deidentify_stage2.py`
 
-**`test-run-3`'s real numbers:** `checked=36731`, `violations=23216` →
-**63.2%** — essentially flat vs. `test-run-1`'s ~65%, despite 69% more
-boxes being checked overall (the newer, longer, now-symmetric hold window
-draws more boxes). Rate holding steady while volume grew is itself
-evidence the check is catching something systemic, not something the
-newer settings introduced.
+Run these checks before changing code:
 
-That comparison alone wasn't proof, so a purpose-built diagnostic
-(`diag_integrity.py` — see "Diagnostic scripts" below) re-decoded the
-*already-encoded* output and measured, for every violating box, **how far**
-past the exact-pixel threshold it actually was, instead of just
-pass/fail:
+```bash
+git status --short
+git log --oneline -10
+uv run --extra test pytest tests/ -q
+```
 
-| How far past the limit | Count | % of violations |
-|---|---|---|
-| Barely over (1–5) | 22,432 | **96.6%** |
-| Moderate (6–20) | 784 | 3.4% |
-| Severe (21–60) | **0** | 0% |
-| Extreme (60+) | **0** | 0% |
+## What is being built
 
-Zero boxes fall into "severe" or "extreme" — a real leaked face would blow
-past a deviation of 60 easily (skin tone is 50–100+ gray levels from
-mid-gray `FILL_VALUE=128`). The worst offender in the entire clip
-deviates by only 22, with `max_std` under 1.0 (limit 2) — meaning the
-"violating" patch is still nearly perfectly *flat*, just slightly the
-wrong shade of gray. A real leak would show high internal variance
-(texture, an edge, a color change); this shows none. Several of the worst
-offenders share the *exact same box coordinates* across nearby frames
-(e.g. `(367, 124, 532, 266)` repeats at frames 6001/6002/6036/6048, all
-within ~1.7s) — consistent with one held/static box sitting over the same
-patch of background hitting the same mild compression artifact, not a
-moving/evolving leak.
+Stage II is a privacy-recovery layer after EgoBlur:
 
-**Conclusion: `check_fill_integrity`'s exact-pixel tolerance is too
-strict against ordinary H.264 encoder quantization, not catching a real
-privacy leak.** Consider this item closed. Re-verify with
-`diag_integrity.py` (already delivered to `/workspace/diag_integrity.py`
-on the pod) if this is ever revisited on different footage or settings.
+```text
+original video -> EgoBlur Stage I video -> DINO face proposals
+               -> SAM2 temporal masks -> Stage II renderer -> human review
+```
 
-## Current best-known-good settings
+EgoBlur remains the first pass. Stage II can add redaction for faces EgoBlur
+missed, but it cannot restore pixels hidden by an EgoBlur false positive.
 
-Unchanged since the last handoff — arrived at empirically via
-`sweep_params.py`, not a guess:
+DINO proposes difficult face locations at low thresholds. SAM2 turns accepted
+boxes or manual seeds into masks and propagates them through bounded temporal
+windows. If SAM2 fails or produces a pathological mask, the padded DINO box
+remains as the fail-closed fallback and the interval is flagged for review.
+
+## Decisions already locked
+
+- Keep EgoBlur as Stage I and DINO plus SAM2 as Stage II.
+- Run both GPU stages sequentially on one RunPod pod and persistent
+  `/workspace` network volume.
+- Keep their Torch/CUDA dependencies isolated in separate self-contained
+  PEP 723 jobs.
+- Stage II uses the original video for model inference but renders by adding
+  masks to the already-redacted Stage I video. It never reconstructs Stage I
+  pixels.
+- A DINO anchor frame always retains a padded-box fallback, even when a SAM2
+  mask is rejected.
+- Use bounded overlapping SAM2 windows rather than global identity tracking.
+- Persist immutable, compressed, bounding-box-cropped mask shards rather than
+  a clip-wide full-resolution mask map.
+- Use layered fingerprints so a DINO threshold experiment can reuse detector
+  proposals without rerunning SAM or EgoBlur unnecessarily.
+- `processing complete` and `review accepted` are separate immutable states.
+  Automatic success is never publication approval.
+- The full `GX010057` clip will be privately labeled and calibrated before a
+  broader rollout. Labels and review evidence stay under `DO-NOT-SHIP`.
+
+## Completed milestones
+
+The original milestone implementations are separate commits:
+
+- `03762c5` — Milestone 1 contracts, Stage I validation, state, and local job
+  skeleton.
+- `0c8bc87` — Milestone 2 DINO proposal generation, tiling, checkpoints,
+  fingerprints, resume, and threshold reuse.
+- `5905aee` — Milestone 3 SAM2 bounded propagation, fallback safety, manual
+  seeds, and immutable compressed mask shards.
+
+The complete review then produced separate milestone-specific fix commits:
+
+- `a31e65c` — Milestone 1 validation hardening, including safe output paths,
+  valid zero-redaction Stage I input, malformed manual-seed handling, a real
+  CLI/ffprobe fixture, and short-clip fake-run support.
+- `ce08d73` — Milestone 2 reuse now verifies that the final DINO proposal list
+  exactly matches the finalized checkpoint rows.
+- `c5609ca` — Milestone 3 shard/runtime provenance, source binding,
+  non-erasable fallback review flags, and correct reverse propagation at local
+  frame zero.
+- `c7b4005` — documentation refreshed to match Milestones 1-3.
+
+## P1 review problems resolved
+
+The high-priority provenance problems found during review are fixed:
+
+1. A canonically edited DINO final artifact can no longer be reused merely by
+   recomputing its internal IDs. Its proposals must match the checkpoint rows.
+2. A canonically edited SAM shard can no longer remove required fallback flags
+   and appear clean.
+3. SAM shard fingerprints now bind the exact SAM2 runtime, configuration,
+   installed source tree, Torch version, and CUDA version. Changing the runtime
+   cannot silently reuse an old shard.
+
+The production SAM2 identity is pinned to:
+
+- repository: `https://github.com/facebookresearch/sam2`
+- revision: `2b90b9f5ceec907a1c18123530e92e794ad901a4`
+- config: `configs/sam2.1/sam2.1_hiera_l.yaml`
+- config SHA-256:
+  `1dbd6cb6dfebeaf588c7006ee222c6efbfa9049a7ad472a3cdfb2f5d919e8107`
+
+The Stage II job reports version `0.3.1` and code version `milestone-3.1`.
+
+## Verification completed
+
+- Complete repository test suite: **423 passed**.
+- Focused Stage II suite used during review: **120 passed** before the final P1
+  regression additions.
+- Ruff passes for the Stage II job and Stage II tests.
+- `scripts/runpod_stage2.sh --version` reports `0.3.1`.
+- Shell syntax and whitespace checks passed.
+- The new fingerprint tests were mutation-tested: they failed when the runtime
+  binding was removed and passed after restoration.
+
+The complete repository Ruff run still reports three unrelated, pre-existing
+items outside the Stage II change:
+
+- `jobs/10_blur_egoblur.py:2746` — `C420`
+- `tests/test_blur_job.py:1716` — `F841`
+- `tests/test_prompt_render.py:101` — `I001`
+
+Do not mix those unrelated cleanup items into a Stage II milestone commit.
+
+## Next milestone
+
+Continue with **Milestone 4: rendering and technical verification** in
+`STAGE2_DEIDENTIFICATION_PLAN.md`.
+
+The main outcome is a deterministic renderer that:
+
+1. streams Stage I frames as its only pixel source;
+2. loads only the one or two mask shards relevant to the current frame;
+3. unions valid SAM masks, padded DINO fallbacks, and manual-seed masks;
+4. applies the configured safety dilation and constant-fill policy;
+5. preserves the input timing/audio contract;
+6. writes an immutable render artifact and technical-verification evidence;
+7. restarts encoding from frame zero whenever the render fingerprint changes;
+8. never creates a `review accepted` record automatically.
+
+Keep Milestone 4 locally testable with deterministic fixtures. Do not begin the
+real GPU calibration while rendering and verification are incomplete.
+
+## Remaining concerns, not current failing tests
+
+These were identified during review and should be addressed in their planned
+milestones:
+
+- Before real SAM2 execution, attest the actual extracted frame-window payload,
+  not just loader-supplied metadata. Verify frame count, names/order, and content
+  identity so an off-by-one or wrong directory cannot reach SAM2 with plausible
+  metadata. This belongs with the Stage II setup/real-adapter path in Milestones
+  5-6.
+- Profile the real SAM2 adapter's full-resolution GPU-to-CPU mask copies and
+  Python-list conversion. Forward/reverse overlap may duplicate work. Measure
+  this during the Milestone 6 GPU pilot before optimizing.
+- The fallback currently holds a conservative padded DINO box over its local
+  interval. Do not describe it as learned tracking or true interpolation.
+- Global cross-window person identity tracking remains intentionally deferred.
+  It is unnecessary for privacy coverage and would add identity-association
+  failure modes.
+
+## EgoBlur context that remains relevant
+
+The current best-known `GX010057` Stage I settings remain:
 
 ```bash
 uv run jobs/10_blur_egoblur.py --input-dir /workspace/in --output-dir /workspace/out2 \
   --run-id test-run-3 --gen 2 \
   --face-weights-gen2 /workspace/weights/ego_blur_face_gen2.jit \
   --face-threshold 0.30 --hold-frames 45 \
-  --gpu-rate-usd-per-hr <your actual $/hr> --skip-shutdown
+  --gpu-rate-usd-per-hr <actual $/hr> --skip-shutdown
 ```
 
-No `--lp-weights-gen2` (plate model false-fires on cardboard packaging on
-this footage; `lp_checked: false` recorded honestly). `--dilate-scale` /
-`--motion-margin-px` left at defaults. Do not lower `--face-threshold`
-below 0.30 without re-running `sweep_params.py` — 0.20 was tried
-(`test-run-2`) and buried the wearer's own hands under grey boxes.
+Do not lower the EgoBlur threshold to `0.20`; that real experiment masked the
+wearer's hands heavily. The Stage I fill-integrity findings were measured and
+confirmed to be mild H.264 quantization, not exposed face pixels. Preserve the
+`NEEDS_REVIEW` evidence rather than treating the clip as an invalid Stage II
+input.
 
-## Two real, small bugs — fixed (commit `d0cbe10`)
+Two older EgoBlur issues remain outside current Stage II scope:
 
-1. **`max_fill_area_frac` was a dead canary** — computed and printed but
-   never gated on. **Fixed:** `build_audit` now flags `NEEDS_REVIEW` above
-   `MAX_FILL_AREA_FRAC_CEILING = 0.5`.
-2. **The hysteresis drift bound counted absorption events, not video
-   frames**, so its real-time budget silently depended on `--detect-hz`.
-   **Fixed:** `Track.last_confident_frame` + a frame-based gate.
+- a resumed multi-clip batch can mix completed manifests produced by different
+  redaction settings;
+- two-threshold hysteresis must stay disabled until high-confidence detections
+  are associated before low-confidence detections.
 
-## Still open — the resumed-batch config gap
+## RunPod reminders
 
-Not touched this session; still the one real, if lower-urgency, risk
-before an unattended batch run:
+- Only `/workspace` persists across pod stops.
+- Re-run `scripts/runpod_setup.sh` and source `/workspace/env.sh` after a restart.
+- Use detached execution for long jobs.
+- Keep model/checkpoint caches and the future Stage II setup under `/workspace`.
+- Use full SSH over an exposed TCP port for file transfer; RunPod Basic SSH does
+  not support SCP/SFTP.
+- No production Stage II command, renderer, persistent model setup, or real GPU
+  inference exists yet. Those are planned work, not hidden operator steps.
 
-**A resumed batch can silently mix redaction configs across clips.**
-`process_clip`'s manifest-skip (`if manifest_path.exists() and not
-cfg.force_reprocess`) only checks *whether* a manifest exists, never
-*what config produced it* — unlike `detection_pass`'s own
-`checkpoint_fingerprint()`. If the 16-clip batch gets interrupted (pod
-disconnects have happened repeatedly) and resumed with a changed flag,
-already-finished clips keep their old settings with **zero warning**.
-Fix: extend `checkpoint_fingerprint()`-style tracking to cover
-redaction-relevant config and check it at the manifest-skip site too, or
-at minimum log the mismatch loudly. Doesn't touch detection, so fixing it
-doesn't cost any GPU re-run.
+## Suggested first message in the new chat
 
-## Hysteresis — 3 of 4 blockers now resolved, 1 left
-
-Two-threshold hysteresis (`build_tracks`'s `start_thresh`/`cont_thresh`)
-is **off by default** (`--continue-threshold` defaults to `0`) and the
-recommended batch command above does not use it. Original acceptance
-criteria before it's safe to turn on, and their current status:
-
-1. ~~One `--continue-threshold` value applies to both face and plate
-   classes, even though only the face model's behaviour was measured.~~
-   **Resolved by context, not by code.** `--lp-weights-gen2` is dropped
-   for the whole batch, so `lp_det` is `None` and no `cls == "lp"`
-   detection is ever produced for a shared threshold to mishandle. This
-   is a fact about current usage, not a code fix — the risk returns
-   immediately if plate redaction is ever re-enabled for different
-   footage.
-2. ~~The `det_low` source tag never reached any human-readable output —
-   `tracks_to_fill_map` discarded it.~~ **Fixed, and fixed *properly* on
-   the second try.** The first attempt threaded a new
-   `low_source_frames` out-parameter through `tracks_to_fill_map`'s hot
-   loop — an adversarial code review then found this was unnecessary
-   complexity: `low_absorbed` (populated during `build_tracks`, one call
-   earlier, never deleted) already carries a `Detection` per absorption
-   with the identical `frame_idx`. The actual fix, with zero changes to
-   `tracks_to_fill_map`: `det_low_frames = sorted({d.frame_idx for d in
-   low_absorbed})` at the `build_audit` call site in `process_clip`.
-   `tracks_to_fill_map` is back to its original, untouched form.
-3. ~~`n_low_absorbed` reached the JSON manifest but not
-   `write_audit_summary`'s markdown.~~ **Fixed** — now printed, plus
-   which frames it refers to (capped excerpt, full list in the JSON).
-   Two real bugs surfaced by the same adversarial review and fixed along
-   the way: (a) the empty-case fallback text used to hard-code `"0 when
-   --continue-threshold is off"`, which `write_audit_summary` has no way
-   to actually verify (it never sees `cfg.continue_threshold`) — a clip
-   run *with* hysteresis on that happened to absorb nothing would have
-   printed a false claim; now it just states the fact with no guessed
-   cause. (b) `n_low_absorbed` (an event count) and `det_low_frames` (a
-   *deduplicated* frame list) can legitimately diverge — two different
-   tracks absorbing on the same `frame_idx` means 2 events, 1 distinct
-   frame — so the line now reads `n_low_absorbed: 2  (...; 1 distinct
-   frame(s): 5)` instead of silently pairing numbers that might not
-   match. `det_low_frames` is also now capped at `AUDIT_MAX_ITEMS` (200)
-   with a paired `det_low_frames_truncated` field, matching this file's
-   existing `candidates_truncated`/`yunet_truncated` convention instead
-   of inventing a third, ad hoc truncation scheme.
-4. **Still open:** greedy single-stage IoU association can let a
-   low-confidence detection outbid a high-confidence one for the same
-   track (real ByteTrack matches high-score detections first; this
-   doesn't). Not touched — this is a real behavioral fix to the matching
-   logic, not a visibility fix, and a bigger, separate piece of work.
-
-**Don't turn `--continue-threshold` on for the real batch until item 4 is
-addressed too.** It doesn't block the batch itself, which doesn't use
-hysteresis at all.
-
-## MediaPipe as a second detector — investigated, concluded, code removed
-
-MediaPipe Face Landmarker was investigated as an independent second check
-and found genuinely non-viable: functionally blind to faces at the size
-they appear in this footage (a face EgoBlur scored 1.00 confidence
-produced zero MediaPipe detections on the full frame, found instantly
-once cropped/upscaled — a BlazeFace-family scale limitation, not a config
-issue). All 4 frames where MediaPipe found something EgoBlur didn't were
-MediaPipe's own false positives on hands/tools. **Do not wire it in
-as-is.** `jobs/10_blur_egoblur.py` has zero MediaPipe references.
-
-## Accepted residual risk — not fixable today, know about it
-
-- **No independent second-opinion detector is actually running.** YuNet
-  weights were never sourced; MediaPipe proved non-viable (above). The
-  low-threshold sweep on EgoBlur's *own* detections is the only signal
-  against a genuinely missed face. State this honestly in the eventual
-  dataset card.
-- **The PEP 723 header pins torch to a CUDA-only index**, so the job
-  cannot resolve its dependencies on macOS at all. Irrelevant on the
-  RunPod pod; a real portability bug for anyone forking this on a Mac.
-
-## SSH access — now properly set up (was a real time-sink this session)
-
-The web terminal's paste buffer silently truncates large pastes (a
-250-line script landed as ~20 lines with no error until it was run) —
-this is what actually forced setting up real SSH instead of working
-around it.
-
-**Which SSH mode matters:** RunPod offers two. **Basic SSH**
-(`ssh <id>@ssh.runpod.io`) does **not** support SCP/SFTP — useless for
-getting files onto the pod, which was the actual problem. **Full SSH over
-exposed TCP** (`ssh root@<ip> -p <port>`) does support SCP and is what
-actually unblocked file transfer. Requires: `22` listed under the pod's
-**Expose TCP Ports**, and `sshd` actually running in the container
-(`pgrep -a sshd`; start with `service ssh start` or
-`mkdir -p /run/sshd && /usr/sbin/sshd` if not).
-
-**Made durable across pods, not just this one:** `scripts/runpod_setup.sh`
-now keeps the real `authorized_keys` on `/workspace/.ssh/` (the volume)
-and symlinks `/root/.ssh/authorized_keys` to it — mirroring the exact
-same pattern the script already used for the rclone config (container
-disk wiped on every stop, volume survives). Populate
-`/workspace/.ssh/authorized_keys` once, and every future pod that mounts
-this same volume has working SSH automatically, no per-pod key-pasting.
-It also rescues any key RunPod's own account-level injection may have
-already written to container disk before replacing the file with the
-symlink, so it won't clobber a working setup. **Caveat the user
-themselves flagged and was right about:** this only helps for pods that
-reattach *this specific* volume — for a genuinely different pod/volume,
-also register the key once at **Console → User Settings → SSH Keys**
-(RunPod's own account-level mechanism, works on any pod using a
-standard template, no volume dependency at all).
-
-This mechanism is currently **uncommitted** — see below.
-
-## How we got here (condensed timeline, for context on *why*)
-
-1. `test-run-1` — high `fill_integrity_violations`, faces visible at 35
-   flagged timestamps, mostly at the *leading edge* of a face entering
-   frame.
-2. Root-caused: `build_tracks`' backward hold was 10x shorter than the
-   forward hold. Fixed (`0ab77da`, `dcad7e1`) to be symmetric by default.
-3. Tried `--face-threshold 0.20` (`test-run-2`) — a mistake, over-redacted
-   the wearer's own hands.
-4. Built `sweep_params.py`; `--hold-frames 45` alone (threshold back at
-   0.30) gave **35/35** coverage. Became `test-run-3`.
-5. Explored hysteresis and MediaPipe-as-second-detector. Hysteresis kept,
-   off by default; MediaPipe rejected.
-6. `test-run-3`'s fill-integrity number finally confirmed with real
-   severity evidence (`diag_integrity.py`), not just a visual spot-check
-   — see "Do this first" above.
-7. Built `det_low`/`n_low_absorbed` visibility fixes for hysteresis, ran
-   an adversarial code review against them, found 2 real correctness bugs
-   plus 2 design issues in the fix itself, fixed all 4 (mutation-tested).
-
-## RunPod gotchas already fixed — don't re-discover these
-
-- **Container disk is wiped on every pod `stop`; `/workspace` (the
-  volume) survives.** `uv`, `ffmpeg`, `ffprobe`, `rclone`, and now SSH's
-  `authorized_keys` all live on `/workspace`, never installed/written via
-  a path that lands on container disk.
-- **`rclone`'s config** is pinned to `/workspace/.rclone.conf` via
-  `$RCLONE_CONFIG`.
-- **After any pod restart, or any new terminal connecting to an already-
-  running pod**, run:
-  ```bash
-  cd /workspace/egoannote && git pull && bash scripts/runpod_setup.sh
-  source /workspace/env.sh
-  ```
-  The `source` step matters — a script cannot export into its parent
-  shell.
-- **Long jobs must run detached**, or a browser/terminal disconnect kills
-  them mid-run:
-  ```bash
-  cd /workspace/egoannote && setsid nohup env PATH="/workspace/bin:$PATH" \
-    UV_CACHE_DIR=/workspace/.uv-cache /workspace/bin/uv run jobs/10_blur_egoblur.py \
-    <args> > /workspace/run.log 2>&1 < /dev/null &
-  tail -f /workspace/run.log   # Ctrl-C only stops watching, not the job
-  ```
-- **The 8-hour watchdog (`arm_watchdog`) almost certainly can't fire** —
-  `runpodctl` was never configured with an API key. Stop the pod
-  yourself when done.
-- **Community Cloud can fail to resume** ("not enough free GPUs"). Try
-  Resume a few times first; a Network Volume survives independent of any
-  specific pod if it keeps happening.
-- **The detection checkpoint is genuinely resumable and fsynced per
-  batch.** `--face-threshold` / `--hold-frames` / `--dilate-scale` /
-  `--motion-margin-px` do **not** invalidate it; `--gen`, weights,
-  `--sweep-threshold`, `--nms-iou`, `--detect-hz`, or adding/removing
-  `--lp-weights-gen2` **do**.
-- **The web terminal silently truncates large pastes** with no error
-  until you try to run the result. Use real SSH (see above) for anything
-  longer than a couple of lines.
-
-## Diagnostic scripts
-
-All standalone, read-only tools operating on a run's own
-`*.manifest.json` + `checkpoints/*.jsonl` — **zero GPU cost**. None are
-committed to the repo (by design — throwaway analysis tools, not
-pipeline code).
-
-- **`diag_integrity.py`** — **confirmed present, at
-  `/workspace/diag_integrity.py` on the pod** (delivered via `scp` once
-  SSH was working; the web terminal paste kept truncating it). Rebuilds a
-  run's *exact* `fill_map` by replaying `build_tracks`/
-  `tracks_to_fill_map` from the real detection checkpoint against the
-  config recorded in the run's own manifest, re-decodes the
-  already-encoded output, and reports per-violation severity instead of
-  a bare pass/fail count. Validated by sanity check: its rebuilt
-  `checked`/`violations` matched `test-run-3`'s manifest exactly
-  (36731/23216) before its severity numbers were trusted. Usage:
-  ```bash
-  uv run diag_integrity.py \
-    --manifest /workspace/out2/GX010057.manifest.json \
-    --checkpoint-dir /workspace/out2/checkpoints \
-    --job-script /workspace/egoannote/jobs/10_blur_egoblur.py \
-    --ffmpeg /workspace/bin/ffmpeg
-  ```
-  Known limitation: doesn't replay `--forced-boxes` (fine for
-  `test-run-3`, which didn't use it — check before reusing on a
-  different run's manifest).
-- **`sweep_params.py`** and **`analyze_timestamps.py`** — presence
-  unconfirmed as of this rewrite; regenerate from conversation history
-  if needed, or ask again — they're small. (`sweep_params.py` is the
-  tool that actually produced `test-run-3`'s settings: tests named
-  parameter combinations against a run's existing checkpoint, reporting
-  coverage of a timestamp list plus bottom-third-of-frame area as a
-  hand-leakage proxy. `analyze_timestamps.py` classifies human-flagged
-  MM:SS timestamps as `DETECTED_FILTERED`/`NEVER_DETECTED`/`COVERED`.)
-- **`pick_threshold.py`**, **`inspect_frame.py`**, **`annotate_local.py`**
-  — presence unconfirmed; see prior session notes if needed.
-
-## What's uncommitted right now
-
-Sitting in the working tree, tested (279 tests passing) and
-mutation-tested, but **not yet committed**:
-
-- `jobs/10_blur_egoblur.py` — the `det_low`/`n_low_absorbed` visibility
-  fixes described above (final, adversarial-review-hardened version).
-- `tests/test_blur_job.py` — matching new/updated tests.
-- `scripts/runpod_setup.sh` — the durable SSH `authorized_keys` symlink
-  mechanism described above.
-
-Run `git status`/`git diff` before assuming this handoff describes what's
-actually on `HEAD` — it doesn't yet.
-
-## What's downstream and genuinely not started
-
-Once the batch of 16 clips clears EgoBlur:
-
-- **MediaPipe hand tracking** — code exists, proven working, never run
-  against real *blurred* output.
-- **VLM captioning** — code exists; `models.toml` still ships placeholder
-  model IDs/prices, needs two real models from *different labs* before
-  any real run.
-- **Segmentation** — deliberately unimplemented, blocked on real
-  measurements from hands + captions that don't exist yet.
-- **`verify/` and `pack/`** — both empty files. Dataset assembly/
-  validation not started.
-
-## Immediate next action, concretely
-
-1. Decide whether to commit the uncommitted work above (recommended —
-   it's tested and mutation-tested, just never landed).
-2. Optionally address the resumed-batch config-drift gap (see "Still
-   open" above) — lower urgency, doesn't block a single uninterrupted
-   16-clip run.
-3. Run the 16-clip batch with the settings block above, one clip's
-   `--input-dir` pointed at all 16 source files via `rclone` (remote
-   name `gdrive`, folder `nbt-videos`, config at
-   `/workspace/.rclone.conf`).
-4. The fill-integrity question that used to gate this is closed — no
-   need to re-litigate it unless settings change materially.
+> Work in the `egoannote-stage2` worktree on
+> `feature/stage2-deidentification`. Read `AGENTS.md`, `handover.md`, and
+> `STAGE2_DEIDENTIFICATION_PLAN.md` completely. Confirm the branch and clean
+> status, then start Milestone 4. Do not modify EgoBlur or begin real GPU setup.

@@ -3,10 +3,12 @@
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
 repo cold. Written 2026-08-11 and updated on the Stage II feature branch on
 2026-08-20. The branch includes clean `master` baseline **`9acfe07`** plus
-the Stage II plan and Milestones 1-3 implementation. The full suite is
-**verified by the current test command below** (`uv run --extra test pytest tests/ -q`).
-Run `git status` and read
-`STAGE2_DEIDENTIFICATION_PLAN.md` before changing either GPU stage.
+the reviewed Stage II plan and Milestones 1-3 implementation. The last code
+HEAD before the current handover edit was **`c7b4005`**. The complete suite
+was verified at **423 passing tests** with
+`uv run --extra test pytest tests/ -q`. Run `git status`, then read
+`handover.md` and `STAGE2_DEIDENTIFICATION_PLAN.md` before changing either
+GPU stage.
 
 If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
@@ -38,10 +40,10 @@ EgoBlur (GPU pod)  →  Stage II DINO/SAM2 (same GPU pod)  →  MediaPipe hands 
 **EgoBlur and the eventual real DINO/SAM2 Stage II need a GPU.** They run
 sequentially on the same pod and persistent `/workspace` volume, but in
 independent PEP 723 environments because their Torch/CUDA stacks are not
-assumed compatible. Milestone 1 of Stage II is contract-only and runs
-locally with fake adapters; real model/GPU work does not begin until later
-milestones. MediaPipe remains local CPU/Metal and captioning remains an HTTP
-API call.
+assumed compatible. Stage II Milestones 1-3 are locally testable with fake
+adapters; the real adapters are lazy and cache-only. Rendering, persistent
+model setup, and real GPU execution begin in later milestones. MediaPipe
+remains local CPU/Metal and captioning remains an HTTP API call.
 
 ## Repo layout
 
@@ -105,10 +107,10 @@ models.toml                 VLM model registry. Ships with placeholder
                              any real captioning run.
 tests/                       pytest suite. Run the complete suite before AND after any
                              change: `uv run --extra test pytest tests/ -q`
-handover.md                  a PREVIOUS session's own continuation notes.
-                             Tracked in git (not gitignored) — read it,
-                             it's usually more current/detailed than this
-                             file on whatever the last session actually did.
+handover.md                  the latest continuation notes for the Stage II
+                             worktree. Tracked in git (not gitignored); it
+                             contains exact commits, review fixes, remaining
+                             concerns, and the next-milestone entry point.
 ```
 
 ## Why the GPU job is a single self-contained script
@@ -184,6 +186,39 @@ and pinned with a regression test:
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
 | verify/pack (dataset assembly) | Not started. Empty files. |
 
+## Stage II continuation point
+
+Milestones 1-3 and their review fixes are committed separately on
+`feature/stage2-deidentification`:
+
+- implementation: `03762c5`, `0c8bc87`, `5905aee`;
+- review hardening: `a31e65c`, `ce08d73`, `c5609ca`;
+- documentation refresh: `c7b4005`.
+
+The review's P1 provenance defects are resolved. Reused DINO proposals must
+match their finalized checkpoint rows; SAM fallback review flags cannot be
+canonically removed; and every SAM shard fingerprint binds the pinned SAM2
+revision, configuration file and hash, installed source-tree hash, Torch
+version, and CUDA version. `jobs/20_deidentify_stage2.py` is version `0.3.1`.
+
+Continue with **Milestone 4 — rendering and technical verification** in
+`STAGE2_DEIDENTIFICATION_PLAN.md`. Do not jump directly to RunPod calibration:
+there is no production renderer or technical-verification artifact yet.
+
+Review concerns intentionally carried into later milestones:
+
+- before real SAM2 execution, verify the extracted frame directory's actual
+  count, ordering, and content identity rather than trusting only loader-supplied
+  metadata;
+- profile the real adapter's full-resolution GPU-to-CPU mask transfers and
+  Python-list conversion during the Milestone 6 GPU pilot;
+- describe the conservative fallback accurately as a held padded DINO box, not
+  learned tracking or true interpolation.
+
+These are planned real-adapter/performance tasks, not current failing tests.
+The full handoff, exact runtime pin, validation evidence, and suggested first
+prompt for a new session are in `handover.md`.
+
 ## Immediate priority — the EgoBlur redaction work
 
 Read this section before doing anything with `jobs/10_blur_egoblur.py`.
@@ -208,10 +243,9 @@ mid-gray `FILL_VALUE=128`); this doesn't. **Conclusion: the check is
 too strict against ordinary encoder quantization, confirmed, not
 assumed.** Don't re-litigate this unless settings change materially; if
 you do need to re-check, `diag_integrity.py` is on the pod at
-`/workspace/diag_integrity.py` — not committed to this repo, by design
-(see `handover.md`'s "Diagnostic scripts" section: these are throwaway
-analysis tools, not pipeline code, kept off the pod's `/workspace` or
-regenerated on request rather than checked in).
+`/workspace/diag_integrity.py`. It is deliberately not committed to this
+repo because it was a one-off analysis tool, not pipeline code. Regenerate it
+from the historical session if the pod volume no longer contains it.
 
 **Current best-known-good settings** (arrived at empirically, not
 guessed — a parameter-sweep tool was built specifically to test
@@ -240,11 +274,11 @@ video).
 ## Known open work (real, scoped, not busywork)
 
 **Fixed since this file was first written:** the `max_fill_area_frac`
-dead-canary gate and hysteresis's drift bound (commit `d0cbe10`); plus,
-**currently uncommitted but tested and mutation-tested**, two of the
-three remaining hysteresis visibility gaps (see item 2 below) and a
-durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
-(see "Operational notes for RunPod"). What's left:
+dead-canary gate and hysteresis's drift bound (commit `d0cbe10`), two of the
+three remaining hysteresis visibility gaps (see item 2 below), and the durable
+SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh` (see
+"Operational notes for RunPod"). Those fixes are part of the merged `master`
+baseline used by this worktree. What's left:
 
 1. **A resumed multi-clip batch can silently mix redaction configs.**
    `process_clip`'s manifest-skip only checks whether a manifest file
