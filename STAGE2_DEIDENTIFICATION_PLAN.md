@@ -1,6 +1,6 @@
 # Stage II EgoBlur + DINO/SAM2 De-identification Plan
 
-Status: Milestones 1-4 complete; Milestone 5 next
+Status: Milestones 1-5 complete; Milestone 6 next
 
 Saved: 2026-08-18; milestone structure updated 2026-08-20
 
@@ -10,7 +10,7 @@ Saved: 2026-08-18; milestone structure updated 2026-08-20
 | 2. DINO proposal generation and reuse | Complete — 2026-08-20 |
 | 3. SAM2 propagation and mask shards | Complete — 2026-08-20 |
 | 4. Rendering and technical verification | Complete — 2026-08-20 |
-| 5. Labels, review workflow, and operator UX | Not started |
+| 5. Labels, review workflow, and operator UX | Complete — 2026-08-20 |
 | 6. Real-GPU smoke test and `GX010057` calibration | Not started |
 | 7. Canary and production rollout | Not started |
 
@@ -95,6 +95,16 @@ Add `--json` before the subcommand for machine-readable output. A fake run recor
 - Reuse revalidates the shard set, immutable output hash/size/path, encoder contract, and decoded technical checks. A changed render fingerprint fails as stale and requires explicit render-layer invalidation followed by a frame-zero restart.
 - Finalization requires an existing `SAM_COMPLETE` production state and matching immutable DINO, SAM, render, and output artifacts. It records `PROCESSING_COMPLETE` with human `review_status=PENDING`; it never creates review acceptance.
 - Deterministic tests cover dilation, YUV plane behavior, fingerprint boundaries, stale/tampered artifacts, Stage I-only sourcing, guarded state transitions, and real ffmpeg round trips.
+
+## Milestone 5 private review and operator contract
+
+- Versioned face-event labels, negative examples, manual seeds, evidence extracts, and review flags are content-addressed beneath each run's `DO-NOT-SHIP` directory. Finalization accepts only unchanged private artifacts from that directory.
+- Human review is an immutable, content-bound record separate from processing and automated audit state. Acceptance requires exact processing-manifest and output hashes, full-clip and flagged-interval attestations, accepted labels, and at least 95% conservative coverage for visible or partially visible face events.
+- Any private correction or evidence not bound to current processing makes the effective review status pending. Release checks reject private content even when renamed, internal manifests/reviews, symlinks, missing accepted output, stale review evidence, and any `DO-NOT-SHIP` directory.
+- `doctor`, `smoke`, `pilot`, `sweep`, `run`, `status`, `resume`, `stop`, `review`, and `release-check` support JSON and dry-run behavior. Status keeps processing, automated audit, and human review independent; errors include reusable layers, artifact locations, and recovery guidance.
+- Explicit recomputation invalidates the selected DINO, SAM, or render layer and all downstream state without following symlinks or deleting private history. Cooperative stop markers and compatible resume preserve verified reusable work.
+- `scripts/runpod_setup_stage2.sh` establishes persistent `/workspace` caches, pins and verifies DINO/SAM assets and the SAM runtime/config source, primes the locked PEP 723 environment, and is safe to rerun. CUDA/model loading and all real inference commands remain deliberately blocked until Milestone 6.
+- The operator workflow and private release boundary are documented in `docs/stage2-operator.md`; the full local suite passes with fake adapters and no network or GPU.
 
 ## Architecture
 

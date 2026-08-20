@@ -6,9 +6,9 @@ Updated 2026-08-20 for the next coding session.
 
 - Worktree: `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2`
 - Branch: `feature/stage2-deidentification`
-- Baseline HEAD before Milestone 4: `7cd5b9a`
+- Baseline HEAD before Milestone 5: `f0754f1`
 - Base merged from `master`: `9acfe07`
-- Milestone 4 implementation, tests, and documentation follow that baseline.
+- Milestones through 5 are implemented, tested, and documented on this branch.
 - Nothing from this branch has been pushed or merged into `master` by this
   session.
 
@@ -92,12 +92,17 @@ The complete review then produced separate milestone-specific fix commits:
   non-erasable fallback review flags, and correct reverse propagation at local
   frame zero.
 - `c7b4005` — documentation refreshed to match Milestones 1-3.
+- `f0754f1` — Milestone 4 verified Stage I-only rendering and atomic output
+  promotion.
 
-Milestone 4 adds deterministic Stage I-only YUV rendering, scaled safety
-dilation, bounded shard loading, source color-fact preservation, stripped
-streams/metadata, decoded fill and outside-mask verification, atomic promotion,
-safe reuse, and guarded transition to `PROCESSING_COMPLETE`. The job is now
-version `0.4.0` with render code version `milestone-4`.
+Milestone 5 adds content-addressed private labels, manual seeds, evidence, and
+review flags beneath `DO-NOT-SHIP`; immutable human reviews bound to exact
+processing/output hashes; correction-driven review invalidation; fail-closed
+release scans; cooperative stop, compatible resume, and explicit layered
+recompute; the complete operator command surface; and an idempotent persistent
+RunPod setup script with verified assets. The job is now version `0.5.0` with
+code version `milestone-5`. The setup and all commands are documented in
+`docs/stage2-operator.md`.
 
 ## P1 review problems resolved
 
@@ -120,15 +125,14 @@ The production SAM2 identity is pinned to:
   `1dbd6cb6dfebeaf588c7006ee222c6efbfa9049a7ad472a3cdfb2f5d919e8107`
 
 Those Milestone 3 artifacts were produced by job version `0.3.1`. The current
-Milestone 4 job reports version `0.4.0` and code version `milestone-4`.
+Milestone 5 job reports version `0.5.0` and code version `milestone-5`.
 
 ## Verification completed
 
-- Complete repository test suite: **431 passed**.
-- Focused Stage II suite used during review: **120 passed** before the final P1
-  regression additions.
+- Complete repository test suite: **446 passed**.
+- Focused Stage II job/render/operator suite: **65 passed**.
 - Ruff passes for the Stage II job and Stage II tests.
-- `jobs/20_deidentify_stage2.py --version` reports `0.4.0`; the thin RunPod
+- `jobs/20_deidentify_stage2.py --version` reports `0.5.0`; the thin RunPod
   wrapper delegates to that same parser.
 - Shell syntax and whitespace checks passed.
 - The new fingerprint tests were mutation-tested: they failed when the runtime
@@ -136,6 +140,12 @@ Milestone 4 job reports version `0.4.0` and code version `milestone-4`.
 - The Milestone 4 Stage I-only source and render-fingerprint tests were also
   mutation-tested: each failed when its protection was removed, then passed
   after restoration.
+- Milestone 5's review-ID content binding, strict review-record schema,
+  post-review private-correction invalidation, recompute symlink refusal, and
+  setup-root canonicalization were mutation-tested the same way. Every targeted
+  test failed with its guard removed and passed after restoration.
+- Setup was exercised only in non-mutating dry-run mode. No weights were
+  downloaded and no CUDA/model execution occurred locally.
 
 The complete repository Ruff run still reports three unrelated, pre-existing
 items outside the Stage II change:
@@ -148,22 +158,22 @@ Do not mix those unrelated cleanup items into a Stage II milestone commit.
 
 ## Next milestone
 
-Continue with **Milestone 5: private labels, review workflow, and operator UX**
-in `STAGE2_DEIDENTIFICATION_PLAN.md`.
+Continue with **Milestone 6: real-GPU smoke test and full `GX010057`
+calibration** in `STAGE2_DEIDENTIFICATION_PLAN.md`.
 
-The renderer is an internal tested layer, not yet a public production command.
-Milestone 5 must expose the documented command set, implement explicit render
-invalidation/recompute, private `DO-NOT-SHIP` labels and evidence, immutable
-human review records, actionable recovery output, release checks, and the
-idempotent persistent RunPod setup path. Do not begin real GPU calibration until
-that operator workflow and its acceptance gate pass.
+On RunPod, run the persistent setup, verify the exact assets and offline
+CUDA/model load, attest the extracted frame-window payload, and select a safe
+SAM window size on a 30-60 second slice before paying for the full-clip sweep.
+Then create the private full-clip answer sheet and compare thresholds `0.15`,
+`0.20`, `0.25`, and `0.30`. Real GPU execution remains structurally deferred
+by the Milestone 5 command implementation until this work begins.
 
 ## Remaining concerns, not current failing tests
 
 These were identified during review and should be addressed in their planned
 milestones:
 
-- Before real SAM2 execution, attest the actual extracted frame-window payload,
+- Before real SAM2 execution in Milestone 6, attest the actual extracted frame-window payload,
   not just loader-supplied metadata. Verify frame count, names/order, and content
   identity so an off-by-one or wrong directory cannot reach SAM2 with plausible
   metadata. This belongs with the Stage II setup/real-adapter path in Milestones
@@ -205,18 +215,21 @@ Two older EgoBlur issues remain outside current Stage II scope:
 ## RunPod reminders
 
 - Only `/workspace` persists across pod stops.
-- Re-run `scripts/runpod_setup.sh` and source `/workspace/env.sh` after a restart.
+- Run `scripts/runpod_setup_stage2.sh` for Stage II and source the generated
+  `/workspace/stage2-env.sh` after a restart.
 - Use detached execution for long jobs.
-- Keep model/checkpoint caches and the future Stage II setup under `/workspace`.
+- Keep model/checkpoint caches and Stage II setup under `/workspace`.
 - Use full SSH over an exposed TCP port for file transfer; RunPod Basic SSH does
   not support SCP/SFTP.
-- No production Stage II command, persistent model setup, private review
-  workflow, or real GPU inference exists yet. The renderer exists only as an
-  internal tested layer until Milestone 5 exposes it safely.
+- The production-shaped commands and persistent setup exist, but real GPU
+  execution deliberately returns `REAL_GPU_EXECUTION_DEFERRED` until Milestone
+  6. No model assets were downloaded and no real Stage II clip was processed in
+  Milestone 5.
 
 ## Suggested first message in the new chat
 
 > Work in the `egoannote-stage2` worktree on
 > `feature/stage2-deidentification`. Read `AGENTS.md`, `handover.md`, and
 > `STAGE2_DEIDENTIFICATION_PLAN.md` completely. Confirm the branch and clean
-> status, then start Milestone 5. Do not modify EgoBlur or begin real GPU setup.
+> status, then start Milestone 6 with the RunPod setup and short real-GPU smoke
+> slice. Do not modify EgoBlur or begin the full sweep before the smoke gate.

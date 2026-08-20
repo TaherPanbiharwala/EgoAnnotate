@@ -3,9 +3,9 @@
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
 repo cold. Written 2026-08-11 and updated on the Stage II feature branch on
 2026-08-20. The branch includes clean `master` baseline **`9acfe07`** plus
-the reviewed Stage II plan and Milestones 1-4 implementation. The last baseline
-HEAD before Milestone 4 was **`7cd5b9a`**. The complete suite
-was verified at **431 passing tests** with
+the reviewed Stage II plan and Milestones 1-5 implementation. The last baseline
+HEAD before Milestone 5 was **`f0754f1`**. The complete suite
+was verified at **446 passing tests** with
 `uv run --extra test pytest tests/ -q`. Run `git status`, then read
 `handover.md` and `STAGE2_DEIDENTIFICATION_PLAN.md` before changing either
 GPU stage.
@@ -40,10 +40,11 @@ EgoBlur (GPU pod)  →  Stage II DINO/SAM2 (same GPU pod)  →  MediaPipe hands 
 **EgoBlur and the eventual real DINO/SAM2 Stage II need a GPU.** They run
 sequentially on the same pod and persistent `/workspace` volume, but in
 independent PEP 723 environments because their Torch/CUDA stacks are not
-assumed compatible. Stage II Milestones 1-4 are locally testable with fake
+assumed compatible. Stage II Milestones 1-5 are locally testable with fake
 adapters and real local ffmpeg fixtures; the real model adapters are lazy and
-cache-only. Persistent model setup and real GPU execution begin in later milestones. MediaPipe
-remains local CPU/Metal and captioning remains an HTTP API call.
+cache-only. Milestone 5 provides the persistent setup and operator paths, but
+downloads, CUDA/model-load verification, and real inference begin in Milestone 6.
+MediaPipe remains local CPU/Metal and captioning remains an HTTP API call.
 
 ## Repo layout
 
@@ -54,7 +55,7 @@ jobs/10_blur_egoblur.py     first GPU job. Self-contained PEP 723 script
                              docstring before changing anything in it.
 jobs/20_deidentify_stage2.py
                              Stage II self-contained PEP 723 job. Milestones
-                             1-4 contain schemas, strict Stage I validation,
+                             1-5 contain schemas, strict Stage I validation,
                              layered fingerprints, atomic state, immutable
                              artifacts, full/tiled DINO orchestration, anchor
                              checkpoints, threshold reuse, bounded forward/
@@ -64,8 +65,10 @@ jobs/20_deidentify_stage2.py
                              verified config, runtime source tree, Torch, and
                              CUDA identities, plus Stage I-only YUV rendering,
                              technical verification, atomic output promotion,
-                             and guarded processing finalization. Real model
-                             adapters are lazy/cache-only; no production command yet.
+                             guarded processing finalization, private labels,
+                             immutable review/release gates, stop/resume, and
+                             the complete operator command surface. Real model
+                             adapters are lazy/cache-only until Milestone 6.
 jobs/_contract.py           the shard-metadata contract other future GPU
                              jobs (hand-pose, depth, SLAM) will vendor by
                              copy — NOT imported (see PEP 723 section).
@@ -74,7 +77,10 @@ scripts/22_blur_review.py   builds an HTML gallery of flagged detections
                              publishing.
 scripts/runpod_setup.sh     idempotent RunPod environment setup. Re-run
                              after every pod restart (see "RunPod" below).
-scripts/runpod_stage2.sh    thin wrapper for Stage II validate/fake-run/status.
+scripts/runpod_setup_stage2.sh
+                             persistent, hash-verifying Stage II RunPod setup.
+scripts/runpod_stage2.sh    thin wrapper for the Stage II operator commands.
+docs/stage2-operator.md     setup, command, correction, review, and release guide.
 scripts/demo.py             zero-setup plumbing smoke test — no GPU, no
                              API key, runs the whole non-GPU pipeline
                              against a bundled synthetic clip.
@@ -182,7 +188,7 @@ and pinned with a regression test:
 | Stage | Status |
 |---|---|
 | EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
-| Stage II DINO/SAM2 | Milestones 1-4 complete on `feature/stage2-deidentification`: contracts, DINO proposals/reuse, bounded SAM propagation/fallback shards, and verified Stage I-only rendering with atomic promotion. Official model adapters remain pinned and lazy. No real GPU inference or production operator workflow exists yet. Continue with Milestone 5 in `STAGE2_DEIDENTIFICATION_PLAN.md`. |
+| Stage II DINO/SAM2 | Milestones 1-5 complete on `feature/stage2-deidentification`: contracts, DINO proposals/reuse, bounded SAM propagation/fallback shards, verified Stage I-only rendering, private review/release gates, and the persistent operator workflow. Official model adapters remain pinned and lazy. Continue with the Milestone 6 real-GPU smoke test and `GX010057` calibration in `STAGE2_DEIDENTIFICATION_PLAN.md`. |
 | MediaPipe hands | Code complete, unit-tested, proven working (Metal-accelerated, fast). Never run against real *redacted* output — only a synthetic test clip. |
 | VLM captioning | Code complete, unit-tested. `models.toml` still has placeholder model IDs / $0.00 prices — cannot run for real until filled in with two real models from different labs. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
@@ -201,13 +207,16 @@ The review's P1 provenance defects are resolved. Reused DINO proposals must
 match their finalized checkpoint rows; SAM fallback review flags cannot be
 canonically removed; and every SAM shard fingerprint binds the pinned SAM2
 revision, configuration file and hash, installed source-tree hash, Torch
-version, and CUDA version. Milestone 4 adds the verified renderer and raises
-`jobs/20_deidentify_stage2.py` to version `0.4.0`.
+version, and CUDA version. Milestone 4 adds the verified renderer. Milestone 5
+adds private content-addressed labels/evidence, immutable hash-bound human
+reviews, fail-closed release checks, explicit stop/resume/recompute, the full
+operator command surface, and verified persistent setup. The Stage II job is
+now version `0.5.0` with code version `milestone-5`.
 
-Continue with **Milestone 5 — private labels, review workflow, and operator UX**
-in `STAGE2_DEIDENTIFICATION_PLAN.md`. Do not jump directly to RunPod calibration:
-real model setup, production commands, private-label enforcement, and immutable
-human review records still do not exist.
+Continue with **Milestone 6 — real-GPU smoke test and full `GX010057`
+calibration** in `STAGE2_DEIDENTIFICATION_PLAN.md`. Run the persistent setup on
+the pod, verify offline CUDA/model loading, attest extracted frame payloads,
+select the safe SAM window size, and only then begin the full threshold sweep.
 
 Review concerns intentionally carried into later milestones:
 

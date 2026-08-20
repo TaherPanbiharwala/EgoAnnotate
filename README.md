@@ -10,8 +10,9 @@ demo. Runs on one laptop plus a small amount of rented GPU time.
 > **Status: early build.** The core annotation pipeline and EgoBlur Stage I
 > are implemented and tested. Stage II de-identification now has validated
 > contracts, full/tiled DINO proposal reuse, bounded SAM2 propagation, and
-> fail-closed mask shards. Its final renderer, RunPod operator workflow, and
-> real-GPU calibration are not built yet. Segmentation, the review UI, and HF
+> fail-closed mask shards, verified rendering, private review/release gates,
+> and a persistent RunPod operator workflow. Real-GPU calibration is not built
+> yet. Segmentation, the review UI, and HF
 > packaging also remain in progress.
 
 ## Setup
@@ -32,7 +33,8 @@ uv sync
 (MediaPipe, OpenCV, PyArrow, Pydantic, httpx). Local hand tracking and VLM
 captioning do not require a GPU. EgoBlur and Stage II use isolated PEP 723
 jobs under `jobs/` because their Torch/CUDA environments are intentionally
-separate; the persistent Stage II RunPod setup command is still planned.
+separate. See [the Stage II operator guide](docs/stage2-operator.md) for its
+persistent setup, dry-run workflow, private artifacts, review, and release gate.
 
 ## Try it — no accounts, no GPU, no API key
 
@@ -159,9 +161,8 @@ uv run --with ruff ruff check src scripts jobs tests
   design is finalized but deliberately not implemented until real hand-
   tracking data exists to calibrate its thresholds against. See that file's
   docstring for the full design and why it's staged this way.
-- The Stage II renderer and technical verifier, real-GPU DINO/SAM2 calibration,
-  review UI, GPU perception layers (objects/depth/camera-pose), dataset
-  packaging, and published benchmarks.
+- Real-GPU DINO/SAM2 calibration, the review UI, GPU perception layers
+  (objects/depth/camera-pose), dataset packaging, and published benchmarks.
 
 ## Known limitations (stated here, not buried)
 

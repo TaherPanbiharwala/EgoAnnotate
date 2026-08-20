@@ -1,14 +1,24 @@
 # /// script
 # requires-python = ">=3.11,<3.13"
-# dependencies = ["numpy>=1.26,<2.3"]
+# dependencies = [
+#   "numpy==1.26.4",
+#   "torch==2.5.1",
+#   "torchvision==0.20.1",
+#   "transformers==4.49.0",
+#   "pillow==11.1.0",
+#   "tqdm==4.67.1",
+#   "hydra-core==1.3.2",
+#   "iopath==0.1.10",
+# ]
 # ///
 """Stage II face de-identification job.
 
-Milestones 1-4 define the fail-closed local contracts, DINO proposal layer,
-bounded SAM2 mask-shard layer, and verified Stage I-only renderer. Heavy model
-imports remain lazy so deterministic adapters and rendering fixtures can be
-exercised without a GPU. Later milestones expose the real GPU command in this
-same self-contained PEP-723 job because GPU jobs may not share an environment.
+Milestones 1-5 define the fail-closed local contracts, DINO proposal layer,
+bounded SAM2 mask-shard layer, verified Stage I-only renderer, private review
+artifacts, release gating, and operator command surface. Heavy model imports
+remain lazy so deterministic adapters and rendering fixtures can be exercised
+without a GPU. Milestone 6 enables real GPU execution in this same
+self-contained PEP-723 job because GPU jobs may not share an environment.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -32,12 +43,13 @@ import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 STAGE2_SCHEMA_VERSION = 1
-STAGE2_CODE_VERSION = "milestone-4"
-STAGE2_JOB_VERSION = "0.4.0"
+STAGE2_CODE_VERSION = "milestone-5"
+STAGE2_JOB_VERSION = "0.5.0"
 DINO_CODE_VERSION = "milestone-2"
 SAM_CODE_VERSION = "milestone-3.1-runtime-bound"
 RENDER_CODE_VERSION = "milestone-4"
@@ -457,6 +469,9 @@ class ReviewRecord:
     review_status: str
     reviewer: str
     reviewed_at: str
+    full_clip_reviewed: bool = False
+    flagged_intervals_reviewed: bool = False
+    notes: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -487,6 +502,8 @@ class ProcessingManifest:
     render_artifact: ArtifactRef
     manual_seed_artifacts: tuple[ArtifactRef, ...] = ()
     label_artifacts: tuple[ArtifactRef, ...] = ()
+    evidence_artifacts: tuple[ArtifactRef, ...] = ()
+    review_flag_artifacts: tuple[ArtifactRef, ...] = ()
     review_record: ArtifactRef | None = None
 
 
@@ -499,6 +516,9 @@ class RunPaths:
     dino_checkpoint: Path
     sam_dir: Path
     render: Path
+    private_root: Path
+    reviews_dir: Path
+    stop_request: Path
 
 
 def _jsonable(value: Any) -> Any:
@@ -955,7 +975,20 @@ def build_run_paths(work_dir: Path, run_id: str, clip_id: str) -> RunPaths:
         dino_checkpoint=resolved_root / "dino" / "checkpoint.jsonl",
         sam_dir=resolved_root / "sam",
         render=resolved_root / "render" / "artifact.json",
+        private_root=resolved_root / "DO-NOT-SHIP",
+        reviews_dir=resolved_root / "reviews",
+        stop_request=resolved_root / "control" / "stop-request.json",
     )
+
+
+def assert_run_root_safe(paths: RunPaths) -> None:
+    for candidate in (paths.root.parents[1], paths.root.parents[0], paths.root):
+        if candidate.is_symlink() or candidate.resolve(strict=False) != candidate:
+            raise Stage2Error(
+                "UNSAFE_OUTPUT_LOCATION",
+                f"Stage II run path became symbolic or redirected: {candidate}",
+                recovery="Restore the real run directory or choose a new work directory.",
+            )
 
 
 def _parse_rate(value: str | None, *, path: Path, field_name: str) -> float:
@@ -2517,6 +2550,314 @@ def validate_manual_seeds(
         seen.add(seed.seed_id)
         validated.append(seed)
     return tuple(sorted(validated, key=lambda seed: (seed.frame_idx, seed.seed_id)))
+
+
+def validate_face_event_labels(
+    labels: tuple[FaceEventLabel, ...], stage1: StageIInput
+) -> tuple[FaceEventLabel, ...]:
+    seen: set[str] = set()
+    validated = []
+    for label in labels:
+        if not isinstance(label, FaceEventLabel):
+            raise Stage2Error(
+                "INVALID_PRIVATE_LABEL",
+                "Private labels must use the versioned FaceEventLabel schema.",
+            )
+        problems = []
+        if (
+            not isinstance(label.schema_version, int)
+            or isinstance(label.schema_version, bool)
+            or label.schema_version != STAGE2_SCHEMA_VERSION
+        ):
+            problems.append("schema_version")
+        if label.clip_id != stage1.clip_id:
+            problems.append("clip_id")
+        if (
+            not isinstance(label.event_id, str)
+            or label.event_id in {".", ".."}
+            or not _SAFE_COMPONENT.fullmatch(label.event_id)
+            or label.event_id in seen
+        ):
+            problems.append("event_id")
+        if (
+            not isinstance(label.frame_start, int)
+            or isinstance(label.frame_start, bool)
+            or not isinstance(label.frame_end, int)
+            or isinstance(label.frame_end, bool)
+            or not 0 <= label.frame_start <= label.frame_end < stage1.source_video.n_frames
+        ):
+            problems.append("frame_range")
+        if not _valid_frame_box(
+            label.conservative_box,
+            stage1.source_video.display_width,
+            stage1.source_video.display_height,
+        ):
+            problems.append("conservative_box")
+        if label.label_kind not in {"face_event", "negative_example"}:
+            problems.append("label_kind")
+        if label.visibility not in {"visible", "partial", "occluded", "not_applicable"}:
+            problems.append("visibility")
+        if not isinstance(label.category, str) or not label.category.strip():
+            problems.append("category")
+        if label.stage1_verdict not in {
+            "covered",
+            "partial",
+            "missed",
+            "not_applicable",
+        }:
+            problems.append("stage1_verdict")
+        if not isinstance(label.dino_proposal_verdicts, tuple):
+            problems.append("dino_proposal_verdicts")
+        else:
+            proposal_ids = set()
+            for verdict in label.dino_proposal_verdicts:
+                if not isinstance(verdict, dict):
+                    problems.append("dino_proposal_verdicts")
+                    break
+                proposal_id = verdict.get("proposal_id")
+                if (
+                    not isinstance(proposal_id, str)
+                    or not proposal_id
+                    or proposal_id in proposal_ids
+                    or verdict.get("verdict")
+                    not in {"face", "false_positive", "missed", "not_applicable"}
+                ):
+                    problems.append("dino_proposal_verdicts")
+                    break
+                proposal_ids.add(proposal_id)
+        if label.final_mask_coverage is not None and (
+            isinstance(label.final_mask_coverage, bool)
+            or not isinstance(label.final_mask_coverage, (int, float))
+            or not math.isfinite(label.final_mask_coverage)
+            or not 0.0 <= label.final_mask_coverage <= 1.0
+        ):
+            problems.append("final_mask_coverage")
+        if label.reviewer_disposition not in {
+            "pending",
+            "accepted",
+            "rejected",
+            "manual_seed_required",
+        }:
+            problems.append("reviewer_disposition")
+        if label.label_kind == "negative_example" and label.stage1_verdict not in {
+            "covered",
+            "not_applicable",
+        }:
+            problems.append("negative_example_stage1_verdict")
+        if problems:
+            raise Stage2Error(
+                "INVALID_PRIVATE_LABEL",
+                f"Private label {label.event_id!r} is invalid.",
+                details={"problems": sorted(set(problems))},
+                recovery="Correct the private label file under DO-NOT-SHIP, then retry.",
+            )
+        seen.add(label.event_id)
+        validated.append(label)
+    return tuple(
+        sorted(validated, key=lambda item: (item.frame_start, item.frame_end, item.event_id))
+    )
+
+
+def _private_path(paths: RunPaths, relative: Path) -> Path:
+    assert_run_root_safe(paths)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise Stage2Error("UNSAFE_PRIVATE_PATH", "Private artifact path is unsafe.")
+    if paths.private_root.is_symlink():
+        raise Stage2Error(
+            "UNSAFE_PRIVATE_PATH", "DO-NOT-SHIP may not be a symbolic link."
+        )
+    candidate = paths.private_root / relative
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(paths.private_root.resolve(strict=False))
+    except ValueError as exc:
+        raise Stage2Error(
+            "UNSAFE_PRIVATE_PATH", "Private artifact escaped DO-NOT-SHIP."
+        ) from exc
+    current = paths.private_root
+    for component in relative.parts[:-1]:
+        current /= component
+        if current.is_symlink():
+            raise Stage2Error(
+                "UNSAFE_PRIVATE_PATH", "Private artifact path contains a symbolic link."
+            )
+    return resolved
+
+
+def _write_private_json(
+    paths: RunPaths, *, artifact_type: str, payload: dict[str, Any]
+) -> ArtifactRef:
+    content = {
+        "schema_version": STAGE2_SCHEMA_VERSION,
+        "artifact_type": artifact_type,
+        **payload,
+    }
+    digest = hashlib.sha256(canonical_json_bytes(content)).hexdigest()
+    path = _private_path(paths, Path(artifact_type) / f"{artifact_type}-{digest}.json")
+    return write_immutable_json(path, content)
+
+
+def write_private_labels(
+    paths: RunPaths,
+    *,
+    stage1: StageIInput,
+    labels: tuple[FaceEventLabel, ...],
+) -> ArtifactRef:
+    validated = validate_face_event_labels(labels, stage1)
+    return _write_private_json(
+        paths,
+        artifact_type="labels",
+        payload={"clip_id": stage1.clip_id, "labels": validated},
+    )
+
+
+def write_private_manual_seeds(
+    paths: RunPaths,
+    *,
+    stage1: StageIInput,
+    seeds: tuple[ManualSeed, ...],
+) -> ArtifactRef:
+    validated = validate_manual_seeds(seeds, stage1)
+    return _write_private_json(
+        paths,
+        artifact_type="manual-seeds",
+        payload={"clip_id": stage1.clip_id, "seeds": validated},
+    )
+
+
+def load_private_labels_file(path: Path, stage1: StageIInput) -> tuple[FaceEventLabel, ...]:
+    raw = read_json(resolve_input_file(path, "private labels file"))
+    if (
+        raw.get("schema_version") != STAGE2_SCHEMA_VERSION
+        or raw.get("artifact_type") != "labels"
+        or raw.get("clip_id") != stage1.clip_id
+        or not isinstance(raw.get("labels"), list)
+    ):
+        raise Stage2Error(
+            "INVALID_PRIVATE_LABEL",
+            "Private labels file envelope is invalid.",
+            recovery="Use the versioned labels envelope for this exact clip.",
+        )
+    labels = []
+    try:
+        for value in raw["labels"]:
+            labels.append(
+                FaceEventLabel(
+                    schema_version=value["schema_version"],
+                    event_id=value["event_id"],
+                    clip_id=value["clip_id"],
+                    frame_start=value["frame_start"],
+                    frame_end=value["frame_end"],
+                    conservative_box=tuple(value["conservative_box"]),
+                    label_kind=value["label_kind"],
+                    visibility=value["visibility"],
+                    category=value["category"],
+                    stage1_verdict=value["stage1_verdict"],
+                    dino_proposal_verdicts=tuple(value["dino_proposal_verdicts"]),
+                    final_mask_coverage=value.get("final_mask_coverage"),
+                    reviewer_disposition=value["reviewer_disposition"],
+                )
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_PRIVATE_LABEL", "Private labels are malformed.") from exc
+    return validate_face_event_labels(tuple(labels), stage1)
+
+
+def load_private_manual_seeds_file(
+    path: Path, stage1: StageIInput
+) -> tuple[ManualSeed, ...]:
+    raw = read_json(resolve_input_file(path, "private manual seeds file"))
+    if (
+        raw.get("schema_version") != STAGE2_SCHEMA_VERSION
+        or raw.get("artifact_type") != "manual-seeds"
+        or raw.get("clip_id") != stage1.clip_id
+        or not isinstance(raw.get("seeds"), list)
+    ):
+        raise Stage2Error(
+            "INVALID_MANUAL_SEED",
+            "Private manual-seed file envelope is invalid.",
+            recovery="Use the versioned manual-seeds envelope for this exact clip.",
+        )
+    try:
+        seeds = tuple(
+            ManualSeed(
+                schema_version=value["schema_version"],
+                seed_id=value["seed_id"],
+                clip_id=value["clip_id"],
+                frame_idx=value["frame_idx"],
+                box=tuple(value["box"]),
+                reason=value["reason"],
+            )
+            for value in raw["seeds"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_MANUAL_SEED", "Private manual seeds are malformed.") from exc
+    return validate_manual_seeds(seeds, stage1)
+
+
+def write_private_review_flags(
+    paths: RunPaths,
+    *,
+    clip_id: str,
+    sam_shards: tuple[ArtifactRef, ...],
+) -> ArtifactRef:
+    safe_component(clip_id, "clip_id")
+    flags = []
+    for reference in sam_shards:
+        loaded = load_sam_mask_shard(Path(reference.path), expected_artifact=reference)
+        flags.extend(loaded.meta.review_flags)
+    return _write_private_json(
+        paths,
+        artifact_type="review-flags",
+        payload={
+            "clip_id": clip_id,
+            "sam_mask_set_sha256": artifact_set_sha256(sam_shards),
+            "flags": tuple(sorted(set(flags))),
+        },
+    )
+
+
+def register_private_evidence(
+    paths: RunPaths,
+    *,
+    clip_id: str,
+    evidence_id: str,
+    evidence_kind: str,
+    source: Path,
+    frame_start: int,
+    frame_end: int,
+) -> tuple[ArtifactRef, ArtifactRef]:
+    safe_component(clip_id, "clip_id")
+    safe_component(evidence_id, "evidence_id")
+    if not evidence_kind.strip() or not 0 <= frame_start <= frame_end:
+        raise Stage2Error("INVALID_PRIVATE_EVIDENCE", "Evidence metadata is invalid.")
+    source = resolve_input_file(source, "private evidence")
+    source_ref = artifact_ref(source)
+    suffix = source.suffix.lower() if re.fullmatch(r"\.[a-z0-9]{1,10}", source.suffix.lower()) else ".bin"
+    evidence_path = _private_path(
+        paths,
+        Path("evidence") / f"{evidence_id}-{source_ref.sha256}{suffix}",
+    )
+    try:
+        content = source.read_bytes()
+    except OSError as exc:
+        raise Stage2Error(
+            "PRIVATE_EVIDENCE_READ_FAILED", "Could not read private evidence."
+        ) from exc
+    evidence_ref = write_immutable_bytes(evidence_path, content)
+    metadata_ref = _write_private_json(
+        paths,
+        artifact_type="evidence-records",
+        payload={
+            "clip_id": clip_id,
+            "evidence_id": evidence_id,
+            "evidence_kind": evidence_kind,
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "evidence": evidence_ref,
+        },
+    )
+    return evidence_ref, metadata_ref
 
 
 def sam_prompts_for_window(
@@ -4766,6 +5107,10 @@ def finalize_verified_processing(
     sam_shards: tuple[ArtifactRef, ...],
     render_result: RenderGenerationResult,
     mode: str = "production",
+    manual_seed_artifacts: tuple[ArtifactRef, ...] = (),
+    label_artifacts: tuple[ArtifactRef, ...] = (),
+    evidence_artifacts: tuple[ArtifactRef, ...] = (),
+    review_flag_artifacts: tuple[ArtifactRef, ...] = (),
 ) -> ProcessingManifest:
     """Advance to processing complete only from immutable verified evidence."""
     if mode == "fake":
@@ -4814,6 +5159,27 @@ def finalize_verified_processing(
         raise Stage2Error(
             "SAM_RENDER_MISMATCH", "Render evidence does not bind the selected SAM shards."
         )
+    private_groups = {
+        "manual_seed_artifacts": manual_seed_artifacts,
+        "label_artifacts": label_artifacts,
+        "evidence_artifacts": evidence_artifacts,
+        "review_flag_artifacts": review_flag_artifacts,
+    }
+    private_root = paths.private_root.resolve(strict=False)
+    for group_name, references in private_groups.items():
+        for reference in references:
+            reference_path = Path(reference.path)
+            if reference_path.is_symlink() or artifact_ref(reference_path) != reference:
+                raise Stage2Error(
+                    "PRIVATE_ARTIFACT_CHANGED", f"{group_name} contains a changed artifact."
+                )
+            try:
+                reference_path.resolve(strict=True).relative_to(private_root)
+            except (OSError, ValueError) as exc:
+                raise Stage2Error(
+                    "PRIVATE_ARTIFACT_OUTSIDE_DO_NOT_SHIP",
+                    f"{group_name} must remain under DO-NOT-SHIP.",
+                ) from exc
     advance_state(
         paths.state,
         run_id=run_id,
@@ -4842,6 +5208,10 @@ def finalize_verified_processing(
         dino_artifact=dino_artifact,
         sam_mask_shards=sam_shards,
         render_artifact=render_result.artifact,
+        manual_seed_artifacts=manual_seed_artifacts,
+        label_artifacts=label_artifacts,
+        evidence_artifacts=evidence_artifacts,
+        review_flag_artifacts=review_flag_artifacts,
     )
     write_immutable_json(paths.manifest, manifest)
     advance_state(
@@ -4854,6 +5224,541 @@ def finalize_verified_processing(
         reusable_layers=("dino", "sam", "render"),
     )
     return manifest
+
+
+def _artifact_ref_from_raw(raw: Any, label: str) -> ArtifactRef:
+    try:
+        reference = ArtifactRef(
+            path=str(raw["path"]), sha256=str(raw["sha256"]), bytes=int(raw["bytes"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error(
+            "INVALID_PROCESSING_MANIFEST", f"{label} artifact reference is malformed."
+        ) from exc
+    if not re.fullmatch(r"[0-9a-f]{64}", reference.sha256) or reference.bytes < 1:
+        raise Stage2Error(
+            "INVALID_PROCESSING_MANIFEST", f"{label} artifact reference is invalid."
+        )
+    return reference
+
+
+def _manifest_private_artifacts(
+    paths: RunPaths, raw: dict[str, Any]
+) -> tuple[ArtifactRef, ...]:
+    references = []
+    private_root = paths.private_root.resolve(strict=False)
+    for field_name in (
+        "manual_seed_artifacts",
+        "label_artifacts",
+        "evidence_artifacts",
+        "review_flag_artifacts",
+    ):
+        values = raw.get(field_name, [])
+        if not isinstance(values, list):
+            raise Stage2Error(
+                "INVALID_PROCESSING_MANIFEST", f"{field_name} must be a list."
+            )
+        for index, value in enumerate(values):
+            reference = _artifact_ref_from_raw(value, f"{field_name}[{index}]")
+            path = Path(reference.path)
+            try:
+                path.resolve(strict=True).relative_to(private_root)
+            except (OSError, ValueError) as exc:
+                raise Stage2Error(
+                    "PRIVATE_ARTIFACT_OUTSIDE_DO_NOT_SHIP",
+                    f"{field_name} escaped DO-NOT-SHIP.",
+                ) from exc
+            if path.is_symlink() or artifact_ref(path) != reference:
+                raise Stage2Error(
+                    "PRIVATE_ARTIFACT_CHANGED",
+                    f"{field_name} contains a changed private artifact.",
+                )
+            references.append(reference)
+    if len({(reference.path, reference.sha256) for reference in references}) != len(references):
+        raise Stage2Error(
+            "INVALID_PROCESSING_MANIFEST", "Private artifact references must be unique."
+        )
+    return tuple(references)
+
+
+def current_processing_evidence(
+    paths: RunPaths,
+) -> tuple[dict[str, Any], ArtifactRef, RenderArtifactMeta]:
+    if not paths.manifest.exists():
+        raise Stage2Error(
+            "PROCESSING_MANIFEST_MISSING",
+            "No completed processing manifest exists for this run.",
+            recovery="Resume processing and complete technical verification first.",
+        )
+    raw = read_json(paths.manifest)
+    manifest_ref = artifact_ref(paths.manifest)
+    if (
+        raw.get("schema_version") != STAGE2_SCHEMA_VERSION
+        or raw.get("processing_state") != "PROCESSING_COMPLETE"
+        or raw.get("mode") == "fake"
+    ):
+        raise Stage2Error(
+            "PROCESSING_NOT_REVIEWABLE",
+            "Only complete, non-fake processing evidence may be reviewed.",
+            recovery="Run the production pipeline through technical verification.",
+        )
+    render_ref = _artifact_ref_from_raw(raw.get("render_artifact"), "render")
+    if artifact_ref(Path(render_ref.path)) != render_ref:
+        raise Stage2Error(
+            "PROCESSING_ARTIFACT_CHANGED", "Render evidence changed after processing."
+        )
+    render_meta = render_meta_from_dict(read_json(Path(render_ref.path)))
+    if render_meta.verification.get("passed") is not True:
+        raise Stage2Error(
+            "PROCESSING_NOT_REVIEWABLE", "Render technical verification did not pass."
+        )
+    if artifact_ref(Path(render_meta.output.path)) != render_meta.output:
+        raise Stage2Error(
+            "PROCESSING_ARTIFACT_CHANGED", "Rendered output changed after processing."
+        )
+    _manifest_private_artifacts(paths, raw)
+    return raw, manifest_ref, render_meta
+
+
+def _validated_reviewed_at(value: str) -> str:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise Stage2Error(
+            "INVALID_REVIEW_TIME",
+            "reviewed_at must be an explicit UTC timestamp ending in Z.",
+            recovery="Pass --reviewed-at in ISO-8601 UTC form, for example 2026-08-20T12:00:00Z.",
+        )
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise Stage2Error("INVALID_REVIEW_TIME", "reviewed_at is not valid ISO-8601.") from exc
+    if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        raise Stage2Error("INVALID_REVIEW_TIME", "reviewed_at must be UTC.")
+    return value
+
+
+def _private_label_acceptance_problems(raw_manifest: dict[str, Any]) -> list[str]:
+    problems = []
+    for artifact_index, raw_reference in enumerate(raw_manifest.get("label_artifacts", [])):
+        reference = _artifact_ref_from_raw(
+            raw_reference, f"label_artifacts[{artifact_index}]"
+        )
+        envelope = read_json(Path(reference.path))
+        if envelope.get("artifact_type") != "labels" or not isinstance(
+            envelope.get("labels"), list
+        ):
+            problems.append(f"label artifact {artifact_index} is malformed")
+            continue
+        for value in envelope["labels"]:
+            if not isinstance(value, dict):
+                problems.append(f"label artifact {artifact_index} contains a malformed label")
+                continue
+            event_id = value.get("event_id", "unknown")
+            if value.get("reviewer_disposition") != "accepted":
+                problems.append(f"label {event_id} is not accepted")
+            coverage = value.get("final_mask_coverage")
+            if value.get("label_kind") == "face_event" and value.get("visibility") in {
+                "visible",
+                "partial",
+            } and (
+                isinstance(coverage, bool)
+                or not isinstance(coverage, (int, float))
+                or not math.isfinite(coverage)
+                or coverage < 0.95
+            ):
+                problems.append(f"visible label {event_id} has final coverage below 0.95")
+    return problems
+
+
+def review_record_from_dict(raw: dict[str, Any]) -> ReviewRecord:
+    expected_fields = {
+        "schema_version",
+        "review_id",
+        "processing_manifest_sha256",
+        "output_sha256",
+        "review_status",
+        "reviewer",
+        "reviewed_at",
+        "full_clip_reviewed",
+        "flagged_intervals_reviewed",
+        "notes",
+    }
+    try:
+        record = ReviewRecord(
+            schema_version=int(raw["schema_version"]),
+            review_id=str(raw["review_id"]),
+            processing_manifest_sha256=str(raw["processing_manifest_sha256"]),
+            output_sha256=str(raw["output_sha256"]),
+            review_status=str(raw["review_status"]),
+            reviewer=str(raw["reviewer"]),
+            reviewed_at=str(raw["reviewed_at"]),
+            full_clip_reviewed=raw.get("full_clip_reviewed") is True,
+            flagged_intervals_reviewed=raw.get("flagged_intervals_reviewed") is True,
+            notes=str(raw.get("notes", "")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_REVIEW_RECORD", "Review record is malformed.") from exc
+    problems = []
+    if set(raw) != expected_fields:
+        problems.append("review_record_fields")
+    if (
+        not isinstance(raw.get("schema_version"), int)
+        or isinstance(raw.get("schema_version"), bool)
+        or record.schema_version != STAGE2_SCHEMA_VERSION
+    ):
+        problems.append("schema_version")
+    for field_name in (
+        "review_id",
+        "processing_manifest_sha256",
+        "output_sha256",
+        "review_status",
+        "reviewer",
+        "reviewed_at",
+        "notes",
+    ):
+        if not isinstance(raw.get(field_name, ""), str):
+            problems.append(field_name)
+    for field_name in ("full_clip_reviewed", "flagged_intervals_reviewed"):
+        if not isinstance(raw.get(field_name), bool):
+            problems.append(field_name)
+    if not _SAFE_COMPONENT.fullmatch(record.review_id) or record.review_id in {".", ".."}:
+        problems.append("review_id")
+    if not re.fullmatch(r"[0-9a-f]{64}", record.processing_manifest_sha256):
+        problems.append("processing_manifest_sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", record.output_sha256):
+        problems.append("output_sha256")
+    if record.review_status not in {"ACCEPTED", "REJECTED"}:
+        problems.append("review_status")
+    if not record.reviewer.strip():
+        problems.append("reviewer")
+    try:
+        _validated_reviewed_at(record.reviewed_at)
+    except Stage2Error:
+        problems.append("reviewed_at")
+    if record.review_status == "ACCEPTED" and not (
+        record.full_clip_reviewed and record.flagged_intervals_reviewed
+    ):
+        problems.append("accepted_review_completeness")
+    identity = {
+        "schema_version": record.schema_version,
+        "processing_manifest_sha256": record.processing_manifest_sha256,
+        "output_sha256": record.output_sha256,
+        "review_status": record.review_status,
+        "reviewer": record.reviewer,
+        "reviewed_at": record.reviewed_at,
+        "full_clip_reviewed": record.full_clip_reviewed,
+        "flagged_intervals_reviewed": record.flagged_intervals_reviewed,
+        "notes": record.notes,
+    }
+    expected_review_id = f"review-{hashlib.sha256(canonical_json_bytes(identity)).hexdigest()}"
+    if record.review_id != expected_review_id:
+        problems.append("review_id_content_binding")
+    if problems:
+        raise Stage2Error(
+            "INVALID_REVIEW_RECORD",
+            "Review record failed validation.",
+            details={"problems": problems},
+        )
+    return record
+
+
+def create_review_record(
+    paths: RunPaths,
+    *,
+    reviewer: str,
+    reviewed_at: str,
+    review_status: str,
+    full_clip_reviewed: bool,
+    flagged_intervals_reviewed: bool,
+    notes: str = "",
+) -> tuple[ArtifactRef, ReviewRecord]:
+    assert_run_root_safe(paths)
+    raw, manifest_ref, render_meta = current_processing_evidence(paths)
+    bound_private = {
+        reference.sha256 for reference in _manifest_private_artifacts(paths, raw)
+    }
+    if _private_artifact_hashes(paths).difference(bound_private):
+        raise Stage2Error(
+            "CORRECTION_REQUIRES_REPROCESSING",
+            "Private corrections or evidence changed after this output was processed.",
+            recovery="Resume with --recompute-from sam or render as appropriate, then review the new output.",
+        )
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        raise Stage2Error("INVALID_REVIEWER", "Reviewer must be a non-empty identity.")
+    reviewed_at = _validated_reviewed_at(reviewed_at)
+    review_status = review_status.upper()
+    if review_status not in {"ACCEPTED", "REJECTED"}:
+        raise Stage2Error(
+            "INVALID_REVIEW_STATUS", "Review decision must be ACCEPTED or REJECTED."
+        )
+    if review_status == "ACCEPTED" and not (
+        full_clip_reviewed and flagged_intervals_reviewed
+    ):
+        raise Stage2Error(
+            "INCOMPLETE_HUMAN_REVIEW",
+            "Acceptance requires full-clip and flagged-interval review attestations.",
+            recovery="Watch the full clip and every flagged interval, then rerun review.",
+        )
+    if review_status == "ACCEPTED":
+        label_problems = _private_label_acceptance_problems(raw)
+        if label_problems:
+            raise Stage2Error(
+                "LABEL_ACCEPTANCE_INCOMPLETE",
+                "Private answer-sheet labels are not ready for output acceptance.",
+                details={"problems": label_problems},
+                recovery="Resolve every label, rerender corrections, and record final coverage before review.",
+            )
+    identity = {
+        "schema_version": STAGE2_SCHEMA_VERSION,
+        "processing_manifest_sha256": manifest_ref.sha256,
+        "output_sha256": render_meta.output.sha256,
+        "review_status": review_status,
+        "reviewer": reviewer.strip(),
+        "reviewed_at": reviewed_at,
+        "full_clip_reviewed": full_clip_reviewed,
+        "flagged_intervals_reviewed": flagged_intervals_reviewed,
+        "notes": notes,
+    }
+    review_id = f"review-{hashlib.sha256(canonical_json_bytes(identity)).hexdigest()}"
+    record = ReviewRecord(review_id=review_id, **identity)
+    review_record_from_dict(_jsonable(record))
+    if paths.reviews_dir.is_symlink():
+        raise Stage2Error("UNSAFE_REVIEW_PATH", "Reviews directory may not be a symlink.")
+    path = paths.reviews_dir / f"{review_id}.json"
+    return write_immutable_json(path, record), record
+
+
+def load_review_records(paths: RunPaths) -> tuple[tuple[ArtifactRef, ReviewRecord], ...]:
+    assert_run_root_safe(paths)
+    if not paths.reviews_dir.exists():
+        return ()
+    if paths.reviews_dir.is_symlink() or not paths.reviews_dir.is_dir():
+        raise Stage2Error("UNSAFE_REVIEW_PATH", "Reviews path is not a safe directory.")
+    records = []
+    for path in sorted(paths.reviews_dir.glob("review-*.json")):
+        if path.is_symlink():
+            raise Stage2Error("UNSAFE_REVIEW_PATH", "Review record may not be a symlink.")
+        records.append((artifact_ref(path), review_record_from_dict(read_json(path))))
+    return tuple(records)
+
+
+def effective_review_status(paths: RunPaths) -> tuple[str, ArtifactRef | None]:
+    try:
+        raw, manifest_ref, render_meta = current_processing_evidence(paths)
+    except Stage2Error as exc:
+        if exc.code in {"PROCESSING_MANIFEST_MISSING", "PROCESSING_NOT_REVIEWABLE"}:
+            return "PENDING", None
+        raise
+    bound_private = {
+        reference.sha256 for reference in _manifest_private_artifacts(paths, raw)
+    }
+    if _private_artifact_hashes(paths).difference(bound_private):
+        return "PENDING", None
+    matching = [
+        (reference, record)
+        for reference, record in load_review_records(paths)
+        if record.processing_manifest_sha256 == manifest_ref.sha256
+        and record.output_sha256 == render_meta.output.sha256
+    ]
+    if not matching:
+        return "PENDING", None
+    reference, record = max(matching, key=lambda item: (item[1].reviewed_at, item[1].review_id))
+    return record.review_status, reference
+
+
+def _private_artifact_hashes(paths: RunPaths) -> set[str]:
+    if not paths.private_root.exists():
+        return set()
+    if paths.private_root.is_symlink() or not paths.private_root.is_dir():
+        raise Stage2Error("UNSAFE_PRIVATE_PATH", "DO-NOT-SHIP is not a safe directory.")
+    hashes = set()
+    for path in paths.private_root.rglob("*"):
+        if path.is_symlink():
+            raise Stage2Error("UNSAFE_PRIVATE_PATH", "DO-NOT-SHIP contains a symlink.")
+        if path.is_file():
+            hashes.add(artifact_ref(path).sha256)
+    return hashes
+
+
+def release_check(paths: RunPaths, *, release_root: Path) -> dict[str, Any]:
+    assert_run_root_safe(paths)
+    raw, manifest_ref, render_meta = current_processing_evidence(paths)
+    review_status, review_ref = effective_review_status(paths)
+    problems = []
+    if review_status != "ACCEPTED" or review_ref is None:
+        problems.append("current processing output has no matching accepted human review")
+    supplied_release_root = release_root.expanduser()
+    if supplied_release_root.is_symlink():
+        raise Stage2Error("UNSAFE_RELEASE_ROOT", "Release root may not be a symlink.")
+    try:
+        release_root = supplied_release_root.resolve(strict=True)
+    except OSError as exc:
+        raise Stage2Error(
+            "RELEASE_ROOT_MISSING", "Release root does not exist.",
+            recovery="Create the release staging directory and copy only public artifacts into it.",
+        ) from exc
+    if not release_root.is_dir() or release_root.is_symlink():
+        raise Stage2Error("UNSAFE_RELEASE_ROOT", "Release root must be a real directory.")
+    private_hashes = _private_artifact_hashes(paths)
+    bound_private_hashes = {
+        reference.sha256 for reference in _manifest_private_artifacts(paths, raw)
+    }
+    release_hashes = set()
+    leaked_private = []
+    leaked_internal = []
+    forbidden_directories = []
+    internal_hashes = {manifest_ref.sha256, artifact_ref(paths.state).sha256}
+    internal_hashes.update(reference.sha256 for reference, _record in load_review_records(paths))
+    render_reference = _artifact_ref_from_raw(raw.get("render_artifact"), "render")
+    internal_hashes.add(render_reference.sha256)
+    for path in release_root.rglob("*"):
+        if path.is_symlink():
+            problems.append(f"release package contains symlink: {path.relative_to(release_root)}")
+            continue
+        if path.is_dir() and path.name == "DO-NOT-SHIP":
+            forbidden_directories.append(str(path.relative_to(release_root)))
+        elif path.is_file():
+            digest = artifact_ref(path).sha256
+            release_hashes.add(digest)
+            if digest in private_hashes:
+                leaked_private.append(str(path.relative_to(release_root)))
+            if digest in internal_hashes:
+                leaked_internal.append(str(path.relative_to(release_root)))
+    if forbidden_directories:
+        problems.append(f"DO-NOT-SHIP directories are present: {forbidden_directories}")
+    if leaked_private:
+        problems.append(f"private artifact content is present: {leaked_private}")
+    if leaked_internal:
+        problems.append(f"internal processing/review artifacts are present: {leaked_internal}")
+    unbound_private = sorted(private_hashes.difference(bound_private_hashes))
+    if unbound_private:
+        problems.append(
+            "private corrections/evidence are not bound to current processing: "
+            f"{unbound_private}"
+        )
+    if render_meta.output.sha256 not in release_hashes:
+        problems.append("the accepted rendered output is absent from the release package")
+    if _private_artifact_hashes(paths) != private_hashes:
+        problems.append("DO-NOT-SHIP changed while release checks were running")
+    if artifact_ref(Path(render_meta.output.path)) != render_meta.output:
+        problems.append("accepted rendered output changed while release checks were running")
+    if review_ref is not None and artifact_ref(Path(review_ref.path)) != review_ref:
+        problems.append("human review record changed while release checks were running")
+    if raw.get("review_status") not in {"PENDING", None}:
+        problems.append("processing manifest improperly embeds a human review decision")
+    if problems:
+        raise Stage2Error(
+            "RELEASE_CHECK_FAILED",
+            "Release package is not safe to publish.",
+            details={"problems": problems, "release_root": str(release_root)},
+            recovery="Remove private/stale artifacts, stage the exact accepted output, and rerun release-check.",
+        )
+    return {
+        "release_ready": True,
+        "processing_manifest_sha256": manifest_ref.sha256,
+        "output_sha256": render_meta.output.sha256,
+        "review_record": review_ref,
+        "release_root": str(release_root),
+        "release_file_count": sum(1 for path in release_root.rglob("*") if path.is_file()),
+        "private_artifact_count": len(private_hashes),
+    }
+
+
+def request_stop(paths: RunPaths) -> dict[str, Any]:
+    assert_run_root_safe(paths)
+    state = load_state(paths.state)
+    if state is None:
+        raise Stage2Error("RUN_NOT_FOUND", "Cannot stop a run that does not exist.")
+    if state.state == "PROCESSING_COMPLETE":
+        return {"stop_requested": False, "reason": "already-complete", "state": state}
+    marker = {
+        "schema_version": STAGE2_SCHEMA_VERSION,
+        "artifact_type": "stop_request",
+        "run_id": state.run_id,
+        "clip_id": state.clip_id,
+        "requested": True,
+    }
+    atomic_write_json(paths.stop_request, marker)
+    return {"stop_requested": True, "state": state, "marker": str(paths.stop_request)}
+
+
+def ensure_run_not_stopped(paths: RunPaths) -> None:
+    assert_run_root_safe(paths)
+    if not paths.stop_request.exists():
+        return
+    if paths.stop_request.is_symlink():
+        raise Stage2Error("UNSAFE_CONTROL_PATH", "Stop request may not be a symlink.")
+    marker = read_json(paths.stop_request)
+    state = load_state(paths.state)
+    if (
+        state is None
+        or marker.get("schema_version") != STAGE2_SCHEMA_VERSION
+        or marker.get("artifact_type") != "stop_request"
+        or marker.get("run_id") != state.run_id
+        or marker.get("clip_id") != state.clip_id
+        or marker.get("requested") is not True
+    ):
+        raise Stage2Error("INVALID_STOP_REQUEST", "Stop request marker is malformed.")
+    raise Stage2Error(
+        "STOP_REQUESTED",
+        "Processing stopped cooperatively before starting the next layer.",
+        details={"reusable_layers": state.reusable_layers},
+        recovery=(
+            "Resume explicitly with: bash scripts/runpod_stage2.sh resume "
+            f"--work-dir {shlex.quote(str(paths.root.parents[2]))} "
+            f"--run-id {shlex.quote(state.run_id)} --clip-id {shlex.quote(state.clip_id)}"
+        ),
+    )
+
+
+def clear_stop_request(paths: RunPaths) -> bool:
+    assert_run_root_safe(paths)
+    if not paths.stop_request.exists():
+        return False
+    if paths.stop_request.is_symlink():
+        raise Stage2Error("UNSAFE_CONTROL_PATH", "Stop request may not be a symlink.")
+    try:
+        paths.stop_request.unlink()
+    except OSError as exc:
+        raise Stage2Error("STOP_CLEAR_FAILED", "Could not clear the stop request.") from exc
+    return True
+
+
+def run_status(paths: RunPaths) -> dict[str, Any]:
+    assert_run_root_safe(paths)
+    state = load_state(paths.state)
+    if state is None:
+        raise Stage2Error("RUN_NOT_FOUND", f"No Stage II run state exists at {paths.state}")
+    audit_status = None
+    embedded_review_status = None
+    manifest_ref = None
+    if paths.manifest.exists():
+        raw = read_json(paths.manifest)
+        audit_status = raw.get("audit_status")
+        embedded_review_status = raw.get("review_status")
+        manifest_ref = artifact_ref(paths.manifest)
+    if embedded_review_status == "NOT_REVIEWABLE_FAKE":
+        review_status, review_ref = embedded_review_status, None
+    else:
+        review_status, review_ref = effective_review_status(paths)
+    return {
+        "processing_state": state.state,
+        "audit_status": audit_status,
+        "review_status": review_status,
+        "completed_layers": state.completed_layers,
+        "reusable_layers": state.reusable_layers,
+        "last_error": state.last_error,
+        "stop_requested": paths.stop_request.exists(),
+        "processing_manifest": manifest_ref,
+        "review_record": review_ref,
+        "artifact_locations": {
+            "run_root": str(paths.root),
+            "dino": str(paths.dino),
+            "sam": str(paths.sam_dir),
+            "render": str(paths.render),
+            "private": str(paths.private_root),
+            "reviews": str(paths.reviews_dir),
+        },
+    }
 
 
 class MetaSam2VideoAdapter:
@@ -5205,6 +6110,7 @@ def run_fake_pipeline(
         source_video, stage1_video, stage1_manifest, probe_fn=probe_fn
     )
     paths = build_run_paths(work_dir, run_id, validated.clip_id)
+    ensure_run_not_stopped(paths)
     resolved_inputs = {
         Path(validated.source.path),
         Path(validated.stage1_video.path),
@@ -5254,6 +6160,7 @@ def run_fake_pipeline(
         ),
     )
     dino_ref = dino_result.artifact
+    ensure_run_not_stopped(paths)
     advance_state(
         paths.state,
         run_id=run_id,
@@ -5290,6 +6197,7 @@ def run_fake_pipeline(
         ),
     )
     sam_refs = sam_result.shards
+    ensure_run_not_stopped(paths)
     mask_set_sha256 = artifact_set_sha256(sam_refs)
     advance_state(
         paths.state,
@@ -5328,6 +6236,7 @@ def run_fake_pipeline(
         verification={"mode": "fake", "passed": True, "publishable": False},
     )
     render_ref = write_immutable_json(paths.render, render_meta)
+    ensure_run_not_stopped(paths)
     advance_state(
         paths.state,
         run_id=run_id,
@@ -5365,16 +6274,284 @@ def run_fake_pipeline(
     return manifest
 
 
+def _remove_layer_path(paths: RunPaths, candidate: Path) -> None:
+    assert_run_root_safe(paths)
+    if candidate.is_symlink():
+        raise Stage2Error(
+            "UNSAFE_INVALIDATION_PATH", f"Refusing to follow symlink during invalidation: {candidate}"
+        )
+    candidate = candidate.resolve(strict=False)
+    try:
+        candidate.relative_to(paths.root)
+    except ValueError as exc:
+        raise Stage2Error("UNSAFE_INVALIDATION_PATH", "Invalidation escaped the run root.") from exc
+    if not candidate.exists() and not candidate.is_symlink():
+        return
+    try:
+        if candidate.is_dir() and not candidate.is_symlink():
+            shutil.rmtree(candidate)
+        else:
+            candidate.unlink()
+    except OSError as exc:
+        raise Stage2Error(
+            "INVALIDATION_FAILED",
+            f"Could not invalidate {candidate}",
+            details={"cause": str(exc)},
+        ) from exc
+
+
+def invalidate_from(paths: RunPaths, *, layer: str) -> ProcessingState:
+    state = load_state(paths.state)
+    if state is None:
+        raise Stage2Error("RUN_NOT_FOUND", "Cannot invalidate a run that does not exist.")
+    if layer not in {"dino", "sam", "render"}:
+        raise Stage2Error("INVALID_RECOMPUTE_LAYER", "Layer must be dino, sam, or render.")
+    prerequisite_met = {
+        "dino": state.state not in {"PENDING", "FAILED"} or bool(state.reusable_layers),
+        "sam": "dino" in state.completed_layers,
+        "render": "sam" in state.completed_layers,
+    }[layer]
+    if not prerequisite_met:
+        raise Stage2Error(
+            "RECOMPUTE_PREREQUISITE_MISSING",
+            f"Cannot recompute from {layer} before its upstream contract is complete.",
+        )
+    targets = {
+        "dino": (paths.dino.parent, paths.sam_dir, paths.render.parent),
+        "sam": (paths.sam_dir, paths.render.parent),
+        "render": (paths.render.parent,),
+    }
+    for target in targets[layer]:
+        _remove_layer_path(paths, target)
+    for target in (paths.manifest, paths.reviews_dir):
+        _remove_layer_path(paths, target)
+    completed = {
+        "dino": (),
+        "sam": ("dino",),
+        "render": ("dino", "sam"),
+    }[layer]
+    target_state = {
+        "dino": "VALIDATED",
+        "sam": "DINO_COMPLETE",
+        "render": "SAM_COMPLETE",
+    }[layer]
+    reset = ProcessingState(
+        schema_version=STAGE2_SCHEMA_VERSION,
+        run_id=state.run_id,
+        clip_id=state.clip_id,
+        mode=state.mode,
+        state=target_state,
+        completed_layers=completed,
+        reusable_layers=completed,
+    )
+    _validate_state_record(reset, paths.state)
+    atomic_write_json(paths.state, reset)
+    clear_stop_request(paths)
+    return reset
+
+
+def prepare_resume(paths: RunPaths) -> ProcessingState:
+    state = load_state(paths.state)
+    if state is None:
+        raise Stage2Error("RUN_NOT_FOUND", "Cannot resume a run that does not exist.")
+    clear_stop_request(paths)
+    if state.state != "FAILED":
+        return state
+    reusable = tuple(layer for layer in ("dino", "sam", "render") if layer in state.reusable_layers)
+    if "render" in reusable:
+        target = "RENDER_COMPLETE"
+        completed = ("dino", "sam", "render")
+    elif "sam" in reusable:
+        target = "SAM_COMPLETE"
+        completed = ("dino", "sam")
+    elif "dino" in reusable:
+        target = "DINO_COMPLETE"
+        completed = ("dino",)
+    else:
+        target = "PENDING"
+        completed = ()
+    resumed = ProcessingState(
+        schema_version=STAGE2_SCHEMA_VERSION,
+        run_id=state.run_id,
+        clip_id=state.clip_id,
+        mode=state.mode,
+        state=target,
+        completed_layers=completed,
+        reusable_layers=tuple(layer for layer in completed if layer in reusable),
+    )
+    _validate_state_record(resumed, paths.state)
+    atomic_write_json(paths.state, resumed)
+    return resumed
+
+
+def stage2_asset_paths(workspace_root: Path) -> dict[str, Path]:
+    root = workspace_root.expanduser().resolve(strict=False)
+    return {
+        "workspace": root,
+        "uv_cache": root / ".uv-cache",
+        "hf_home": root / ".cache" / "huggingface",
+        "torch_home": root / ".cache" / "torch",
+        "dino_weights": root / "models" / "stage2" / "dino" / "model.safetensors",
+        "sam_checkpoint": root / "models" / "stage2" / "sam2" / "sam2.1_hiera_large.pt",
+        "sam_runtime": root / "models" / "stage2" / "sam2-runtime",
+        "asset_manifest": root / "models" / "stage2" / "assets.manifest.json",
+        "work_dir": root / "stage2",
+    }
+
+
+def doctor_stage2(workspace_root: Path) -> dict[str, Any]:
+    paths = stage2_asset_paths(workspace_root)
+    tools = {name: shutil.which(name) for name in ("uv", "ffmpeg", "ffprobe", "git")}
+    problems = [f"{name} not found on PATH" for name, path in tools.items() if path is None]
+    assets = {}
+    for name, expected in (
+        ("dino_weights", DINO_MODEL_WEIGHTS_SHA256),
+        ("sam_checkpoint", SAM_MODEL_WEIGHTS_SHA256),
+    ):
+        path = paths[name]
+        if path.exists() and path.is_file() and not path.is_symlink():
+            actual = sha256_file(path)
+            assets[name] = {"path": str(path), "sha256": actual, "verified": actual == expected}
+            if actual != expected:
+                problems.append(f"{name} hash mismatch")
+        else:
+            assets[name] = {"path": str(path), "verified": False, "missing": True}
+    runtime = paths["sam_runtime"]
+    runtime_revision = None
+    runtime_remote = None
+    runtime_clean = False
+    config_sha256 = None
+    def git_probe(*arguments: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return subprocess.run(
+                [str(tools["git"]), "-C", str(runtime), *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    if (
+        tools.get("git")
+        and runtime.is_dir()
+        and not runtime.is_symlink()
+        and (runtime / ".git").exists()
+    ):
+        result = git_probe("rev-parse", "HEAD")
+        if result is not None and result.returncode == 0:
+            runtime_revision = result.stdout.strip()
+        remote_result = git_probe("remote", "get-url", "origin")
+        status_result = git_probe("status", "--porcelain", "--untracked-files=no")
+        runtime_remote = (
+            remote_result.stdout.strip()
+            if remote_result is not None and remote_result.returncode == 0
+            else None
+        )
+        runtime_clean = (
+            status_result is not None
+            and status_result.returncode == 0
+            and not status_result.stdout.strip()
+        )
+        config_path = runtime / "sam2" / SAM_MODEL_CONFIG
+        if config_path.is_file() and not config_path.is_symlink():
+            config_sha256 = sha256_file(config_path)
+        if runtime_revision != SAM_RUNTIME_REVISION:
+            problems.append("SAM2 runtime revision mismatch")
+        if _normalized_git_url(runtime_remote or "") != _normalized_git_url(
+            SAM_RUNTIME_REPOSITORY
+        ):
+            problems.append("SAM2 runtime repository mismatch")
+        if not runtime_clean:
+            problems.append("SAM2 runtime has tracked modifications")
+        if config_sha256 != SAM_MODEL_CONFIG_SHA256:
+            problems.append("SAM2 model configuration hash mismatch")
+    assets["sam_runtime"] = {
+        "path": str(runtime),
+        "revision": runtime_revision,
+        "repository": runtime_remote,
+        "clean": runtime_clean,
+        "model_config_sha256": config_sha256,
+        "verified": (
+            runtime_revision == SAM_RUNTIME_REVISION
+            and _normalized_git_url(runtime_remote or "")
+            == _normalized_git_url(SAM_RUNTIME_REPOSITORY)
+            and runtime_clean
+            and config_sha256 == SAM_MODEL_CONFIG_SHA256
+        ),
+    }
+    tools_ready = all(tools.values())
+    assets_ready = all(item.get("verified") is True for item in assets.values())
+    return {
+        "status": (
+            "READY_FOR_MILESTONE_6_GPU_SMOKE"
+            if tools_ready and assets_ready
+            else "SETUP_REQUIRED"
+        ),
+        "tools": tools,
+        "persistent_paths": {name: str(path) for name, path in paths.items()},
+        "assets": assets,
+        "problems": problems,
+        "gpu_execution_enabled": False,
+        "next_command": "bash scripts/runpod_setup_stage2.sh",
+    }
+
+
+def operator_dry_run(args: argparse.Namespace) -> dict[str, Any]:
+    payload = {
+        "dry_run": True,
+        "command": args.command,
+        "writes": [],
+        "gpu_execution_enabled": False,
+    }
+    if args.command in {"pilot", "sweep", "run"}:
+        payload.update(
+            {
+                "planned_layers": ("validate", "dino", "sam", "render", "technical-verify"),
+                "pixel_source": "stage1-video-only",
+                "next_boundary": "Milestone 6 real-GPU smoke test",
+                "private_inputs": {
+                    "manual_seeds": str(args.manual_seeds) if args.manual_seeds else None,
+                    "labels": str(args.labels) if args.labels else None,
+                },
+            }
+        )
+    elif args.command == "review":
+        payload["planned_review_status"] = args.decision
+    elif args.command == "release-check":
+        payload["planned_checks"] = (
+            "processing",
+            "human-review",
+            "output-hash",
+            "private-content",
+        )
+    elif args.command == "stop":
+        payload["planned_marker"] = "control/stop-request.json"
+    elif args.command == "resume":
+        payload["recompute_from"] = args.recompute_from
+    return payload
+
+
 def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source-video", type=Path, required=True)
     parser.add_argument("--stage1-video", type=Path, required=True)
     parser.add_argument("--stage1-manifest", type=Path, required=True)
 
 
+def _add_run_identity_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--clip-id", required=True)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=STAGE2_JOB_VERSION)
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="validate intent and report planned writes only"
+    )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     validate = subcommands.add_parser("validate", help="validate Stage I inputs only")
@@ -5387,21 +6564,148 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     fake_run.add_argument("--work-dir", type=Path, required=True)
     fake_run.add_argument("--run-id", required=True)
 
+    doctor = subcommands.add_parser("doctor", help="check persistent setup and pinned assets")
+    doctor.add_argument("--workspace-root", type=Path, default=Path("/workspace"))
+
+    smoke = subcommands.add_parser(
+        "smoke", help="run the deterministic local workflow without GPU models"
+    )
+    _add_input_arguments(smoke)
+    smoke.add_argument("--work-dir", type=Path, required=True)
+    smoke.add_argument("--run-id", required=True)
+
+    pilot = subcommands.add_parser("pilot", help="plan the real-GPU pilot boundary")
+    pilot.add_argument("clip_id")
+    pilot.add_argument("--work-dir", type=Path, default=Path("/workspace/stage2"))
+    pilot.add_argument("--manual-seeds", type=Path)
+    pilot.add_argument("--labels", type=Path)
+
+    sweep = subcommands.add_parser("sweep", help="plan the fixed DINO threshold sweep")
+    sweep.add_argument("clip_id")
+    sweep.add_argument("--work-dir", type=Path, default=Path("/workspace/stage2"))
+    sweep.add_argument(
+        "--thresholds", nargs="+", type=float, default=(0.15, 0.20, 0.25, 0.30)
+    )
+    sweep.add_argument("--manual-seeds", type=Path)
+    sweep.add_argument("--labels", type=Path)
+
+    run = subcommands.add_parser("run", help="run Stage II or its deterministic fake path")
+    _add_input_arguments(run)
+    run.add_argument("--work-dir", type=Path, required=True)
+    run.add_argument("--run-id", required=True)
+    run.add_argument("--fake", action="store_true")
+    run.add_argument("--manual-seeds", type=Path)
+    run.add_argument("--labels", type=Path)
+
     status = subcommands.add_parser("status", help="read local processing state")
-    status.add_argument("--work-dir", type=Path, required=True)
-    status.add_argument("--run-id", required=True)
-    status.add_argument("--clip-id", required=True)
+    _add_run_identity_arguments(status)
+
+    resume = subcommands.add_parser("resume", help="prepare a compatible interrupted run")
+    _add_run_identity_arguments(resume)
+    resume.add_argument("--recompute-from", choices=("dino", "sam", "render"))
+
+    stop = subcommands.add_parser("stop", help="request a cooperative stop")
+    _add_run_identity_arguments(stop)
+
+    review = subcommands.add_parser("review", help="write an immutable human review record")
+    _add_run_identity_arguments(review)
+    review.add_argument("--decision", choices=("ACCEPTED", "REJECTED"), required=True)
+    review.add_argument("--reviewer", required=True)
+    review.add_argument("--reviewed-at", required=True)
+    review.add_argument("--full-clip-reviewed", action="store_true")
+    review.add_argument("--flagged-intervals-reviewed", action="store_true")
+    review.add_argument("--notes", default="")
+
+    release = subcommands.add_parser(
+        "release-check", help="fail closed unless a release package is safe"
+    )
+    _add_run_identity_arguments(release)
+    release.add_argument("--release-root", type=Path, required=True)
     return parser.parse_args(argv)
+
+
+def _paths_from_args(args: argparse.Namespace) -> RunPaths:
+    return build_run_paths(args.work_dir, args.run_id, args.clip_id)
+
+
+def _deferred_gpu_error(command: str) -> Stage2Error:
+    return Stage2Error(
+        "REAL_GPU_EXECUTION_DEFERRED",
+        f"{command} is defined but real GPU execution remains locked until Milestone 6.",
+        details={
+            "completed_boundary": "Milestone 5 operator workflow",
+            "reusable_layers": (),
+        },
+        recovery=(
+            "Run 'bash scripts/runpod_setup_stage2.sh', then use '--dry-run' to inspect "
+            "the command. Enable real execution only during the Milestone 6 GPU smoke test."
+        ),
+    )
+
+
+def _enrich_operator_error(args: argparse.Namespace, exc: Stage2Error) -> None:
+    if not all(hasattr(args, name) for name in ("work_dir", "run_id")):
+        return
+    if not hasattr(args, "clip_id"):
+        try:
+            run_component = safe_component(args.run_id, "run_id")
+        except Stage2Error:
+            return
+        run_group = args.work_dir.expanduser().resolve() / "runs" / run_component
+        exc.details.setdefault(
+            "artifact_locations",
+            {
+                "run_group": str(run_group),
+                "clip_directory": "created after Stage I validation",
+                "logs": str(run_group / "<validated-clip-id>" / "logs"),
+            },
+        )
+        exc.details.setdefault("reusable_layers", ())
+        if exc.recovery is None and all(
+            hasattr(args, name)
+            for name in ("source_video", "stage1_video", "stage1_manifest")
+        ):
+            exc.recovery = (
+                "Retry validation with: bash scripts/runpod_stage2.sh validate "
+                f"--source-video {shlex.quote(str(args.source_video))} "
+                f"--stage1-video {shlex.quote(str(args.stage1_video))} "
+                f"--stage1-manifest {shlex.quote(str(args.stage1_manifest))}"
+            )
+        return
+    try:
+        paths = _paths_from_args(args)
+        state = load_state(paths.state)
+    except Stage2Error:
+        return
+    exc.details.setdefault(
+        "artifact_locations",
+        {
+            "run_root": str(paths.root),
+            "state": str(paths.state),
+            "manifest": str(paths.manifest),
+            "logs": str(paths.root / "logs"),
+        },
+    )
+    exc.details.setdefault("reusable_layers", state.reusable_layers if state else ())
+    if exc.recovery is None:
+        exc.recovery = (
+            "Inspect the run with: bash scripts/runpod_stage2.sh status "
+            f"--work-dir {shlex.quote(str(args.work_dir))} "
+            f"--run-id {shlex.quote(str(args.run_id))} "
+            f"--clip-id {shlex.quote(str(args.clip_id))}"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        if args.command == "validate":
+        if args.dry_run:
+            result: Any = operator_dry_run(args)
+        elif args.command == "validate":
             result: Any = validate_stage1(
                 args.source_video, args.stage1_video, args.stage1_manifest
             )
-        elif args.command == "fake-run":
+        elif args.command in {"fake-run", "smoke"}:
             result = run_fake_pipeline(
                 source_video=args.source_video,
                 stage1_video=args.stage1_video,
@@ -5409,14 +6713,63 @@ def main(argv: list[str] | None = None) -> int:
                 work_dir=args.work_dir,
                 run_id=args.run_id,
             )
-        else:
-            paths = build_run_paths(args.work_dir, args.run_id, args.clip_id)
-            result = load_state(paths.state)
-            if result is None:
+        elif args.command == "doctor":
+            result = doctor_stage2(args.workspace_root)
+        elif args.command == "run":
+            if not args.fake:
+                raise _deferred_gpu_error("run")
+            if args.manual_seeds or args.labels:
                 raise Stage2Error(
-                    "RUN_NOT_FOUND",
-                    f"No Stage II run state exists at {paths.state}",
+                    "PRIVATE_INPUT_NOT_REVIEWABLE_FAKE",
+                    "Fake runs cannot consume private correction or answer-sheet artifacts.",
+                    recovery="Use fake inputs only for plumbing; apply private inputs during the Milestone 6 production pilot.",
                 )
+            result = run_fake_pipeline(
+                source_video=args.source_video,
+                stage1_video=args.stage1_video,
+                stage1_manifest=args.stage1_manifest,
+                work_dir=args.work_dir,
+                run_id=args.run_id,
+            )
+        elif args.command in {"pilot", "sweep"}:
+            raise _deferred_gpu_error(args.command)
+        elif args.command == "status":
+            result = run_status(_paths_from_args(args))
+        elif args.command == "stop":
+            result = request_stop(_paths_from_args(args))
+        elif args.command == "resume":
+            paths = _paths_from_args(args)
+            resumed = (
+                invalidate_from(paths, layer=args.recompute_from)
+                if args.recompute_from
+                else prepare_resume(paths)
+            )
+            result = {
+                "resume_ready": True,
+                "state": resumed,
+                "status": run_status(paths),
+                "gpu_execution_enabled": False,
+                "next_boundary": "Milestone 6 real-GPU smoke test",
+            }
+        elif args.command == "review":
+            reference, record = create_review_record(
+                _paths_from_args(args),
+                reviewer=args.reviewer,
+                reviewed_at=args.reviewed_at,
+                review_status=args.decision,
+                full_clip_reviewed=args.full_clip_reviewed,
+                flagged_intervals_reviewed=args.flagged_intervals_reviewed,
+                notes=args.notes,
+            )
+            result = {"review_record": reference, "review": record}
+        elif args.command == "release-check":
+            result = release_check(
+                _paths_from_args(args), release_root=args.release_root
+            )
+        else:
+            raise Stage2Error(
+                "UNKNOWN_COMMAND", f"Unsupported operator command: {args.command}"
+            )
         payload = _jsonable(result)
         if args.json:
             print(json.dumps(payload, sort_keys=True))
@@ -5424,6 +6777,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     except Stage2Error as exc:
+        _enrich_operator_error(args, exc)
         if args.json:
             print(json.dumps(exc.to_dict(), sort_keys=True), file=sys.stderr)
         else:
