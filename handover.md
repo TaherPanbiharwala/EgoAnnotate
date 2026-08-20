@@ -6,9 +6,9 @@ Updated 2026-08-20 for the next coding session.
 
 - Worktree: `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2`
 - Branch: `feature/stage2-deidentification`
-- Current HEAD before this handover edit: `c7b4005`
+- Baseline HEAD before Milestone 4: `7cd5b9a`
 - Base merged from `master`: `9acfe07`
-- Working tree was clean before this handover update.
+- Milestone 4 implementation, tests, and documentation follow that baseline.
 - Nothing from this branch has been pushed or merged into `master` by this
   session.
 
@@ -64,6 +64,9 @@ remains as the fail-closed fallback and the interval is flagged for review.
   proposals without rerunning SAM or EgoBlur unnecessarily.
 - `processing complete` and `review accepted` are separate immutable states.
   Automatic success is never publication approval.
+- Rendering decodes Stage I as its only pixel source, uses constant YUV fill,
+  verifies the encoded temporary artifact, and promotes it only after every
+  technical check passes.
 - The full `GX010057` clip will be privately labeled and calibrated before a
   broader rollout. Labels and review evidence stay under `DO-NOT-SHIP`.
 
@@ -90,6 +93,12 @@ The complete review then produced separate milestone-specific fix commits:
   frame zero.
 - `c7b4005` — documentation refreshed to match Milestones 1-3.
 
+Milestone 4 adds deterministic Stage I-only YUV rendering, scaled safety
+dilation, bounded shard loading, source color-fact preservation, stripped
+streams/metadata, decoded fill and outside-mask verification, atomic promotion,
+safe reuse, and guarded transition to `PROCESSING_COMPLETE`. The job is now
+version `0.4.0` with render code version `milestone-4`.
+
 ## P1 review problems resolved
 
 The high-priority provenance problems found during review are fixed:
@@ -110,18 +119,23 @@ The production SAM2 identity is pinned to:
 - config SHA-256:
   `1dbd6cb6dfebeaf588c7006ee222c6efbfa9049a7ad472a3cdfb2f5d919e8107`
 
-The Stage II job reports version `0.3.1` and code version `milestone-3.1`.
+Those Milestone 3 artifacts were produced by job version `0.3.1`. The current
+Milestone 4 job reports version `0.4.0` and code version `milestone-4`.
 
 ## Verification completed
 
-- Complete repository test suite: **423 passed**.
+- Complete repository test suite: **431 passed**.
 - Focused Stage II suite used during review: **120 passed** before the final P1
   regression additions.
 - Ruff passes for the Stage II job and Stage II tests.
-- `scripts/runpod_stage2.sh --version` reports `0.3.1`.
+- `jobs/20_deidentify_stage2.py --version` reports `0.4.0`; the thin RunPod
+  wrapper delegates to that same parser.
 - Shell syntax and whitespace checks passed.
 - The new fingerprint tests were mutation-tested: they failed when the runtime
   binding was removed and passed after restoration.
+- The Milestone 4 Stage I-only source and render-fingerprint tests were also
+  mutation-tested: each failed when its protection was removed, then passed
+  after restoration.
 
 The complete repository Ruff run still reports three unrelated, pre-existing
 items outside the Stage II change:
@@ -134,22 +148,15 @@ Do not mix those unrelated cleanup items into a Stage II milestone commit.
 
 ## Next milestone
 
-Continue with **Milestone 4: rendering and technical verification** in
-`STAGE2_DEIDENTIFICATION_PLAN.md`.
+Continue with **Milestone 5: private labels, review workflow, and operator UX**
+in `STAGE2_DEIDENTIFICATION_PLAN.md`.
 
-The main outcome is a deterministic renderer that:
-
-1. streams Stage I frames as its only pixel source;
-2. loads only the one or two mask shards relevant to the current frame;
-3. unions valid SAM masks, padded DINO fallbacks, and manual-seed masks;
-4. applies the configured safety dilation and constant-fill policy;
-5. preserves the input timing/audio contract;
-6. writes an immutable render artifact and technical-verification evidence;
-7. restarts encoding from frame zero whenever the render fingerprint changes;
-8. never creates a `review accepted` record automatically.
-
-Keep Milestone 4 locally testable with deterministic fixtures. Do not begin the
-real GPU calibration while rendering and verification are incomplete.
+The renderer is an internal tested layer, not yet a public production command.
+Milestone 5 must expose the documented command set, implement explicit render
+invalidation/recompute, private `DO-NOT-SHIP` labels and evidence, immutable
+human review records, actionable recovery output, release checks, and the
+idempotent persistent RunPod setup path. Do not begin real GPU calibration until
+that operator workflow and its acceptance gate pass.
 
 ## Remaining concerns, not current failing tests
 
@@ -203,12 +210,13 @@ Two older EgoBlur issues remain outside current Stage II scope:
 - Keep model/checkpoint caches and the future Stage II setup under `/workspace`.
 - Use full SSH over an exposed TCP port for file transfer; RunPod Basic SSH does
   not support SCP/SFTP.
-- No production Stage II command, renderer, persistent model setup, or real GPU
-  inference exists yet. Those are planned work, not hidden operator steps.
+- No production Stage II command, persistent model setup, private review
+  workflow, or real GPU inference exists yet. The renderer exists only as an
+  internal tested layer until Milestone 5 exposes it safely.
 
 ## Suggested first message in the new chat
 
 > Work in the `egoannote-stage2` worktree on
 > `feature/stage2-deidentification`. Read `AGENTS.md`, `handover.md`, and
 > `STAGE2_DEIDENTIFICATION_PLAN.md` completely. Confirm the branch and clean
-> status, then start Milestone 4. Do not modify EgoBlur or begin real GPU setup.
+> status, then start Milestone 5. Do not modify EgoBlur or begin real GPU setup.

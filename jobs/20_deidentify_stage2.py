@@ -1,14 +1,14 @@
 # /// script
 # requires-python = ">=3.11,<3.13"
-# dependencies = []
+# dependencies = ["numpy>=1.26,<2.3"]
 # ///
 """Stage II face de-identification job.
 
-Milestones 1-3 define the fail-closed local contracts, DINO proposal layer,
-and bounded SAM2 mask-shard layer. Heavy model imports remain lazy so the
-contracts and deterministic fake adapters can be exercised without a GPU.
-Later milestones expose the real GPU command and renderer in this same
-self-contained PEP-723 job because GPU jobs may not share an environment.
+Milestones 1-4 define the fail-closed local contracts, DINO proposal layer,
+bounded SAM2 mask-shard layer, and verified Stage I-only renderer. Heavy model
+imports remain lazy so deterministic adapters and rendering fixtures can be
+exercised without a GPU. Later milestones expose the real GPU command in this
+same self-contained PEP-723 job because GPU jobs may not share an environment.
 """
 
 from __future__ import annotations
@@ -36,11 +36,11 @@ from pathlib import Path
 from typing import Any
 
 STAGE2_SCHEMA_VERSION = 1
-STAGE2_CODE_VERSION = "milestone-3.1"
-STAGE2_JOB_VERSION = "0.3.1"
+STAGE2_CODE_VERSION = "milestone-4"
+STAGE2_JOB_VERSION = "0.4.0"
 DINO_CODE_VERSION = "milestone-2"
 SAM_CODE_VERSION = "milestone-3.1-runtime-bound"
-RENDER_CODE_VERSION = "milestone-1"
+RENDER_CODE_VERSION = "milestone-4"
 
 DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
 DINO_MODEL_REVISION = "e76a695ed7ae1032a61530cce4b4e9b65f4e368b"
@@ -67,6 +67,11 @@ SAM_MAX_PROMPT_AREA_RATIO = 16.0
 SAM_MAX_FRAME_AREA_RATIO = 0.65
 SAM_ANCHOR_NEIGHBORHOOD_SCALE = 2.0
 SAM_MIN_ANCHOR_NEIGHBORHOOD_FRACTION = 0.50
+
+RENDER_DILATION_PIXELS_AT_1080P = 8
+RENDER_FILL_YUV = (128, 128, 128)
+RENDER_FILL_TOLERANCE = 24
+RENDER_MAX_OUTSIDE_MASK_MAE = 12.0
 
 EXPECTED_STAGE1 = {
     "gen": "2",
@@ -395,6 +400,25 @@ class RenderArtifactMeta:
     output: ArtifactRef
     encoder: dict[str, Any]
     verification: dict[str, Any]
+
+
+@dataclass(slots=True, frozen=True)
+class RenderConfig:
+    dilation_pixels_at_1080p: int = RENDER_DILATION_PIXELS_AT_1080P
+    fill_yuv: tuple[int, int, int] = RENDER_FILL_YUV
+    codec: str = "libx264"
+    crf: int = 18
+    preset: str = "medium"
+    pixel_format: str = "yuv420p"
+    fill_tolerance: int = RENDER_FILL_TOLERANCE
+    max_outside_mask_mae: float = RENDER_MAX_OUTSIDE_MASK_MAE
+
+
+@dataclass(slots=True, frozen=True)
+class RenderGenerationResult:
+    artifact: ArtifactRef
+    meta: RenderArtifactMeta
+    reused: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -3750,6 +3774,1086 @@ def union_sam_masks_for_frame(
                     if value:
                         output[destination_start + column] = 1
     return bytes(output)
+
+
+def scaled_render_dilation(height: int, pixels_at_1080p: int) -> int:
+    if height < 1 or pixels_at_1080p < 0:
+        raise Stage2Error(
+            "INVALID_RENDER_CONFIG",
+            "Render height must be positive and dilation must be non-negative.",
+        )
+    if pixels_at_1080p == 0:
+        return 0
+    return max(1, round(pixels_at_1080p * height / 1080))
+
+
+def dilate_binary_mask(mask: bytes, *, width: int, height: int, radius: int) -> bytes:
+    """Dilate a dense 0/1 mask with a square kernel using an integral image."""
+    if width < 1 or height < 1 or radius < 0 or len(mask) != width * height:
+        raise Stage2Error("INVALID_RENDER_MASK", "Render mask dimensions are invalid.")
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise Stage2Error(
+            "NUMPY_NOT_FOUND",
+            "NumPy is required by the Stage II renderer.",
+            recovery="Run the Stage II setup command, then retry rendering.",
+        ) from exc
+    source = np.frombuffer(mask, dtype=np.uint8).reshape(height, width)
+    if np.any(source > 1):
+        raise Stage2Error("INVALID_RENDER_MASK", "Render masks must contain only 0 or 1.")
+    if radius == 0 or not source.any():
+        return source.tobytes()
+    padded = np.pad(source, radius, mode="constant")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(0).cumsum(1)
+    diameter = 2 * radius + 1
+    counts = (
+        integral[diameter:, diameter:]
+        - integral[:-diameter, diameter:]
+        - integral[diameter:, :-diameter]
+        + integral[:-diameter, :-diameter]
+    )
+    return (counts > 0).astype(np.uint8).tobytes()
+
+
+def apply_mask_to_yuv420p(
+    frame: bytes,
+    mask: bytes,
+    *,
+    width: int,
+    height: int,
+    fill_yuv: tuple[int, int, int],
+) -> bytes:
+    if width % 2 or height % 2:
+        raise Stage2Error(
+            "UNSUPPORTED_RENDER_DIMENSIONS",
+            "The yuv420p renderer requires even display dimensions.",
+            details={"width": width, "height": height},
+        )
+    expected_size = width * height * 3 // 2
+    if len(frame) != expected_size or len(mask) != width * height:
+        raise Stage2Error("INVALID_RENDER_FRAME", "Render frame or mask size is invalid.")
+    if len(fill_yuv) != 3 or any(
+        isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255
+        for value in fill_yuv
+    ):
+        raise Stage2Error("INVALID_RENDER_CONFIG", "YUV fill values must be bytes.")
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise Stage2Error("NUMPY_NOT_FOUND", "NumPy is required by the renderer.") from exc
+    output = np.frombuffer(frame, dtype=np.uint8).copy()
+    luma_size = width * height
+    chroma_size = luma_size // 4
+    luma_mask = np.frombuffer(mask, dtype=np.uint8).reshape(height, width).astype(bool)
+    if np.any(np.frombuffer(mask, dtype=np.uint8) > 1):
+        raise Stage2Error("INVALID_RENDER_MASK", "Render masks must contain only 0 or 1.")
+    output[:luma_size].reshape(height, width)[luma_mask] = fill_yuv[0]
+    chroma_mask = luma_mask.reshape(height // 2, 2, width // 2, 2).any(axis=(1, 3))
+    output[luma_size : luma_size + chroma_size].reshape(height // 2, width // 2)[
+        chroma_mask
+    ] = fill_yuv[1]
+    output[luma_size + chroma_size :].reshape(height // 2, width // 2)[chroma_mask] = (
+        fill_yuv[2]
+    )
+    return output.tobytes()
+
+
+def _validate_render_config(config: RenderConfig) -> None:
+    problems = []
+    if isinstance(config.dilation_pixels_at_1080p, bool) or not isinstance(
+        config.dilation_pixels_at_1080p, int
+    ) or not 0 <= config.dilation_pixels_at_1080p <= 256:
+        problems.append("dilation_pixels_at_1080p must be an integer from 0 to 256")
+    if config.pixel_format != "yuv420p":
+        problems.append("pixel_format must be yuv420p")
+    if not config.codec or not config.preset:
+        problems.append("codec and preset must be non-empty")
+    if isinstance(config.crf, bool) or not isinstance(config.crf, int) or not 0 <= config.crf <= 51:
+        problems.append("crf must be an integer from 0 to 51")
+    if len(config.fill_yuv) != 3 or any(
+        isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255
+        for value in config.fill_yuv
+    ):
+        problems.append("fill_yuv must contain three byte values")
+    if (
+        isinstance(config.fill_tolerance, bool)
+        or not isinstance(config.fill_tolerance, int)
+        or not 0 <= config.fill_tolerance <= 127
+    ):
+        problems.append("fill_tolerance must be an integer from 0 to 127")
+    if not math.isfinite(config.max_outside_mask_mae) or config.max_outside_mask_mae < 0:
+        problems.append("max_outside_mask_mae must be finite and non-negative")
+    if problems:
+        raise Stage2Error(
+            "INVALID_RENDER_CONFIG",
+            "Stage II render configuration is invalid.",
+            details={"problems": problems},
+        )
+
+
+def render_fingerprint_payload(
+    *,
+    stage1: StageIInput,
+    sam_shards: tuple[ArtifactRef, ...],
+    config: RenderConfig,
+) -> dict[str, Any]:
+    return {
+        "stage1_video_sha256": stage1.stage1_video.sha256,
+        "stage1_video_bytes": stage1.stage1_video.bytes,
+        "mask_set_sha256": artifact_set_sha256(sam_shards),
+        "mask_shards": tuple(
+            {"sha256": shard.sha256, "bytes": shard.bytes} for shard in sam_shards
+        ),
+        "display_size": (
+            stage1.stage1_output_video.display_width,
+            stage1.stage1_output_video.display_height,
+        ),
+        "fps": stage1.stage1_output_video.fps,
+        "n_frames": stage1.stage1_output_video.n_frames,
+        "dilation_pixels_at_1080p": config.dilation_pixels_at_1080p,
+        "fill_yuv": config.fill_yuv,
+        "encoder": {
+            "codec": config.codec,
+            "crf": config.crf,
+            "preset": config.preset,
+            "pixel_format": config.pixel_format,
+        },
+        "verification_policy": {
+            "fill_tolerance": config.fill_tolerance,
+            "max_outside_mask_mae": config.max_outside_mask_mae,
+        },
+    }
+
+
+def _load_render_shard_metas(
+    sam_shards: tuple[ArtifactRef, ...], *, stage1: StageIInput
+) -> tuple[SamMaskShardMeta, ...]:
+    if not sam_shards:
+        raise Stage2Error("EMPTY_ARTIFACT_SET", "Rendering requires SAM mask shards.")
+    metas = []
+    for reference in sam_shards:
+        loaded = load_sam_mask_shard(Path(reference.path), expected_artifact=reference)
+        meta = loaded.meta
+        if (
+            meta.frame_width != stage1.stage1_output_video.display_width
+            or meta.frame_height != stage1.stage1_output_video.display_height
+        ):
+            raise Stage2Error(
+                "SAM_FRAME_SIZE_MISMATCH",
+                "SAM shard dimensions do not match the Stage I render source.",
+            )
+        metas.append(meta)
+    meta_tuple = tuple(metas)
+    first = meta_tuple[0]
+    consistency = (
+        first.schema_version,
+        first.artifact_type,
+        first.dino_artifact_sha256,
+        first.dino_fingerprint,
+        first.model,
+        first.runtime,
+        first.accepted_proposal_threshold,
+        first.precision,
+    )
+    if first.schema_version != STAGE2_SCHEMA_VERSION or first.artifact_type != "sam_mask_shard":
+        raise Stage2Error("INVALID_SAM_SHARD", "SAM shard schema or artifact type is invalid.")
+    if any(
+        (
+            meta.schema_version,
+            meta.artifact_type,
+            meta.dino_artifact_sha256,
+            meta.dino_fingerprint,
+            meta.model,
+            meta.runtime,
+            meta.accepted_proposal_threshold,
+            meta.precision,
+        )
+        != consistency
+        for meta in meta_tuple
+    ):
+        raise Stage2Error(
+            "INCONSISTENT_SAM_SHARD_SET",
+            "SAM shards do not share one model, runtime, DINO artifact, and threshold.",
+        )
+    try:
+        window_size = int(first.window["size"])
+        window_overlap = int(first.window["overlap"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", "SAM window layout is malformed.") from exc
+    try:
+        layout_disagrees = any(
+            int(meta.window.get("size", -1)) != window_size
+            or int(meta.window.get("overlap", -1)) != window_overlap
+            for meta in meta_tuple
+        )
+    except (TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_SAM_SHARD", "SAM window layout is malformed.") from exc
+    if layout_disagrees:
+        raise Stage2Error("INCOMPLETE_SAM_SHARD_SET", "SAM window layouts disagree.")
+    validate_sam_shard_set(
+        meta_tuple,
+        n_frames=stage1.stage1_output_video.n_frames,
+        window_size=window_size,
+        window_overlap=window_overlap,
+    )
+    return meta_tuple
+
+
+class _RenderShardReader:
+    def __init__(
+        self,
+        references: tuple[ArtifactRef, ...],
+        metas: tuple[SamMaskShardMeta, ...],
+    ) -> None:
+        self.references = references
+        self.metas = metas
+        self.loaded: dict[int, LoadedSamMaskShard] = {}
+
+    def for_frame(self, frame_idx: int) -> tuple[LoadedSamMaskShard, ...]:
+        relevant = tuple(
+            index
+            for index, meta in enumerate(self.metas)
+            if meta.frame_start <= frame_idx <= meta.frame_end
+        )
+        if not relevant:
+            raise Stage2Error(
+                "SAM_SHARD_COVERAGE_GAP", f"No SAM shard covers frame {frame_idx}."
+            )
+        for index in tuple(self.loaded):
+            if index not in relevant:
+                del self.loaded[index]
+        for index in relevant:
+            if index not in self.loaded:
+                self.loaded[index] = load_sam_mask_shard(
+                    Path(self.references[index].path),
+                    expected_artifact=self.references[index],
+                )
+        return tuple(self.loaded[index] for index in relevant)
+
+
+def _read_exact_frame(stream: Any, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _ffmpeg_path() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise Stage2Error(
+            "FFMPEG_NOT_FOUND",
+            "ffmpeg was not found on PATH.",
+            recovery="Run the Stage II setup command, then retry rendering.",
+        )
+    return ffmpeg
+
+
+def _rawvideo_decoder(path: Path, *, pixel_format: str, stderr: Any) -> subprocess.Popen:
+    command = [
+        _ffmpeg_path(),
+        "-v",
+        "error",
+        "-i",
+        str(path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        pixel_format,
+        "pipe:1",
+    ]
+    try:
+        return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr)
+    except OSError as exc:
+        raise Stage2Error("FFMPEG_START_FAILED", "Could not start the video decoder.") from exc
+
+
+def _rawvideo_encoder(
+    path: Path,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    config: RenderConfig,
+    color_facts: dict[str, str],
+    stderr: Any,
+) -> subprocess.Popen:
+    command = [
+        _ffmpeg_path(),
+        "-v",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        config.pixel_format,
+        "-s:v",
+        f"{width}x{height}",
+        "-r",
+        format(fps, ".12g"),
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-map_metadata",
+        "-1",
+        "-c:v",
+        config.codec,
+        "-preset",
+        config.preset,
+        "-crf",
+        str(config.crf),
+        "-pix_fmt",
+        config.pixel_format,
+    ]
+    color_options = {
+        "color_range": "-color_range",
+        "color_space": "-colorspace",
+        "color_transfer": "-color_trc",
+        "color_primaries": "-color_primaries",
+        "chroma_location": "-chroma_sample_location",
+    }
+    for field_name, option in color_options.items():
+        value = color_facts.get(field_name)
+        if value and value not in {"unknown", "reserved", "unspecified"}:
+            command.extend((option, value))
+    command.extend([
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(path),
+    ])
+    try:
+        return subprocess.Popen(command, stdin=subprocess.PIPE, stderr=stderr)
+    except OSError as exc:
+        raise Stage2Error("FFMPEG_START_FAILED", "Could not start the video encoder.") from exc
+
+
+def _stderr_text(handle: Any) -> str:
+    handle.flush()
+    handle.seek(0)
+    return handle.read().decode("utf-8", errors="replace").strip()[-4000:]
+
+
+def _render_frames(
+    *,
+    stage1_path: Path,
+    output_path: Path,
+    stage1: StageIInput,
+    sam_shards: tuple[ArtifactRef, ...],
+    metas: tuple[SamMaskShardMeta, ...],
+    config: RenderConfig,
+) -> dict[str, Any]:
+    width = stage1.stage1_output_video.display_width
+    height = stage1.stage1_output_video.display_height
+    if width % 2 or height % 2:
+        raise Stage2Error(
+            "UNSUPPORTED_RENDER_DIMENSIONS",
+            "The yuv420p renderer requires even display dimensions.",
+        )
+    frame_size = width * height * 3 // 2
+    radius = scaled_render_dilation(height, config.dilation_pixels_at_1080p)
+    reader = _RenderShardReader(sam_shards, metas)
+    source_media = _probe_media_contract(stage1_path)
+    source_video_streams = [
+        stream for stream in source_media["streams"] if stream.get("codec_type") == "video"
+    ]
+    if len(source_video_streams) != 1:
+        raise Stage2Error(
+            "RENDER_SOURCE_INVALID", "Stage I must contain exactly one video stream."
+        )
+    color_fields = (
+        "color_range",
+        "color_space",
+        "color_transfer",
+        "color_primaries",
+        "chroma_location",
+    )
+    color_facts = {
+        name: str(source_video_streams[0][name])
+        for name in color_fields
+        if source_video_streams[0].get(name)
+    }
+    masked_pixels = 0
+    started = time.monotonic()
+    with tempfile.TemporaryFile() as decoder_stderr, tempfile.TemporaryFile() as encoder_stderr:
+        decoder = _rawvideo_decoder(
+            stage1_path, pixel_format=config.pixel_format, stderr=decoder_stderr
+        )
+        encoder = _rawvideo_encoder(
+            output_path,
+            width=width,
+            height=height,
+            fps=stage1.stage1_output_video.fps,
+            config=config,
+            color_facts=color_facts,
+            stderr=encoder_stderr,
+        )
+        assert decoder.stdout is not None and encoder.stdin is not None
+        try:
+            for frame_idx in range(stage1.stage1_output_video.n_frames):
+                frame = _read_exact_frame(decoder.stdout, frame_size)
+                if len(frame) != frame_size:
+                    raise Stage2Error(
+                        "RENDER_SOURCE_TRUNCATED",
+                        "Stage I decode ended before the recorded frame count.",
+                        details={"frame_idx": frame_idx, "bytes": len(frame)},
+                    )
+                active = reader.for_frame(frame_idx)
+                mask = union_sam_masks_for_frame(
+                    active, frame_idx=frame_idx, width=width, height=height
+                )
+                mask = dilate_binary_mask(mask, width=width, height=height, radius=radius)
+                masked_pixels += mask.count(1)
+                rendered = apply_mask_to_yuv420p(
+                    frame,
+                    mask,
+                    width=width,
+                    height=height,
+                    fill_yuv=config.fill_yuv,
+                )
+                try:
+                    encoder.stdin.write(rendered)
+                except BrokenPipeError as exc:
+                    raise Stage2Error(
+                        "RENDER_ENCODE_FAILED", "The Stage II encoder stopped early."
+                    ) from exc
+            if decoder.stdout.read(1):
+                raise Stage2Error(
+                    "RENDER_SOURCE_FRAME_COUNT_MISMATCH",
+                    "Stage I decoded more frames than its validated frame count.",
+                )
+        except BaseException:
+            decoder.kill()
+            encoder.kill()
+            decoder.wait()
+            encoder.wait()
+            raise
+        finally:
+            decoder.stdout.close()
+            with contextlib.suppress(BrokenPipeError):
+                encoder.stdin.close()
+        decoder_code = decoder.wait()
+        encoder_code = encoder.wait()
+        if decoder_code != 0:
+            raise Stage2Error(
+                "RENDER_DECODE_FAILED",
+                "ffmpeg could not decode the complete Stage I video.",
+                details={"stderr": _stderr_text(decoder_stderr)},
+            )
+        if encoder_code != 0:
+            raise Stage2Error(
+                "RENDER_ENCODE_FAILED",
+                "ffmpeg could not encode the complete Stage II video.",
+                details={"stderr": _stderr_text(encoder_stderr)},
+            )
+    return {
+        "runtime_seconds": time.monotonic() - started,
+        "n_frames": stage1.stage1_output_video.n_frames,
+        "dilation_pixels": radius,
+        "added_mask_pixels": masked_pixels,
+        "added_mask_area_fraction": masked_pixels
+        / (width * height * stage1.stage1_output_video.n_frames),
+        "hand_tool_overlap": {"available": False, "overlap_pixels": None},
+        "source_color_facts": color_facts,
+    }
+
+
+def _probe_media_contract(path: Path) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise Stage2Error("FFPROBE_NOT_FOUND", "ffprobe was not found on PATH.")
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise Stage2Error(
+            "RENDER_MEDIA_PROBE_FAILED",
+            "ffprobe could not inspect the rendered video.",
+            details={"stderr": result.stderr.strip()},
+        )
+    try:
+        payload = json.loads(result.stdout)
+        streams = payload["streams"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise Stage2Error(
+            "RENDER_MEDIA_PROBE_FAILED", "Rendered media facts are malformed."
+        ) from exc
+    if not isinstance(streams, list):
+        raise Stage2Error("RENDER_MEDIA_PROBE_FAILED", "Rendered streams are malformed.")
+    return payload
+
+
+def _mask_arrays(mask: bytes, *, width: int, height: int) -> tuple[Any, Any]:
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise Stage2Error("NUMPY_NOT_FOUND", "NumPy is required by verification.") from exc
+    luma = np.frombuffer(mask, dtype=np.uint8).reshape(height, width).astype(bool)
+    chroma = luma.reshape(height // 2, 2, width // 2, 2).any(axis=(1, 3))
+    return luma, chroma
+
+
+def verify_rendered_video(
+    *,
+    stage1: StageIInput,
+    output_path: Path,
+    sam_shards: tuple[ArtifactRef, ...],
+    metas: tuple[SamMaskShardMeta, ...],
+    config: RenderConfig,
+) -> dict[str, Any]:
+    """Decode both videos and fail closed unless media and redaction checks pass."""
+    output_path = resolve_input_file(output_path, "temporary Stage II output")
+    output_facts = probe_video(output_path)
+    expected = stage1.stage1_output_video
+    problems = []
+    if (output_facts.display_width, output_facts.display_height) != (
+        expected.display_width,
+        expected.display_height,
+    ):
+        problems.append("display dimensions changed")
+    if output_facts.n_frames != expected.n_frames:
+        problems.append(
+            f"frame count changed from {expected.n_frames} to {output_facts.n_frames}"
+        )
+    if not output_facts.is_cfr or not math.isclose(
+        output_facts.fps, expected.fps, rel_tol=0.0, abs_tol=1e-6
+    ):
+        problems.append("frame rate or constant-frame-rate contract changed")
+    if output_facts.rotation != 0:
+        problems.append("rendered video retains rotation metadata")
+    media = _probe_media_contract(output_path)
+    streams = media["streams"]
+    if len(streams) != 1 or streams[0].get("codec_type") != "video":
+        problems.append("rendered output must contain exactly one video stream")
+    elif streams[0].get("pix_fmt") != config.pixel_format:
+        problems.append(
+            f"pixel format is {streams[0].get('pix_fmt')!r}, expected {config.pixel_format!r}"
+        )
+    source_media = _probe_media_contract(Path(stage1.stage1_video.path))
+    source_video_streams = [
+        stream
+        for stream in source_media["streams"]
+        if stream.get("codec_type") == "video"
+    ]
+    color_fields = (
+        "color_range",
+        "color_space",
+        "color_transfer",
+        "color_primaries",
+        "chroma_location",
+    )
+    source_color_facts = {
+        name: str(source_video_streams[0][name])
+        for name in color_fields
+        if len(source_video_streams) == 1 and source_video_streams[0].get(name)
+    }
+    output_color_facts = {
+        name: str(streams[0][name])
+        for name in color_fields
+        if len(streams) == 1 and streams[0].get(name)
+    }
+    for name, value in source_color_facts.items():
+        if value not in {"unknown", "reserved", "unspecified"} and output_color_facts.get(
+            name
+        ) != value:
+            problems.append(
+                f"color fact {name} changed from {value!r} to {output_color_facts.get(name)!r}"
+            )
+    forbidden_tag_names = {
+        "title",
+        "artist",
+        "album",
+        "comment",
+        "description",
+        "creation_time",
+        "location",
+        "location-eng",
+        "make",
+        "model",
+    }
+    tags = dict(media.get("format", {}).get("tags", {}) or {})
+    for stream in streams:
+        tags.update(stream.get("tags", {}) or {})
+    retained_forbidden_tags = sorted(
+        forbidden_tag_names.intersection(str(name).casefold() for name in tags)
+    )
+    if retained_forbidden_tags:
+        problems.append(f"forbidden metadata remains: {retained_forbidden_tags}")
+    if problems:
+        raise Stage2Error(
+            "RENDER_MEDIA_VERIFICATION_FAILED",
+            "Rendered media contract verification failed.",
+            details={"problems": problems},
+        )
+
+    width = expected.display_width
+    height = expected.display_height
+    frame_size = width * height * 3 // 2
+    luma_size = width * height
+    chroma_size = luma_size // 4
+    radius = scaled_render_dilation(height, config.dilation_pixels_at_1080p)
+    reader = _RenderShardReader(sam_shards, metas)
+    fill_checked = 0
+    fill_violations = 0
+    outside_abs_sum = 0
+    outside_squared_sum = 0
+    outside_samples = 0
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise Stage2Error("NUMPY_NOT_FOUND", "NumPy is required by verification.") from exc
+    with tempfile.TemporaryFile() as source_stderr, tempfile.TemporaryFile() as output_stderr:
+        source_decoder = _rawvideo_decoder(
+            Path(stage1.stage1_video.path),
+            pixel_format=config.pixel_format,
+            stderr=source_stderr,
+        )
+        output_decoder = _rawvideo_decoder(
+            output_path, pixel_format=config.pixel_format, stderr=output_stderr
+        )
+        assert source_decoder.stdout is not None and output_decoder.stdout is not None
+        for frame_idx in range(expected.n_frames):
+            source_frame = _read_exact_frame(source_decoder.stdout, frame_size)
+            output_frame = _read_exact_frame(output_decoder.stdout, frame_size)
+            if len(source_frame) != frame_size or len(output_frame) != frame_size:
+                source_decoder.kill()
+                output_decoder.kill()
+                raise Stage2Error(
+                    "RENDER_DECODE_VERIFICATION_FAILED",
+                    "A verification decode ended before the expected frame count.",
+                    details={"frame_idx": frame_idx},
+                )
+            mask = union_sam_masks_for_frame(
+                reader.for_frame(frame_idx),
+                frame_idx=frame_idx,
+                width=width,
+                height=height,
+            )
+            mask = dilate_binary_mask(mask, width=width, height=height, radius=radius)
+            luma_mask, chroma_mask = _mask_arrays(mask, width=width, height=height)
+            source_values = np.frombuffer(source_frame, dtype=np.uint8)
+            output_values = np.frombuffer(output_frame, dtype=np.uint8)
+            output_luma = output_values[:luma_size].reshape(height, width)
+            source_luma = source_values[:luma_size].reshape(height, width)
+            if luma_mask.any():
+                deviations = np.abs(
+                    output_luma[luma_mask].astype(np.int16) - config.fill_yuv[0]
+                )
+                fill_checked += int(deviations.size)
+                fill_violations += int((deviations > config.fill_tolerance).sum())
+            for offset, fill_value in (
+                (luma_size, config.fill_yuv[1]),
+                (luma_size + chroma_size, config.fill_yuv[2]),
+            ):
+                plane = output_values[offset : offset + chroma_size].reshape(
+                    height // 2, width // 2
+                )
+                if chroma_mask.any():
+                    deviations = np.abs(plane[chroma_mask].astype(np.int16) - fill_value)
+                    fill_checked += int(deviations.size)
+                    fill_violations += int((deviations > config.fill_tolerance).sum())
+            outside = ~luma_mask
+            if outside.any():
+                difference = output_luma[outside].astype(np.int16) - source_luma[
+                    outside
+                ].astype(np.int16)
+                absolute = np.abs(difference).astype(np.int64)
+                outside_abs_sum += int(absolute.sum())
+                outside_squared_sum += int((difference.astype(np.int64) ** 2).sum())
+                outside_samples += int(difference.size)
+        source_extra = source_decoder.stdout.read(1)
+        output_extra = output_decoder.stdout.read(1)
+        source_decoder.stdout.close()
+        output_decoder.stdout.close()
+        source_code = source_decoder.wait()
+        output_code = output_decoder.wait()
+        if source_code != 0 or output_code != 0 or source_extra or output_extra:
+            raise Stage2Error(
+                "RENDER_DECODE_VERIFICATION_FAILED",
+                "Verification decoders did not consume exactly the expected frames.",
+                details={
+                    "source_stderr": _stderr_text(source_stderr),
+                    "output_stderr": _stderr_text(output_stderr),
+                },
+            )
+    outside_mae = outside_abs_sum / outside_samples if outside_samples else 0.0
+    outside_mse = outside_squared_sum / outside_samples if outside_samples else 0.0
+    outside_psnr = None if outside_mse == 0 else 10 * math.log10(255**2 / outside_mse)
+    if fill_violations:
+        raise Stage2Error(
+            "RENDER_FILL_INTEGRITY_FAILED",
+            "Encoded Stage II fill pixels exceeded the allowed deviation.",
+            details={
+                "checked": fill_checked,
+                "violations": fill_violations,
+                "tolerance": config.fill_tolerance,
+            },
+        )
+    if outside_mae > config.max_outside_mask_mae:
+        raise Stage2Error(
+            "RENDER_QUALITY_FAILED",
+            "Outside-mask quality loss exceeded the configured ceiling.",
+            details={
+                "outside_mask_mae": outside_mae,
+                "ceiling": config.max_outside_mask_mae,
+            },
+        )
+    return {
+        "passed": True,
+        "publishable": False,
+        "frame_count": output_facts.n_frames,
+        "fps": output_facts.fps,
+        "display_width": output_facts.display_width,
+        "display_height": output_facts.display_height,
+        "cfr": output_facts.is_cfr,
+        "stream_types": tuple(stream.get("codec_type") for stream in streams),
+        "pixel_format": streams[0].get("pix_fmt"),
+        "source_color_facts": source_color_facts,
+        "output_color_facts": output_color_facts,
+        "forbidden_metadata_tags": retained_forbidden_tags,
+        "fill_integrity_checked": fill_checked,
+        "fill_integrity_violations": fill_violations,
+        "fill_tolerance": config.fill_tolerance,
+        "outside_mask_luma_mae": outside_mae,
+        "outside_mask_luma_psnr_db": outside_psnr,
+        "outside_mask_samples": outside_samples,
+        "input_artifact_hashes_verified": True,
+        "complete_shard_set_verified": True,
+    }
+
+
+def render_meta_from_dict(raw: dict[str, Any]) -> RenderArtifactMeta:
+    try:
+        output = raw["output"]
+        return RenderArtifactMeta(
+            schema_version=int(raw["schema_version"]),
+            artifact_type=str(raw["artifact_type"]),
+            fingerprint=str(raw["fingerprint"]),
+            stage1_video_sha256=str(raw["stage1_video_sha256"]),
+            mask_set_sha256=str(raw["mask_set_sha256"]),
+            output=ArtifactRef(
+                path=str(output["path"]),
+                sha256=str(output["sha256"]),
+                bytes=int(output["bytes"]),
+            ),
+            encoder=dict(raw["encoder"]),
+            verification=dict(raw["verification"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Stage2Error("INVALID_RENDER_ARTIFACT", "Render artifact is malformed.") from exc
+
+
+def _promote_render_output(temporary: Path, final: Path) -> ArtifactRef:
+    final.parent.mkdir(parents=True, exist_ok=True)
+    temporary_ref = artifact_ref(temporary)
+    if final.exists():
+        existing = artifact_ref(final)
+        if (existing.sha256, existing.bytes) != (
+            temporary_ref.sha256,
+            temporary_ref.bytes,
+        ):
+            raise Stage2Error(
+                "IMMUTABLE_ARTIFACT_CONFLICT",
+                "A different immutable render output already exists.",
+                details={"path": str(final)},
+            )
+        temporary.unlink()
+        return existing
+    try:
+        os.replace(temporary, final)
+        directory_fd = os.open(final.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise Stage2Error(
+            "RENDER_PROMOTION_FAILED",
+            "Verified output could not be promoted atomically.",
+            details={"cause": str(exc)},
+        ) from exc
+    return artifact_ref(final)
+
+
+def render_stage2_video(
+    *,
+    stage1: StageIInput,
+    paths: RunPaths,
+    sam_shards: tuple[ArtifactRef, ...],
+    config: RenderConfig | None = None,
+) -> RenderGenerationResult:
+    """Render from Stage I only, verify the temporary output, then promote it."""
+    if config is None:
+        config = RenderConfig()
+    _validate_render_config(config)
+    stage1_path = Path(stage1.stage1_video.path)
+    current_stage1_ref = artifact_ref(stage1_path)
+    if current_stage1_ref != stage1.stage1_video:
+        raise Stage2Error(
+            "STAGE1_VIDEO_CHANGED",
+            "The Stage I render source changed after validation.",
+        )
+    metas = _load_render_shard_metas(sam_shards, stage1=stage1)
+    payload = render_fingerprint_payload(stage1=stage1, sam_shards=sam_shards, config=config)
+    fingerprint_value = render_fingerprint(payload)
+    mask_set_sha256 = artifact_set_sha256(sam_shards)
+    final_output = paths.render.parent / f"stage2-{fingerprint_value[:16]}.mp4"
+    if paths.render.exists():
+        meta = render_meta_from_dict(read_json(paths.render))
+        expected_encoder = {
+            "codec": config.codec,
+            "crf": config.crf,
+            "preset": config.preset,
+            "pixel_format": config.pixel_format,
+            "audio": "stripped",
+            "subtitles": "stripped",
+            "data_streams": "stripped",
+            "metadata": "stripped",
+            "pixel_source": "stage1_video_only",
+            "fill_yuv": list(config.fill_yuv),
+            "dilation_pixels_at_1080p": config.dilation_pixels_at_1080p,
+        }
+        expected_fields = (
+            meta.schema_version == STAGE2_SCHEMA_VERSION,
+            meta.artifact_type == "render",
+            meta.fingerprint == fingerprint_value,
+            meta.stage1_video_sha256 == stage1.stage1_video.sha256,
+            meta.mask_set_sha256 == mask_set_sha256,
+            meta.verification.get("passed") is True,
+            meta.encoder == expected_encoder,
+            Path(meta.output.path) == final_output.resolve(strict=False),
+        )
+        if not all(expected_fields):
+            raise Stage2Error(
+                "STALE_RENDER_ARTIFACT",
+                "Existing render evidence does not match the requested render fingerprint.",
+                recovery="Explicitly invalidate the render layer, then rerun from frame zero.",
+            )
+        if artifact_ref(Path(meta.output.path)) != meta.output:
+            raise Stage2Error(
+                "INVALID_RENDER_ARTIFACT", "Recorded render output hash or size changed."
+            )
+        verify_rendered_video(
+            stage1=stage1,
+            output_path=Path(meta.output.path),
+            sam_shards=sam_shards,
+            metas=metas,
+            config=config,
+        )
+        if artifact_ref(Path(meta.output.path)) != meta.output:
+            raise Stage2Error(
+                "INVALID_RENDER_ARTIFACT", "Recorded output changed during verification."
+            )
+        if artifact_ref(stage1_path) != stage1.stage1_video:
+            raise Stage2Error(
+                "STAGE1_VIDEO_CHANGED", "Stage I changed during render reuse verification."
+            )
+        return RenderGenerationResult(
+            artifact=artifact_ref(paths.render), meta=meta, reused=True
+        )
+
+    paths.render.parent.mkdir(parents=True, exist_ok=True)
+    temporary_handle = tempfile.NamedTemporaryFile(
+        dir=paths.render.parent,
+        prefix=f".{final_output.name}.",
+        suffix=".tmp.mp4",
+        delete=False,
+    )
+    temporary = Path(temporary_handle.name)
+    temporary_handle.close()
+    temporary.unlink(missing_ok=True)
+    try:
+        metrics = _render_frames(
+            stage1_path=stage1_path,
+            output_path=temporary,
+            stage1=stage1,
+            sam_shards=sam_shards,
+            metas=metas,
+            config=config,
+        )
+        rendered_temporary_ref = artifact_ref(temporary)
+        if artifact_ref(stage1_path) != stage1.stage1_video:
+            raise Stage2Error(
+                "STAGE1_VIDEO_CHANGED", "Stage I changed while rendering was in progress."
+            )
+        verification = verify_rendered_video(
+            stage1=stage1,
+            output_path=temporary,
+            sam_shards=sam_shards,
+            metas=metas,
+            config=config,
+        )
+        if artifact_ref(temporary) != rendered_temporary_ref:
+            raise Stage2Error(
+                "RENDER_OUTPUT_CHANGED",
+                "Temporary output changed while technical verification was running.",
+            )
+        if artifact_ref(stage1_path) != stage1.stage1_video:
+            raise Stage2Error(
+                "STAGE1_VIDEO_CHANGED", "Stage I changed during technical verification."
+            )
+        output_ref = _promote_render_output(temporary, final_output)
+        if (output_ref.sha256, output_ref.bytes) != (
+            rendered_temporary_ref.sha256,
+            rendered_temporary_ref.bytes,
+        ):
+            raise Stage2Error(
+                "RENDER_OUTPUT_CHANGED", "Promoted output does not match verified bytes."
+            )
+    finally:
+        temporary.unlink(missing_ok=True)
+    verification.update(metrics)
+    verification["output_bytes"] = output_ref.bytes
+    encoder = {
+        "codec": config.codec,
+        "crf": config.crf,
+        "preset": config.preset,
+        "pixel_format": config.pixel_format,
+        "audio": "stripped",
+        "subtitles": "stripped",
+        "data_streams": "stripped",
+        "metadata": "stripped",
+        "pixel_source": "stage1_video_only",
+        "fill_yuv": config.fill_yuv,
+        "dilation_pixels_at_1080p": config.dilation_pixels_at_1080p,
+    }
+    meta = RenderArtifactMeta(
+        schema_version=STAGE2_SCHEMA_VERSION,
+        artifact_type="render",
+        fingerprint=fingerprint_value,
+        stage1_video_sha256=stage1.stage1_video.sha256,
+        mask_set_sha256=mask_set_sha256,
+        output=output_ref,
+        encoder=encoder,
+        verification=verification,
+    )
+    artifact = write_immutable_json(paths.render, meta)
+    if artifact_ref(final_output) != output_ref:
+        raise Stage2Error(
+            "RENDER_OUTPUT_CHANGED", "Promoted output changed while evidence was written."
+        )
+    return RenderGenerationResult(artifact=artifact, meta=meta, reused=False)
+
+
+def finalize_verified_processing(
+    *,
+    stage1: StageIInput,
+    paths: RunPaths,
+    run_id: str,
+    dino_artifact: ArtifactRef,
+    sam_shards: tuple[ArtifactRef, ...],
+    render_result: RenderGenerationResult,
+    mode: str = "production",
+) -> ProcessingManifest:
+    """Advance to processing complete only from immutable verified evidence."""
+    if mode == "fake":
+        raise Stage2Error(
+            "INVALID_PROCESSING_MODE",
+            "Real render evidence cannot be finalized with fake processing status.",
+        )
+    current = load_state(paths.state)
+    if current is None or current.state not in {
+        "SAM_COMPLETE",
+        "RENDER_COMPLETE",
+        "PROCESSING_COMPLETE",
+    }:
+        raise Stage2Error(
+            "RENDER_PREREQUISITE_MISSING",
+            "A run must have verified DINO and SAM layers before render finalization.",
+        )
+    if (current.run_id, current.clip_id, current.mode) != (run_id, stage1.clip_id, mode):
+        raise Stage2Error("STATE_IDENTITY_MISMATCH", "Render finalization identity changed.")
+    dino_actual = artifact_ref(Path(dino_artifact.path))
+    render_actual = artifact_ref(Path(render_result.artifact.path))
+    if dino_actual != dino_artifact or render_actual != render_result.artifact:
+        raise Stage2Error(
+            "PROCESSING_ARTIFACT_CHANGED",
+            "DINO or render evidence changed before processing finalization.",
+        )
+    stored_render = render_meta_from_dict(read_json(Path(render_result.artifact.path)))
+    if (
+        canonical_json_bytes(stored_render) != canonical_json_bytes(render_result.meta)
+        or stored_render.verification.get("passed") is not True
+    ):
+        raise Stage2Error(
+            "INVALID_RENDER_ARTIFACT",
+            "Only matching, technically verified render evidence may be finalized.",
+        )
+    if artifact_ref(Path(stored_render.output.path)) != stored_render.output:
+        raise Stage2Error(
+            "INVALID_RENDER_ARTIFACT", "Rendered output changed before finalization."
+        )
+    metas = _load_render_shard_metas(sam_shards, stage1=stage1)
+    if metas[0].dino_artifact_sha256 != dino_artifact.sha256:
+        raise Stage2Error(
+            "DINO_SAM_MISMATCH", "SAM shards do not bind the selected DINO artifact."
+        )
+    if stored_render.mask_set_sha256 != artifact_set_sha256(sam_shards):
+        raise Stage2Error(
+            "SAM_RENDER_MISMATCH", "Render evidence does not bind the selected SAM shards."
+        )
+    advance_state(
+        paths.state,
+        run_id=run_id,
+        clip_id=stage1.clip_id,
+        mode=mode,
+        target="RENDER_COMPLETE",
+        completed_layers=("dino", "sam", "render"),
+        reusable_layers=("dino", "sam", "render"),
+    )
+    review_flags = tuple(sorted({flag for meta in metas for flag in meta.review_flags}))
+    audit_status = (
+        "NEEDS_REVIEW"
+        if stage1.stage1_status == "NEEDS_REVIEW" or review_flags
+        else "PASS_AUTOMATED_TECHNICAL"
+    )
+    manifest = ProcessingManifest(
+        schema_version=STAGE2_SCHEMA_VERSION,
+        code_version=STAGE2_CODE_VERSION,
+        run_id=run_id,
+        clip_id=stage1.clip_id,
+        mode=mode,
+        processing_state="PROCESSING_COMPLETE",
+        audit_status=audit_status,
+        review_status="PENDING",
+        stage1=stage1,
+        dino_artifact=dino_artifact,
+        sam_mask_shards=sam_shards,
+        render_artifact=render_result.artifact,
+    )
+    write_immutable_json(paths.manifest, manifest)
+    advance_state(
+        paths.state,
+        run_id=run_id,
+        clip_id=stage1.clip_id,
+        mode=mode,
+        target="PROCESSING_COMPLETE",
+        completed_layers=("dino", "sam", "render"),
+        reusable_layers=("dino", "sam", "render"),
+    )
+    return manifest
 
 
 class MetaSam2VideoAdapter:

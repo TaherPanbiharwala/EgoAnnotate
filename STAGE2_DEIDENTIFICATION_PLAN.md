@@ -1,6 +1,6 @@
 # Stage II EgoBlur + DINO/SAM2 De-identification Plan
 
-Status: Milestones 1-3 complete; Milestone 4 next
+Status: Milestones 1-4 complete; Milestone 5 next
 
 Saved: 2026-08-18; milestone structure updated 2026-08-20
 
@@ -9,7 +9,7 @@ Saved: 2026-08-18; milestone structure updated 2026-08-20
 | 1. Contracts, validation, and local skeleton | Complete — 2026-08-20 |
 | 2. DINO proposal generation and reuse | Complete — 2026-08-20 |
 | 3. SAM2 propagation and mask shards | Complete — 2026-08-20 |
-| 4. Rendering and technical verification | Not started |
+| 4. Rendering and technical verification | Complete — 2026-08-20 |
 | 5. Labels, review workflow, and operator UX | Not started |
 | 6. Real-GPU smoke test and `GX010057` calibration | Not started |
 | 7. Canary and production rollout | Not started |
@@ -83,6 +83,18 @@ Add `--json` before the subcommand for machine-readable output. A fake run recor
 - DINO, SAM, and render fingerprints carry independent layer code versions. Advancing SAM implementation code therefore does not make an unchanged Milestone 2 DINO artifact stale.
 - Overlap reconstruction unions only the shards covering the requested frame; it never builds a clip-wide dense mask map. The complete shard layout is validated before downstream rendering.
 - `fake-run` now exercises the complete DINO-to-SAM orchestration. The real Meta adapter is lazy and requires an already verified local checkpoint/frame window; setup, frame extraction, dependency installation, and real GPU execution remain deferred to Milestones 5-6.
+
+## Milestone 4 render and verification contract
+
+- The renderer decodes the validated Stage I video as its only pixel source. The original video is never opened by the render path; it remains inference-only input.
+- Only the one or two SAM shards covering the current frame stay loaded. Their canonical archives, recorded hashes, dimensions, window coverage, DINO binding, model/runtime identity, threshold, and precision must agree before encoding starts.
+- The per-frame union is dilated with the configured square safety kernel, scaled from `8px` at 1080p. Filled luma and subsampled chroma use constant YUV `(128, 128, 128)`.
+- Encoding starts from frame zero into a temporary MP4. The encoder receives raw Stage I-derived `yuv420p`, carries explicit source color facts, strips audio/subtitles/data streams and private metadata, and records every result-affecting setting in the render fingerprint.
+- Technical verification independently decodes Stage I and the temporary output. It checks exact frame count, CFR/fps, dimensions, rotation, streams, pixel/color facts, forbidden metadata, fill survival after encoding, complete shard coverage, input hashes, and outside-mask luma MAE/PSNR.
+- Failed or interrupted encoding and any failed verification delete the temporary file and cannot create render evidence, promote an output, or mark processing complete. Promotion uses an atomic rename only after all checks pass.
+- Reuse revalidates the shard set, immutable output hash/size/path, encoder contract, and decoded technical checks. A changed render fingerprint fails as stale and requires explicit render-layer invalidation followed by a frame-zero restart.
+- Finalization requires an existing `SAM_COMPLETE` production state and matching immutable DINO, SAM, render, and output artifacts. It records `PROCESSING_COMPLETE` with human `review_status=PENDING`; it never creates review acceptance.
+- Deterministic tests cover dilation, YUV plane behavior, fingerprint boundaries, stale/tampered artifacts, Stage I-only sourcing, guarded state transitions, and real ffmpeg round trips.
 
 ## Architecture
 
