@@ -1,9 +1,14 @@
 # egoannote — agent briefing
 
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
-repo cold. Written 2026-08-11, last updated same day after two more fixes
-landed. Repo HEAD at time of writing: **`d0cbe10`**, tree clean, 272 tests
-passing (`uv run --extra test pytest tests/ -q`).
+repo cold. Written 2026-08-11, substantially updated in a later session
+after the EgoBlur fill-integrity question got resolved with real evidence
+and two more hysteresis visibility bugs got fixed. Repo HEAD at time of
+writing: **`5cca081`** — but the working tree has real, tested,
+**uncommitted** changes on top (the `det_low`/`n_low_absorbed` fixes below,
+plus an SSH durability fix in `scripts/runpod_setup.sh`); run `git status`
+before trusting this describes `HEAD` exactly. 279 tests passing
+(`uv run --extra test pytest tests/ -q`), including the uncommitted work.
 
 If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
@@ -84,11 +89,12 @@ models.toml                 VLM model registry. Ships with placeholder
                              entries; needs 2 real models from DIFFERENT
                              labs (see file's own comments on why) before
                              any real captioning run.
-tests/                       pytest, 267 tests. Run before AND after any
+tests/                       pytest, 279 tests. Run before AND after any
                              change: `uv run --extra test pytest tests/ -q`
-handover.md                  a PREVIOUS session's own continuation notes
-                             (gitignored, may or may not still exist on
-                             disk — don't assume it's current).
+handover.md                  a PREVIOUS session's own continuation notes.
+                             Tracked in git (not gitignored) — read it,
+                             it's usually more current/detailed than this
+                             file on whatever the last session actually did.
 ```
 
 ## Why the GPU job is a single self-contained script
@@ -157,7 +163,7 @@ and pinned with a regression test:
 
 | Stage | Status |
 |---|---|
-| EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **Not yet confirmed safe to scale to the other 15 clips** — see "Immediate priority" below. |
+| EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
 | MediaPipe hands | Code complete, unit-tested, proven working (Metal-accelerated, fast). Never run against real *redacted* output — only a synthetic test clip. |
 | VLM captioning | Code complete, unit-tested. `models.toml` still has placeholder model IDs / $0.00 prices — cannot run for real until filled in with two real models from different labs. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
@@ -165,25 +171,32 @@ and pinned with a regression test:
 
 ## Immediate priority — the EgoBlur redaction work
 
-This is what the previous session spent most of its time on. Read this
-section before doing anything with `jobs/10_blur_egoblur.py`.
+Read this section before doing anything with `jobs/10_blur_egoblur.py`.
 
-**The one thing to check first, genuinely unresolved:** an early run
-(`test-run-1`, default settings) showed `fill_integrity_violations: 14096`
-— 65% of checked redaction boxes failing an exact-pixel-value check. The
-developer watched the actual output video and it looked correctly
-redacted, so the working theory was that the *check* is too strict
-against real H.264 encoder ringing at box edges, not a real privacy leak
-— but this was **never confirmed on the current best-known settings**
-(`test-run-3`, see below). If you have access to the pod, the very first
-thing to do is:
+**The fill-integrity question is RESOLVED, with actual evidence — not
+just a visual spot-check.** An early run (`test-run-1`, default settings)
+showed `fill_integrity_violations: 14096` (~65% of checked boxes). The
+working theory was "the check is too strict against H.264 encoder
+ringing, not a real leak" — accepted at the time purely because the
+developer watched the output video and it looked fine.
 
-```bash
-cat /workspace/out2/GX010057.audit_summary.md
-```
-
-and read the actual `fill_integrity_violations` number under the current
-settings before trusting anything is ready to scale.
+That got properly confirmed in a later session. `test-run-3`'s real
+numbers: `checked=36731`, `violations=23216` → **63.2%**, essentially
+flat vs. `test-run-1` despite 69% more boxes being checked overall. More
+importantly, a purpose-built diagnostic (`diag_integrity.py` — rebuilds
+the exact `fill_map` from the real checkpoint, re-decodes the
+already-encoded output, and measures actual pixel deviation instead of a
+bare pass/fail) found **96.6% of violations are within 5 gray levels of
+the allowed limit, and 0% are "severe" or "extreme"** — a real leaked
+face would blow past the limit by 50-100+ gray levels (skin tone vs.
+mid-gray `FILL_VALUE=128`); this doesn't. **Conclusion: the check is
+too strict against ordinary encoder quantization, confirmed, not
+assumed.** Don't re-litigate this unless settings change materially; if
+you do need to re-check, `diag_integrity.py` is on the pod at
+`/workspace/diag_integrity.py` — not committed to this repo, by design
+(see `handover.md`'s "Diagnostic scripts" section: these are throwaway
+analysis tools, not pipeline code, kept off the pod's `/workspace` or
+regenerated on request rather than checked in).
 
 **Current best-known-good settings** (arrived at empirically, not
 guessed — a parameter-sweep tool was built specifically to test
@@ -211,11 +224,12 @@ video).
 
 ## Known open work (real, scoped, not busywork)
 
-**Fixed since this file was first written** (commit `d0cbe10`): the
-`max_fill_area_frac` dead-canary gate, and hysteresis's drift bound
-(it counted absorption events instead of real video frames — now budgets
-`max_low_run * stride` frames since the track's last confident detection).
-Both mutation-tested. What's left:
+**Fixed since this file was first written:** the `max_fill_area_frac`
+dead-canary gate and hysteresis's drift bound (commit `d0cbe10`); plus,
+**currently uncommitted but tested and mutation-tested**, two of the
+three remaining hysteresis visibility gaps (see item 2 below) and a
+durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
+(see "Operational notes for RunPod"). What's left:
 
 1. **A resumed multi-clip batch can silently mix redaction configs.**
    `process_clip`'s manifest-skip only checks whether a manifest file
@@ -226,20 +240,40 @@ Both mutation-tested. What's left:
    no warning, and `run_manifest.json` doesn't even record which
    thresholds were used. Fix: extend fingerprinting to cover
    redaction-relevant config and check it at the manifest-skip site.
+   Not touched this session.
 2. **Two-threshold hysteresis exists in the code but is off by default**
-   (`--continue-threshold 0`) and has known unresolved issues if ever
-   turned on: one threshold value applies to both face and plate classes,
-   greedy association can let a low-confidence detection outbid a
-   high-confidence one for the same track, and its audit fields
-   (`n_low_absorbed`, the `det_low` source tag) don't fully reach
-   human-readable output. Two real privacy regressions in this feature
-   have already been found and fixed (an absorbed low-confidence
-   detection could make a confirmed face's coverage *worse* while
-   silencing the audit check that would have caught it; its drift bound
-   didn't actually bound drift — see `git log --oneline | grep -iE
-   "hysteresis|drift bound"`) — but the items above were left open.
-   Don't enable `--continue-threshold` for a real batch without
-   addressing them.
+   (`--continue-threshold 0`). Of its original 4 acceptance criteria
+   before it's safe to turn on, 3 are now resolved:
+   - ~~One threshold value shared between face and plate classes, only
+     face's behaviour measured~~ — moot for how this project actually
+     runs: `--lp-weights-gen2` is dropped project-wide, so no `cls ==
+     "lp"` detection is ever produced. A config fact, not a code fix.
+   - ~~The `det_low` source tag never reached human-readable output~~ —
+     fixed properly on the second try. The first attempt threaded a new
+     out-parameter through `tracks_to_fill_map`'s hot loop; an
+     adversarial code review found this unnecessary — `low_absorbed`
+     (populated during `build_tracks`, never deleted) already carries
+     the same frame indices. Final fix derives `det_low_frames` from
+     `low_absorbed` directly in `process_clip`, with zero changes to
+     `tracks_to_fill_map`.
+   - ~~`n_low_absorbed` reached the JSON manifest but not the
+     markdown~~ — fixed, plus two real bugs the same adversarial review
+     caught in the fix itself: an unverifiable hardcoded claim ("0 when
+     `--continue-threshold` is off" — `write_audit_summary` never
+     actually sees `cfg.continue_threshold`) and a count/list mismatch
+     (`n_low_absorbed` counts absorption *events*, `det_low_frames` is a
+     *deduplicated* frame list — two tracks absorbing on the same frame
+     makes these legitimately differ, now labeled explicitly instead of
+     looking like a bug). `det_low_frames` is also now capped at
+     `AUDIT_MAX_ITEMS` with a paired `det_low_frames_truncated` field,
+     matching this file's own `candidates_truncated`/`yunet_truncated`
+     convention instead of inventing a new one.
+   - **Still open:** greedy single-stage IoU association can let a
+     low-confidence detection outbid a high-confidence one for the same
+     track (real ByteTrack matches high-score detections first; this
+     doesn't). A real behavioral fix to the matching logic, not a
+     visibility fix — bigger, separate work. Don't enable
+     `--continue-threshold` for a real batch until this is addressed.
 3. **No independent second-opinion face detector is actually running.**
    `--yunet-model` was designed for this but real weights were never
    sourced. MediaPipe Face Landmarker was investigated as an
@@ -289,6 +323,23 @@ Both mutation-tested. What's left:
 - The 8-hour job watchdog (`arm_watchdog`) likely cannot actually fire —
   `runpodctl` on the working pod was never authenticated with an API
   key. Don't rely on it as a real cost backstop; stop the pod manually.
+- **The web terminal's paste buffer silently truncates large pastes** —
+  a 250-line script landed as ~20 lines with no error until it was run.
+  Use real SSH for anything longer than a couple of lines. RunPod offers
+  two SSH modes: **Basic SSH** (`ssh <id>@ssh.runpod.io`) does **not**
+  support SCP/SFTP, so it can't actually solve the paste problem; **Full
+  SSH over exposed TCP** (`ssh root@<ip> -p <port>`) does. Needs `22`
+  listed under the pod's Expose TCP Ports, and `sshd` actually running
+  (`pgrep -a sshd`; `service ssh start` or `mkdir -p /run/sshd &&
+  /usr/sbin/sshd` if not). `scripts/runpod_setup.sh` now keeps the real
+  `authorized_keys` on `/workspace/.ssh/` and symlinks
+  `/root/.ssh/authorized_keys` to it — same wiped-container-disk pattern
+  as everything else above — so populating
+  `/workspace/.ssh/authorized_keys` once makes SSH work automatically on
+  every future pod that mounts this same volume. For a genuinely
+  different pod/volume, also register the key at Console → User Settings
+  → SSH Keys (RunPod's own account-level mechanism, no volume
+  dependency).
 
 ## How to work in this repo
 

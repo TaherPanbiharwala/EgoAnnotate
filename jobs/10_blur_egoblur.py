@@ -2438,7 +2438,8 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
 def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
                  yunet: dict, gen: str, n_dropped_small: int = 0,
                  lp_checked: bool = True, n_face_fill_frames: int | None = None,
-                 n_low_absorbed: int = 0) -> dict:
+                 n_low_absorbed: int = 0,
+                 det_low_frames: list[int] | None = None) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -2540,6 +2541,14 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # are now genuinely covered) and a reviewer reading the manifest
         # otherwise cannot distinguish that from "the detector found less".
         "n_low_absorbed": n_low_absorbed,
+        # WHICH frames n_low_absorbed's count refers to. Sorted + deduplicated
+        # by the caller: more than one absorbed box (different tracks) can
+        # land on the same frame_idx. Capped + counted the same way
+        # candidates_truncated/yunet_truncated already are below, instead of
+        # storing an unbounded list — a long clip under heavy hysteresis use
+        # could otherwise put thousands of entries in every manifest.
+        "det_low_frames": (det_low_frames or [])[:AUDIT_MAX_ITEMS],
+        "det_low_frames_truncated": max(0, len(det_low_frames or []) - AUDIT_MAX_ITEMS),
         # False means no plate detector ran at all. Recorded so a face-only
         # run is never later read as "this clip has no license plates".
         "lp_checked": lp_checked,
@@ -2578,6 +2587,29 @@ def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
         lines += ["## Why this needs a look", ""]
         lines += [f"{i}. {r}" for i, r in enumerate(reasons, 1)]
         lines += [""]
+    # WHERE n_low_absorbed's count actually is, not just how many — capped
+    # at 8 frame numbers so a clip with dozens of absorptions doesn't turn
+    # this into an unreadable dump; the full list is always in the
+    # manifest's audit.det_low_frames regardless of this cap.
+    #
+    # n_low_absorbed counts ABSORPTION EVENTS; det_low_frames is the
+    # DEDUPLICATED set of frames they landed on. Two different tracks can
+    # each absorb a low box on the same frame_idx, so the two numbers can
+    # legitimately differ — naming the distinct-frame count explicitly is
+    # what stops that from reading as a bug instead of two different,
+    # correct measures.
+    n_low_absorbed = audit.get("n_low_absorbed", 0)
+    low_frames = audit.get("det_low_frames") or []
+    if low_frames:
+        shown = ", ".join(str(f) for f in low_frames[:8])
+        more = f", +{len(low_frames) - 8} more" if len(low_frames) > 8 else ""
+        low_detail = f"; {len(low_frames)} distinct frame(s): {shown}{more}"
+    else:
+        # No guess at WHY it's zero: this function only has the audit dict,
+        # never cfg.continue_threshold, so it cannot actually tell "hysteresis
+        # was off" apart from "hysteresis was on and absorbed nothing here" —
+        # asserting either would be a claim this function has no way to check.
+        low_detail = ""
     lines += [
         f"frames {clip.n_frames}  fps {clip.fps:.2f}  gen {audit['gen']}",
         f"frames_with_fill: {audit.get('n_frames_with_fill', 0)} "
@@ -2587,6 +2619,7 @@ def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
         f"candidate_misses [sweep_threshold, operating): {audit.get('n_candidate_misses', 'n/a')}  (hard gate — review these)",
         f"yunet_uncovered: {audit.get('n_yunet_uncovered', 'n/a') if audit.get('yunet_ran') else 'SKIPPED — see note'}  (hard gate when run — review these first)",
         f"max_fill_area_frac: {audit.get('max_fill_area_frac', 0):.4f}  (runaway false-positive canary)",
+        f"n_low_absorbed: {n_low_absorbed}  (hysteresis-absorbed low-confidence detections{low_detail})",
         "",
         audit["note"],
     ]
@@ -2812,11 +2845,18 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                          full_range=clip.color_range == "pc")
     t_verify = time.monotonic()
 
+    # Derived from low_absorbed, not a separate side-channel out of
+    # tracks_to_fill_map: build_tracks() appends the same Detection to
+    # low_absorbed in the exact branch that writes a "det_low" frame entry
+    # (frame_idx matches), and low_absorbed is never deleted -- still alive,
+    # unmodified, right here.
+    det_low_frames = sorted({d.frame_idx for d in low_absorbed})
     audit = build_audit(clip, fill_stats, integrity, sweep, yunet, gen,
                          n_dropped_small=len(dropped_small),
                          lp_checked=lp_det is not None,
                          n_face_fill_frames=n_face_fill_frames,
-                         n_low_absorbed=len(low_absorbed))
+                         n_low_absorbed=len(low_absorbed),
+                         det_low_frames=det_low_frames)
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {

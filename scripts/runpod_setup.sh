@@ -7,7 +7,10 @@
 # or copied there — while the pod still looks fully set up because the repo,
 # the weights and the footage all live on the volume and survived. So this
 # installs everything into /workspace/bin instead, and is safe to re-run:
-# it IS the recovery procedure after every pod restart.
+# it IS the recovery procedure after every pod restart. SSH access
+# (/root/.ssh/authorized_keys) has the identical problem and gets the
+# identical fix below — see the SSH section for the one-time setup that
+# makes it durable across every future pod on this same volume.
 #
 # Usage, from anywhere on the pod:
 #     bash /workspace/egoannote/scripts/runpod_setup.sh
@@ -148,6 +151,72 @@ if [ ! -f "$RCLONE_CONFIG" ] && [ -f /root/.config/rclone/rclone.conf ]; then
 fi
 [ -f "$RCLONE_CONFIG" ] && chmod 600 "$RCLONE_CONFIG"
 
+# --- SSH (optional; skip with EGOANNOTE_SKIP_SSH=1) --------------------------
+# /root/.ssh/authorized_keys is CONTAINER disk too — wiped on every stop,
+# same failure mode as everything above. Re-pasting a key into a fresh pod's
+# web terminal every time is also the wrong fix on its own merits: that
+# paste path is unreliable for anything longer than a line or two (this is
+# how this section came to exist). Keep the real authorized_keys on the
+# VOLUME and make /root/.ssh/authorized_keys a symlink to it. Populate
+# /workspace/.ssh/authorized_keys ONCE and every future pod that mounts
+# this same volume — different pod, different GPU, doesn't matter — has
+# working SSH with zero per-pod setup.
+#
+# Never seed an actual key into this script or the repo. A public key isn't
+# a secret, but this is a forkable public project — a key baked in here
+# would mean every fork's pod trusts the original author's key by default.
+if [ "${EGOANNOTE_SKIP_SSH:-0}" = "1" ]; then
+    echo ">> skipping SSH setup (EGOANNOTE_SKIP_SSH=1)"
+else
+    VOL_SSH_DIR="/workspace/.ssh"
+    mkdir -p "$VOL_SSH_DIR"
+    chmod 700 "$VOL_SSH_DIR"
+    touch "$VOL_SSH_DIR/authorized_keys"
+    chmod 600 "$VOL_SSH_DIR/authorized_keys"
+
+    # Rescue whatever RunPod's own account-level key injection may already
+    # have written directly to container disk, before we replace it with a
+    # symlink — same rescue-don't-clobber principle as the rclone config
+    # migration above, so an already-working key isn't thrown away.
+    if [ -f /root/.ssh/authorized_keys ] && [ ! -L /root/.ssh/authorized_keys ] \
+       && [ -s /root/.ssh/authorized_keys ]; then
+        echo ">> found an existing container-disk authorized_keys — merging onto the volume"
+        cat /root/.ssh/authorized_keys >> "$VOL_SSH_DIR/authorized_keys"
+        sort -u -o "$VOL_SSH_DIR/authorized_keys" "$VOL_SSH_DIR/authorized_keys"
+    fi
+
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    # Idempotent: only relink if it isn't already the right symlink, so a
+    # re-run doesn't churn the file or fight some other process touching it.
+    if [ ! -L /root/.ssh/authorized_keys ] || \
+       [ "$(readlink /root/.ssh/authorized_keys)" != "$VOL_SSH_DIR/authorized_keys" ]; then
+        rm -f /root/.ssh/authorized_keys
+        ln -s "$VOL_SSH_DIR/authorized_keys" /root/.ssh/authorized_keys
+    fi
+
+    if [ ! -s "$VOL_SSH_DIR/authorized_keys" ]; then
+        echo ">> $VOL_SSH_DIR/authorized_keys is empty — SSH will reject every key until you add one, ONCE:"
+        echo "     echo '<paste your public key>' >> $VOL_SSH_DIR/authorized_keys"
+        echo "   After that, every pod mounting this volume has working SSH automatically."
+    fi
+
+    # sshd is a running SERVICE, not a file that needs to survive a stop —
+    # reinstalling/restarting it fresh every boot is normal and cheap, unlike
+    # uv/ffmpeg/rclone above where the whole point was avoiding exactly that.
+    if ! command -v sshd >/dev/null 2>&1; then
+        echo ">> installing openssh-server"
+        apt-get update -qq && apt-get install -y -qq openssh-server >/dev/null
+    fi
+    mkdir -p /run/sshd
+    if pgrep -x sshd >/dev/null 2>&1; then
+        echo ">> sshd already running"
+    else
+        echo ">> starting sshd"
+        /usr/sbin/sshd
+    fi
+fi
+
 echo
 echo "--- ready ---"
 echo "uv      : $(command -v uv) — $(uv --version)"
@@ -155,6 +224,11 @@ echo "ffmpeg  : $(command -v ffmpeg) — $(ffmpeg -version | head -1)"
 echo "ffprobe : $(command -v ffprobe) — $(ffprobe -version | head -1)"
 if [ -x "$BIN/rclone" ]; then
     echo "rclone  : $BIN/rclone — $("$BIN/rclone" version | head -1)"
+fi
+if [ "${EGOANNOTE_SKIP_SSH:-0}" != "1" ]; then
+    n_keys=$(grep -c . /workspace/.ssh/authorized_keys 2>/dev/null || echo 0)
+    sshd_state=$(pgrep -x sshd >/dev/null 2>&1 && echo running || echo "NOT running")
+    echo "ssh     : $n_keys key(s) on the volume, sshd $sshd_state"
 fi
 echo
 if [ -f "$RCLONE_CONFIG" ]; then
