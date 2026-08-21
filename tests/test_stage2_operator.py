@@ -234,6 +234,30 @@ def test_release_check_rejects_private_content_even_when_renamed(stage2_job, tmp
     assert "not bound to current processing" in " ".join(invalidated.value.details["problems"])
 
 
+def test_effective_review_status_orders_by_parsed_time_not_string(stage2_job, tmp_path):
+    paths, _output_ref = _completed_run(stage2_job, tmp_path)
+    stage2_job.create_review_record(
+        paths,
+        reviewer="human",
+        reviewed_at="2026-08-20T12:00:00Z",
+        review_status="REJECTED",
+        full_clip_reviewed=True,
+        flagged_intervals_reviewed=True,
+    )
+    # Chronologically later (500ms after the REJECTED record above) despite sorting
+    # lexicographically *before* it as a raw string, since "." < "Z" in ASCII.
+    stage2_job.create_review_record(
+        paths,
+        reviewer="human",
+        reviewed_at="2026-08-20T12:00:00.500000Z",
+        review_status="ACCEPTED",
+        full_clip_reviewed=True,
+        flagged_intervals_reviewed=True,
+    )
+    status, _reference = stage2_job.effective_review_status(paths)
+    assert status == "ACCEPTED"
+
+
 def test_canonical_review_edit_cannot_forge_acceptance(stage2_job, tmp_path):
     paths, _output_ref = _completed_run(stage2_job, tmp_path)
     reference, _record = stage2_job.create_review_record(
@@ -312,6 +336,91 @@ def test_stop_resume_and_explicit_render_invalidation(stage2_job, tmp_path):
     resumed = stage2_job.prepare_resume(paths)
     assert resumed.state == "SAM_COMPLETE"
     assert not paths.stop_request.exists()
+
+
+def test_recompute_archives_prior_review_records_instead_of_erasing_them(stage2_job, tmp_path):
+    paths, _output = _completed_run(stage2_job, tmp_path)
+    rejected_reference, rejected_record = stage2_job.create_review_record(
+        paths,
+        reviewer="human",
+        reviewed_at="2026-08-20T12:00:00Z",
+        review_status="REJECTED",
+        full_clip_reviewed=True,
+        flagged_intervals_reviewed=True,
+    )
+    history_path = paths.root / "reviews-history.jsonl"
+    assert not history_path.exists()
+
+    stage2_job.invalidate_from(paths, layer="render")
+
+    assert not paths.reviews_dir.exists()
+    assert history_path.exists()
+    first_batch = [json.loads(line) for line in history_path.read_text().splitlines()]
+    assert len(first_batch) == 1
+    archived = first_batch[0]
+    assert archived["review_id"] == rejected_record.review_id
+    assert archived["review_status"] == "REJECTED"
+    assert archived["review_record_sha256"] == rejected_reference.sha256
+    assert archived["invalidated_from_layer"] == "render"
+    assert archived["invalidated_at"].endswith("Z")
+
+    # A recompute with nothing in reviews_dir must not append empty/duplicate entries.
+    stage2_job.invalidate_from(paths, layer="render")
+    assert [json.loads(line) for line in history_path.read_text().splitlines()] == first_batch
+
+    # A second real review followed by another recompute must append, not overwrite,
+    # so the log stays a complete history rather than only remembering the latest.
+    paths_after = stage2_job.build_run_paths(tmp_path / "work", "run", "clip")
+    output = paths_after.render.parent / "stage2.mp4"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b"second verified stage2 video")
+    output_ref = stage2_job.artifact_ref(output)
+    render_meta = stage2_job.RenderArtifactMeta(
+        schema_version=1,
+        artifact_type="render",
+        fingerprint="1" * 64,
+        stage1_video_sha256="2" * 64,
+        mask_set_sha256="3" * 64,
+        output=output_ref,
+        encoder={"pixel_source": "stage1_video_only"},
+        verification={"passed": True, "publishable": False},
+    )
+    render_ref = stage2_job.write_immutable_json(paths_after.render, render_meta)
+    manifest = {
+        "schema_version": 1,
+        "code_version": stage2_job.STAGE2_CODE_VERSION,
+        "run_id": "run",
+        "clip_id": "clip",
+        "mode": "production",
+        "processing_state": "PROCESSING_COMPLETE",
+        "audit_status": "PASS_AUTOMATED_TECHNICAL",
+        "review_status": "PENDING",
+        "render_artifact": render_ref,
+    }
+    stage2_job.write_immutable_json(paths_after.manifest, manifest)
+    stage2_job.transition_state(
+        paths_after.state,
+        run_id="run",
+        clip_id="clip",
+        mode="production",
+        target="PROCESSING_COMPLETE",
+        completed_layers=("dino", "sam", "render"),
+        reusable_layers=("dino", "sam", "render"),
+    )
+    _accepted_reference, accepted_record = stage2_job.create_review_record(
+        paths_after,
+        reviewer="human",
+        reviewed_at="2026-08-21T09:00:00Z",
+        review_status="ACCEPTED",
+        full_clip_reviewed=True,
+        flagged_intervals_reviewed=True,
+    )
+    stage2_job.invalidate_from(paths_after, layer="render")
+    second_batch = [json.loads(line) for line in history_path.read_text().splitlines()]
+    assert len(second_batch) == 2
+    assert second_batch[0]["review_id"] == rejected_record.review_id
+    assert second_batch[1]["review_id"] == accepted_record.review_id
+    assert second_batch[1]["review_status"] == "ACCEPTED"
 
 
 def test_recompute_refuses_symlinked_layer_directory(stage2_job, tmp_path):

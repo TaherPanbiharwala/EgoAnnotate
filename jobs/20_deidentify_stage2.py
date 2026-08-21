@@ -45,7 +45,7 @@ import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -5915,7 +5915,13 @@ def effective_review_status(paths: RunPaths) -> tuple[str, ArtifactRef | None]:
     ]
     if not matching:
         return "PENDING", None
-    reference, record = max(matching, key=lambda item: (item[1].reviewed_at, item[1].review_id))
+    reference, record = max(
+        matching,
+        key=lambda item: (
+            datetime.fromisoformat(item[1].reviewed_at[:-1] + "+00:00"),
+            item[1].review_id,
+        ),
+    )
     return record.review_status, reference
 
 
@@ -6649,6 +6655,52 @@ def _remove_layer_path(paths: RunPaths, candidate: Path) -> None:
         ) from exc
 
 
+def _utc_now_z() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _archive_invalidated_reviews(paths: RunPaths, *, layer: str) -> None:
+    """Preserve prior review records before invalidate_from deletes reviews_dir.
+
+    Recompute is designed to invalidate every earlier human review record
+    (see docs/stage2-operator.md), but the earlier implementation deleted
+    them outright with no trace, letting a rejected review be silently
+    discarded and replaced by a fresh acceptance of byte-identical
+    recomputed content. Append-only history keeps the invalidation itself
+    (not just its cause) auditable.
+    """
+    records = load_review_records(paths)
+    if not records:
+        return
+    history_path = paths.root / "reviews-history.jsonl"
+    if history_path.is_symlink():
+        raise Stage2Error("UNSAFE_REVIEW_PATH", "Review history log may not be a symlink.")
+    existing = b""
+    if history_path.exists():
+        try:
+            existing = history_path.read_bytes()
+        except OSError as exc:
+            raise Stage2Error(
+                "ARTIFACT_READ_FAILED",
+                f"Could not read existing review history log {history_path}",
+                details={"cause": str(exc)},
+            ) from exc
+    invalidated_at = _utc_now_z()
+    appended = b"".join(
+        canonical_json_bytes(
+            {
+                **_jsonable(record),
+                "review_record_sha256": reference.sha256,
+                "invalidated_from_layer": layer,
+                "invalidated_at": invalidated_at,
+            }
+        )
+        + b"\n"
+        for reference, record in records
+    )
+    atomic_write_bytes(history_path, existing + appended)
+
+
 def invalidate_from(paths: RunPaths, *, layer: str) -> ProcessingState:
     state = load_state(paths.state)
     if state is None:
@@ -6665,6 +6717,7 @@ def invalidate_from(paths: RunPaths, *, layer: str) -> ProcessingState:
             "RECOMPUTE_PREREQUISITE_MISSING",
             f"Cannot recompute from {layer} before its upstream contract is complete.",
         )
+    _archive_invalidated_reviews(paths, layer=layer)
     targets = {
         "dino": (paths.dino.parent, paths.sam_dir, paths.frames_dir, paths.render.parent),
         "sam": (paths.sam_dir, paths.frames_dir, paths.render.parent),
