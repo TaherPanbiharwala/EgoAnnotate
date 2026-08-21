@@ -3321,6 +3321,26 @@ def extract_attested_sam_window(
     )
 
 
+def real_sam_window_loader(
+    *, stage1: StageIInput, paths: RunPaths
+) -> Callable[[TemporalWindow], SamWindowInput]:
+    """Bind stage1/paths so extract_attested_sam_window fits window_loader(window).
+
+    generate_sam_mask_shards calls whatever it receives as window_loader
+    with a single positional TemporalWindow argument (the same convention
+    run_fake_pipeline's own inline lambda already follows); the real
+    extractor takes stage1/paths/window all as keyword-only arguments, so
+    calling it directly as window_loader(window) raises TypeError. This
+    closes over the run's stage1/paths once and exposes the single-argument
+    shape the orchestration expects.
+    """
+
+    def loader(window: TemporalWindow) -> SamWindowInput:
+        return extract_attested_sam_window(stage1=stage1, paths=paths, window=window)
+
+    return loader
+
+
 def sam_shard_path(paths: RunPaths, window: TemporalWindow, fingerprint_value: str) -> Path:
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint_value):
         raise Stage2Error("INVALID_SAM_FINGERPRINT", "SAM fingerprint is not a SHA-256.")

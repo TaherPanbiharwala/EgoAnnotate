@@ -81,6 +81,22 @@ def test_exact_sam_window_is_atomically_extracted_attested_and_reused(stage2_job
     assert second == first
 
 
+def test_real_sam_window_loader_matches_generate_sam_mask_shards_contract(stage2_job, tmp_path):
+    """extract_attested_sam_window can't be window_loader=... directly (keyword-only args
+    vs generate_sam_mask_shards calling window_loader(window) positionally) - real_sam_window_loader
+    is the binding that closes the gap."""
+    stage1 = _make_source_video(stage2_job, tmp_path)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    window = stage2_job.TemporalWindow(index=0, frame_start=1, frame_end=3)
+
+    with pytest.raises(TypeError):
+        stage2_job.extract_attested_sam_window(window)
+
+    loader = stage2_job.real_sam_window_loader(stage1=stage1, paths=paths)
+    direct = stage2_job.extract_attested_sam_window(stage1=stage1, paths=paths, window=window)
+    assert loader(window) == direct
+
+
 def test_changed_or_extra_sam_frame_payload_fails_closed(stage2_job, tmp_path):
     stage1 = _make_source_video(stage2_job, tmp_path)
     paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
