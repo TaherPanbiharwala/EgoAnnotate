@@ -18,10 +18,34 @@ a `fingerprint()`-bypass in private-artifact hashing (no code path actually
 reuses a stale private artifact across a code-version bump). Neither is listed
 below.
 
-All 15 findings below were independently verified (CONFIRMED). None have been
-fixed yet — this file is the record of what needs fixing before Milestone 6's
-real-GPU work and eventual production rollout, not a description of fixes
-already applied.
+All 15 findings below were independently verified (CONFIRMED). All 15 are now
+fixed, on this same branch, each in its own commit with a mutation-tested
+regression test (revert the fix, confirm the new test fails; restore it,
+confirm the suite passes). Commits, in the same order as the findings below:
+
+1. `f402ee8` — also covers #2
+2. `f402ee8`
+3. `32dab4e`
+4. `f8f85a0`
+5. `1f1095c`
+6. `1edf808`
+7. `fc727b3`
+8. `ec0d030`
+9. `5f0382f`
+10. `2334a4d` (Python side mutation-tested; the shell-script half sits on the
+    real-GPU-pod path, the same pre-existing testability boundary as the rest
+    of that script, so it's verified by code review and `bash -n` rather than
+    an automated test)
+11. `88badd8`
+12. `1462af9` (test-only fix; verified by reproducing the exact cross-test
+    leak with a throwaway probe rather than a kept regression test)
+13. `21a747b`
+14. `d772acc`
+15. `459f7ae`
+
+Full suite: 473 passed (up from 453 before this pass). This file is kept as
+the historical record of the review; treat `git log` on this branch as
+authoritative for exact diffs.
 
 ## 1. `invalidate_from` erases review history with no audit trail
 
