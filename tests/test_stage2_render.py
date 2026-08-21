@@ -198,6 +198,31 @@ def test_real_render_is_verified_promoted_and_reusable(stage2_job, tmp_path):
     assert second.artifact == result.artifact
 
 
+def test_render_stage2_video_honors_a_stop_request(stage2_job, tmp_path):
+    stage1 = _make_video(stage2_job, tmp_path)
+    shard = _make_shard(stage2_job, tmp_path, stage1)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    stage2_job.transition_state(
+        paths.state,
+        run_id="run",
+        clip_id=stage1.clip_id,
+        mode="production",
+        target="SAM_COMPLETE",
+        completed_layers=("dino", "sam"),
+        reusable_layers=("dino", "sam"),
+    )
+    stage2_job.request_stop(paths)
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.render_stage2_video(
+            stage1=stage1,
+            paths=paths,
+            sam_shards=(shard,),
+            config=stage2_job.RenderConfig(dilation_pixels_at_1080p=0),
+        )
+    assert caught.value.code == "STOP_REQUESTED"
+    assert not paths.render.exists()
+
+
 def test_failed_verification_never_promotes_output(stage2_job, tmp_path, monkeypatch):
     stage1 = _make_video(stage2_job, tmp_path)
     shard = _make_shard(stage2_job, tmp_path, stage1)

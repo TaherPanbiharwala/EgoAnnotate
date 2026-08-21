@@ -337,6 +337,32 @@ def test_interrupted_generation_resumes_completed_anchors(stage2_job, tmp_path):
     assert resumed.meta.anchor_frames == (0, 20, 24)
 
 
+def test_generate_dino_proposals_honors_a_stop_request_mid_run(stage2_job, tmp_path):
+    stage1 = _stage1(stage2_job, n_frames=25)  # anchors (0, 20, 24)
+    adapter = GlobalFaceAdapter(stage2_job)
+    config = _config(stage2_job, adapter)
+    paths = stage2_job.build_run_paths(tmp_path, "dino-test", stage1.clip_id)
+    stage2_job.transition_state(
+        paths.state, run_id="dino-test", clip_id=stage1.clip_id, mode="production", target="VALIDATED"
+    )
+    loaded_frames = []
+
+    def frame_loader(frame_idx):
+        loaded_frames.append(frame_idx)
+        if len(loaded_frames) == 2:
+            stage2_job.request_stop(paths)
+        return stage2_job.FakeImage(100, 80)
+
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.generate_dino_proposals(
+            stage1=stage1, paths=paths, config=config, adapter=adapter, frame_loader=frame_loader
+        )
+    assert caught.value.code == "STOP_REQUESTED"
+    # Stopped once the marker appeared, before starting the 3rd anchor -
+    # not after silently running every remaining anchor to completion.
+    assert loaded_frames == [0, 20]
+
+
 def test_torn_final_checkpoint_row_is_repaired_on_resume(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job, n_frames=25)
     interrupted = GlobalFaceAdapter(stage2_job, fail_on_call=2)

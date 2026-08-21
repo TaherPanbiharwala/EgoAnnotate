@@ -2197,6 +2197,7 @@ def generate_dino_proposals(
     for frame_idx in anchors:
         if frame_idx in rows:
             continue
+        ensure_run_not_stopped(paths)
         try:
             image = frame_loader(frame_idx)
         except Stage2Error:
@@ -4403,6 +4404,7 @@ def generate_sam_mask_shards(
     reused = 0
     generated = 0
     for window in windows:
+        ensure_run_not_stopped(paths)
         prompts = sam_prompts_for_window(window, selection.accepted, seeds)
         propagation: SamPropagationResult | None = None
         propagation_failure: str | None = None
@@ -4939,6 +4941,7 @@ def _render_frames(
     stage1_path: Path,
     output_path: Path,
     stage1: StageIInput,
+    paths: RunPaths,
     sam_shards: tuple[ArtifactRef, ...],
     metas: tuple[SamMaskShardMeta, ...],
     config: RenderConfig,
@@ -4952,6 +4955,10 @@ def _render_frames(
         )
     frame_size = width * height * 3 // 2
     radius = scaled_render_dilation(height, config.dilation_pixels_at_1080p)
+    # Checking every frame would add a stat/read per frame on a clip that
+    # can run to thousands of frames; about once per second of footage
+    # keeps stop latency reasonable without meaningful per-frame overhead.
+    stop_check_interval = max(1, round(stage1.stage1_output_video.fps))
     reader = _RenderShardReader(sam_shards, metas)
     source_media = _probe_media_contract(stage1_path)
     source_video_streams = [
@@ -4989,6 +4996,8 @@ def _render_frames(
         assert decoder.stdout is not None and encoder.stdin is not None
         try:
             for frame_idx in range(stage1.stage1_output_video.n_frames):
+                if frame_idx % stop_check_interval == 0:
+                    ensure_run_not_stopped(paths)
                 frame = _read_exact_frame(decoder.stdout, frame_size)
                 if len(frame) != frame_size:
                     raise Stage2Error(
@@ -5466,6 +5475,7 @@ def render_stage2_video(
             stage1_path=stage1_path,
             output_path=temporary,
             stage1=stage1,
+            paths=paths,
             sam_shards=sam_shards,
             metas=metas,
             config=config,

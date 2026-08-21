@@ -236,6 +236,40 @@ def test_complete_shard_reuse_revalidates_payload_without_model_calls(stage2_job
     assert loaded_windows == [stage2_job.temporal_windows(20, 10, 2)[0]]
 
 
+def test_generate_sam_mask_shards_honors_a_stop_request_mid_run(stage2_job, tmp_path):
+    stage1 = _stage1(stage2_job)  # n_frames=20 -> temporal_windows(20, 10, 2) has 3 windows
+    proposal = _proposal(stage2_job, frame_idx=5)  # falls inside window 0
+    adapter = stage2_job.FakeSamAdapter()
+    config = _config(stage2_job, adapter)
+    dino_ref, dino_meta = _dino_artifact(stage2_job, tmp_path / "inputs", stage1, (proposal,))
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    stage2_job.transition_state(
+        paths.state, run_id="run", clip_id=stage1.clip_id, mode="production", target="VALIDATED"
+    )
+    loaded_windows = []
+
+    def stopping_loader(window):
+        loaded_windows.append(window)
+        stage2_job.request_stop(paths)
+        return _window_input(stage2_job, stage1, window)
+
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.generate_sam_mask_shards(
+            stage1=stage1,
+            paths=paths,
+            dino_artifact=dino_ref,
+            dino_meta=dino_meta,
+            config=config,
+            adapter=adapter,
+            window_loader=stopping_loader,
+        )
+    assert caught.value.code == "STOP_REQUESTED"
+    # Only the one window whose loader ran (and requested the stop) was
+    # touched - the remaining two windows were never started.
+    assert len(loaded_windows) == 1
+    assert adapter.calls == 1
+
+
 def test_no_prompt_windows_are_persisted_without_running_sam(stage2_job, tmp_path):
     adapter = stage2_job.FakeSamAdapter()
     result, *_ = _generate(stage2_job, tmp_path, adapter=adapter)
