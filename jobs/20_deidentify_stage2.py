@@ -601,19 +601,30 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def sha256_directory_tree(root: Path) -> str:
-    """Hash installed runtime files by relative path and content."""
+def sha256_directory_tree(
+    root: Path,
+    *,
+    description: str = "installed SAM2 package",
+    unverifiable_code: str = "SAM_RUNTIME_UNVERIFIABLE",
+    changed_code: str = "SAM_RUNTIME_CHANGED_DURING_HASH",
+) -> str:
+    """Hash every file under root by relative path and content, TOCTOU-guarded.
+
+    Generic over which asset directory is being hashed (the installed SAM2
+    package, a persistent DINO snapshot, ...); callers customize the error
+    codes and wording so a DINO problem doesn't get reported as a SAM one.
+    """
     try:
         root = root.resolve(strict=True)
     except OSError as exc:
         raise Stage2Error(
-            "SAM_RUNTIME_UNVERIFIABLE",
-            f"Could not resolve the installed SAM2 package directory: {root}",
+            unverifiable_code,
+            f"Could not resolve the {description} directory: {root}",
         ) from exc
     if not root.is_dir():
         raise Stage2Error(
-            "SAM_RUNTIME_UNVERIFIABLE",
-            f"Installed SAM2 package path is not a directory: {root}",
+            unverifiable_code,
+            f"The {description} path is not a directory: {root}",
         )
 
     def runtime_files() -> list[Path]:
@@ -624,8 +635,8 @@ def sha256_directory_tree(root: Path) -> str:
                 continue
             if path.is_symlink():
                 raise Stage2Error(
-                    "SAM_RUNTIME_UNVERIFIABLE",
-                    f"Installed SAM2 runtime contains a symbolic link: {path}",
+                    unverifiable_code,
+                    f"The {description} contains a symbolic link: {path}",
                 )
             if path.is_file():
                 found.append(path)
@@ -634,8 +645,8 @@ def sha256_directory_tree(root: Path) -> str:
     files = runtime_files()
     if not files:
         raise Stage2Error(
-            "SAM_RUNTIME_UNVERIFIABLE",
-            "Installed SAM2 package contains no hashable runtime files.",
+            unverifiable_code,
+            f"The {description} contains no hashable files.",
         )
     before_stamps = {path: file_stamp(path) for path in files}
     digest = hashlib.sha256()
@@ -646,8 +657,8 @@ def sha256_directory_tree(root: Path) -> str:
         digest.update(bytes.fromhex(sha256_file(path)))
     if runtime_files() != files or any(file_stamp(path) != before_stamps[path] for path in files):
         raise Stage2Error(
-            "SAM_RUNTIME_CHANGED_DURING_HASH",
-            "Installed SAM2 runtime changed while its identity was being calculated.",
+            changed_code,
+            f"The {description} changed while its identity was being calculated.",
             recovery="Stop the installer or updater, then retry.",
         )
     return digest.hexdigest()
@@ -2297,6 +2308,7 @@ class TransformersGroundingDinoAdapter:
         model_path: Path | None = None,
     ) -> None:
         verified_weights: ArtifactRef | None = None
+        snapshot_sha256: str | None = None
         if model_path is not None:
             supplied = model_path.expanduser()
             if supplied.is_symlink():
@@ -2332,6 +2344,19 @@ class TransformersGroundingDinoAdapter:
                         "actual": verified_weights.sha256,
                     },
                 )
+            # model.safetensors is the only file hash-pinned to a known-good
+            # value, but from_pretrained also reads config.json,
+            # preprocessor_config.json, and tokenizer files from this same
+            # directory. Hash the whole snapshot so those files get the same
+            # TOCTOU protection the weights already have, instead of loading
+            # unverified — mirrors verified_sam_runtime_identity's use of
+            # sha256_directory_tree for the installed SAM2 package.
+            snapshot_sha256 = sha256_directory_tree(
+                model_path,
+                description="persistent DINO snapshot",
+                unverifiable_code="DINO_SNAPSHOT_UNVERIFIABLE",
+                changed_code="DINO_SNAPSHOT_CHANGED",
+            )
         try:
             import torch
             from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
@@ -2370,6 +2395,17 @@ class TransformersGroundingDinoAdapter:
                 "DINO_CHECKPOINT_CHANGED",
                 "Persistent DINO weights changed while the model was loading.",
             )
+        if model_path is not None and sha256_directory_tree(
+            model_path,
+            description="persistent DINO snapshot",
+            unverifiable_code="DINO_SNAPSHOT_UNVERIFIABLE",
+            changed_code="DINO_SNAPSHOT_CHANGED",
+        ) != snapshot_sha256:
+            raise Stage2Error(
+                "DINO_SNAPSHOT_CHANGED",
+                "Persistent DINO snapshot directory changed while the model was loading.",
+            )
+        self.snapshot_sha256 = snapshot_sha256
 
     def infer_batch(
         self,

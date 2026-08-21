@@ -633,3 +633,41 @@ def test_real_adapter_rejects_unverified_persistent_snapshot_before_import(
     with pytest.raises(stage2_job.Stage2Error) as caught:
         stage2_job.TransformersGroundingDinoAdapter(model_path=snapshot)
     assert caught.value.code == "DINO_CHECKPOINT_HASH_MISMATCH"
+
+
+def test_directory_tree_hash_covers_every_file_not_just_the_pinned_one(stage2_job, tmp_path):
+    snapshot = tmp_path / "dino"
+    snapshot.mkdir()
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    (snapshot / "config.json").write_bytes(b'{"architecture": "grounding-dino"}')
+    before = stage2_job.sha256_directory_tree(snapshot)
+
+    # A file that TransformersGroundingDinoAdapter never hash-pins on its own
+    # (only model.safetensors gets a known-good sha256) must still change
+    # the snapshot's overall identity when it changes, or it isn't actually
+    # covered by any integrity check.
+    (snapshot / "config.json").write_bytes(b'{"architecture": "tampered"}')
+    after = stage2_job.sha256_directory_tree(snapshot)
+    assert before != after
+
+    # And reverting it must reproduce the original hash exactly (deterministic).
+    (snapshot / "config.json").write_bytes(b'{"architecture": "grounding-dino"}')
+    assert stage2_job.sha256_directory_tree(snapshot) == before
+
+
+def test_directory_tree_hash_uses_caller_specific_error_codes(stage2_job, tmp_path):
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(stage2_job.Stage2Error) as default_caught:
+        stage2_job.sha256_directory_tree(missing)
+    assert default_caught.value.code == "SAM_RUNTIME_UNVERIFIABLE"
+
+    with pytest.raises(stage2_job.Stage2Error) as dino_caught:
+        stage2_job.sha256_directory_tree(
+            missing,
+            description="persistent DINO snapshot",
+            unverifiable_code="DINO_SNAPSHOT_UNVERIFIABLE",
+            changed_code="DINO_SNAPSHOT_CHANGED",
+        )
+    assert dino_caught.value.code == "DINO_SNAPSHOT_UNVERIFIABLE"
+    assert "DINO" in dino_caught.value.message
+    assert "SAM2" not in dino_caught.value.message
