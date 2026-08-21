@@ -579,6 +579,35 @@ def test_operator_command_surface_and_dry_run(stage2_job, capsys, tmp_path):
     assert all(f'"{command}"' in parser_source for command in commands)
 
 
+def test_sweep_dry_run_surfaces_thresholds(stage2_job, capsys, tmp_path):
+    exit_code = stage2_job.main(
+        ["--json", "--dry-run", "sweep", "GX010057", "--work-dir", str(tmp_path)]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["thresholds"] == [0.15, 0.20, 0.25, 0.30]
+
+
+def test_sweep_rejects_out_of_range_threshold(stage2_job, capsys, tmp_path):
+    with pytest.raises(SystemExit) as caught:
+        stage2_job.main(
+            [
+                "--dry-run",
+                "sweep",
+                "GX010057",
+                "--work-dir",
+                str(tmp_path),
+                "--thresholds",
+                "0.15",
+                "0.20",
+                "0.25",
+                "3.0",  # typo for 0.30 - must be rejected, not silently accepted
+            ]
+        )
+    assert caught.value.code == 2
+    assert "must be in" in capsys.readouterr().err
+
+
 def test_real_gpu_commands_fail_with_actionable_boundary(stage2_job, capsys, tmp_path):
     exit_code = stage2_job.main(["--json", "pilot", "GX010057", "--work-dir", str(tmp_path)])
     assert exit_code == 2

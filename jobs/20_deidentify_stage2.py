@@ -7200,6 +7200,9 @@ def operator_dry_run(args: argparse.Namespace) -> dict[str, Any]:
                 },
             }
         )
+        thresholds = getattr(args, "thresholds", None)
+        if thresholds is not None:
+            payload["thresholds"] = tuple(thresholds)
     elif args.command == "review":
         payload["planned_review_status"] = args.decision
     elif args.command == "release-check":
@@ -7226,6 +7229,21 @@ def _add_run_identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--clip-id", required=True)
+
+
+def _dino_threshold(value: str) -> float:
+    """Same bound generate_sam_mask_shards enforces via validate_sam_config's
+    accepted_proposal_threshold check, applied at parse time so a typo like
+    3.0 for 0.30 fails immediately instead of silently reaching sweep."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from exc
+    if not math.isfinite(parsed) or not (DINO_PROPOSAL_FLOOR <= parsed <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"threshold {parsed} must be in [{DINO_PROPOSAL_FLOOR}, 1.0]"
+        )
+    return parsed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -7271,7 +7289,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sweep = subcommands.add_parser("sweep", help="plan the fixed DINO threshold sweep")
     sweep.add_argument("clip_id")
     sweep.add_argument("--work-dir", type=Path, default=Path("/workspace/stage2"))
-    sweep.add_argument("--thresholds", nargs="+", type=float, default=(0.15, 0.20, 0.25, 0.30))
+    sweep.add_argument(
+        "--thresholds", nargs="+", type=_dino_threshold, default=(0.15, 0.20, 0.25, 0.30)
+    )
     sweep.add_argument("--manual-seeds", type=Path)
     sweep.add_argument("--labels", type=Path)
 
