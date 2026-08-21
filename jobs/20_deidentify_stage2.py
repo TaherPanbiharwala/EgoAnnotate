@@ -45,7 +45,7 @@ import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -6791,7 +6791,7 @@ def _remove_layer_path(paths: RunPaths, candidate: Path) -> None:
 
 
 def _utc_now_z() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _archive_invalidated_reviews(paths: RunPaths, *, layer: str) -> None:
