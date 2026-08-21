@@ -5412,6 +5412,11 @@ def render_stage2_video(
             "STAGE1_VIDEO_CHANGED",
             "The Stage I render source changed after validation.",
         )
+    # The full-content hash above is the one canonical check; every later
+    # "did Stage I change since then" recheck in this call only needs to
+    # detect a mutation, not recompute a multi-GB video's identity from
+    # scratch, so it uses this cheap stat instead.
+    stage1_stamp = file_stamp(stage1_path)
     metas = _load_render_shard_metas(sam_shards, stage1=stage1)
     payload = render_fingerprint_payload(stage1=stage1, sam_shards=sam_shards, config=config)
     fingerprint_value = render_fingerprint(payload)
@@ -5452,6 +5457,7 @@ def render_stage2_video(
             raise Stage2Error(
                 "INVALID_RENDER_ARTIFACT", "Recorded render output hash or size changed."
             )
+        existing_output_stamp = file_stamp(Path(meta.output.path))
         verify_rendered_video(
             stage1=stage1,
             output_path=Path(meta.output.path),
@@ -5459,11 +5465,11 @@ def render_stage2_video(
             metas=metas,
             config=config,
         )
-        if artifact_ref(Path(meta.output.path)) != meta.output:
+        if file_stamp(Path(meta.output.path)) != existing_output_stamp:
             raise Stage2Error(
                 "INVALID_RENDER_ARTIFACT", "Recorded output changed during verification."
             )
-        if artifact_ref(stage1_path) != stage1.stage1_video:
+        if file_stamp(stage1_path) != stage1_stamp:
             raise Stage2Error(
                 "STAGE1_VIDEO_CHANGED", "Stage I changed during render reuse verification."
             )
@@ -5490,7 +5496,8 @@ def render_stage2_video(
             config=config,
         )
         rendered_temporary_ref = artifact_ref(temporary)
-        if artifact_ref(stage1_path) != stage1.stage1_video:
+        temporary_stamp = file_stamp(temporary)
+        if file_stamp(stage1_path) != stage1_stamp:
             raise Stage2Error(
                 "STAGE1_VIDEO_CHANGED", "Stage I changed while rendering was in progress."
             )
@@ -5501,12 +5508,12 @@ def render_stage2_video(
             metas=metas,
             config=config,
         )
-        if artifact_ref(temporary) != rendered_temporary_ref:
+        if file_stamp(temporary) != temporary_stamp:
             raise Stage2Error(
                 "RENDER_OUTPUT_CHANGED",
                 "Temporary output changed while technical verification was running.",
             )
-        if artifact_ref(stage1_path) != stage1.stage1_video:
+        if file_stamp(stage1_path) != stage1_stamp:
             raise Stage2Error(
                 "STAGE1_VIDEO_CHANGED", "Stage I changed during technical verification."
             )
@@ -5518,6 +5525,7 @@ def render_stage2_video(
             raise Stage2Error(
                 "RENDER_OUTPUT_CHANGED", "Promoted output does not match verified bytes."
             )
+        promoted_stamp = file_stamp(final_output)
     finally:
         temporary.unlink(missing_ok=True)
     verification.update(metrics)
@@ -5546,7 +5554,7 @@ def render_stage2_video(
         verification=verification,
     )
     artifact = write_immutable_json(paths.render, meta)
-    if artifact_ref(final_output) != output_ref:
+    if file_stamp(final_output) != promoted_stamp:
         raise Stage2Error(
             "RENDER_OUTPUT_CHANGED", "Promoted output changed while evidence was written."
         )

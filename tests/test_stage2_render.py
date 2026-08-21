@@ -198,6 +198,58 @@ def test_real_render_is_verified_promoted_and_reusable(stage2_job, tmp_path):
     assert second.artifact == result.artifact
 
 
+def test_render_stage2_video_does_not_repeatedly_rehash_stage1_or_output(
+    stage2_job, tmp_path, monkeypatch
+):
+    stage1 = _make_video(stage2_job, tmp_path)
+    shard = _make_shard(stage2_job, tmp_path, stage1)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    stage1_path = Path(stage1.stage1_video.path)
+
+    calls: list[Path] = []
+    original_sha256_file = stage2_job.sha256_file
+
+    def counting_sha256_file(path):
+        calls.append(Path(path))
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(stage2_job, "sha256_file", counting_sha256_file)
+
+    stage2_job.render_stage2_video(
+        stage1=stage1,
+        paths=paths,
+        sam_shards=(shard,),
+        config=stage2_job.RenderConfig(dilation_pixels_at_1080p=0),
+    )
+    stage1_calls = [path for path in calls if path == stage1_path]
+    # The video-output paths (the temp file before rename, then the final
+    # promoted path) - excludes the small render/artifact.json manifest,
+    # which isn't the multi-GB content this fix targets.
+    output_calls = [path for path in calls if path != stage1_path and path.suffix == ".mp4"]
+    # Stage I is a stable input to this call - one canonical hash, then cheap
+    # file_stamp() rechecks for every later "did it change" guard, not three
+    # full re-hashes of the same unchanged video.
+    assert len(stage1_calls) == 1
+    # The rendered output legitimately gets content-addressed by the caller
+    # right after encoding, then again inside _promote_render_output's own
+    # boundary before and after the atomic rename (3 total) - not the extra
+    # rehashes a plain artifact_ref()-based recheck would add on top of that.
+    assert len(output_calls) == 3
+
+    calls.clear()
+    second = stage2_job.render_stage2_video(
+        stage1=stage1,
+        paths=paths,
+        sam_shards=(shard,),
+        config=stage2_job.RenderConfig(dilation_pixels_at_1080p=0),
+    )
+    assert second.reused is True
+    stage1_calls = [path for path in calls if path == stage1_path]
+    output_calls = [path for path in calls if path != stage1_path and path.suffix == ".mp4"]
+    assert len(stage1_calls) == 1
+    assert len(output_calls) == 1
+
+
 def test_promote_render_output_fsyncs_content_before_rename(stage2_job, tmp_path, monkeypatch):
     temporary = tmp_path / "temp-output.mp4"
     temporary.write_bytes(b"rendered content")
