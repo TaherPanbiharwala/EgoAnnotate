@@ -198,6 +198,42 @@ def test_real_render_is_verified_promoted_and_reusable(stage2_job, tmp_path):
     assert second.artifact == result.artifact
 
 
+def test_promote_render_output_fsyncs_content_before_rename(stage2_job, tmp_path, monkeypatch):
+    temporary = tmp_path / "temp-output.mp4"
+    temporary.write_bytes(b"rendered content")
+    final = tmp_path / "final" / "stage2-output.mp4"
+
+    open_paths: dict[int, Path] = {}
+    synced_paths: list[Path] = []
+    original_open = stage2_job.os.open
+    original_fsync = stage2_job.os.fsync
+    original_close = stage2_job.os.close
+
+    def spy_open(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        open_paths[fd] = Path(path)
+        return fd
+
+    def spy_fsync(fd):
+        if fd in open_paths:
+            synced_paths.append(open_paths[fd])
+        return original_fsync(fd)
+
+    def spy_close(fd):
+        open_paths.pop(fd, None)
+        return original_close(fd)
+
+    monkeypatch.setattr(stage2_job.os, "open", spy_open)
+    monkeypatch.setattr(stage2_job.os, "fsync", spy_fsync)
+    monkeypatch.setattr(stage2_job.os, "close", spy_close)
+
+    stage2_job._promote_render_output(temporary, final)
+    # Both the content itself and the directory entry (already covered
+    # before this fix) must be fsynced - not just the directory.
+    assert temporary in synced_paths
+    assert final.parent in synced_paths
+
+
 def test_render_stage2_video_honors_a_stop_request(stage2_job, tmp_path):
     stage1 = _make_video(stage2_job, tmp_path)
     shard = _make_shard(stage2_job, tmp_path, stage1)

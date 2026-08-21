@@ -298,6 +298,7 @@ uv run "$REPO_DIR/jobs/20_deidentify_stage2.py" --json doctor \
     --workspace-root "$WORKSPACE_ROOT" --load-models > "$GPU_SMOKE_PARTIAL"
 uv run --no-project python - "$GPU_SMOKE_PARTIAL" <<'PY'
 import json
+import os
 import pathlib
 import sys
 
@@ -305,6 +306,14 @@ path = pathlib.Path(sys.argv[1])
 payload = json.loads(path.read_text(encoding="utf-8"))
 if payload.get("status") != "PASS_OFFLINE_GPU_SMOKE":
     raise SystemExit(f"GPU smoke did not pass: {payload}")
+# Match the asset-manifest write's fsync-before-rename a few lines above:
+# without this, a crash right after the mv below can leave "verified" GPU
+# smoke evidence that was never actually flushed to disk.
+fd = os.open(str(path), os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
 PY
 mv "$GPU_SMOKE_PARTIAL" "$GPU_SMOKE_RESULT"
 

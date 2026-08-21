@@ -5370,6 +5370,15 @@ def _promote_render_output(temporary: Path, final: Path) -> ArtifactRef:
         temporary.unlink()
         return existing
     try:
+        # Match extract_attested_sam_window's promotion: fsync the encoded
+        # content itself, not just the directory entry after rename, so a
+        # crash right after promotion can't leave "immutable" output that's
+        # actually still sitting in the OS write cache.
+        file_fd = os.open(temporary, os.O_RDONLY)
+        try:
+            os.fsync(file_fd)
+        finally:
+            os.close(file_fd)
         os.replace(temporary, final)
         directory_fd = os.open(final.parent, os.O_RDONLY)
         try:
