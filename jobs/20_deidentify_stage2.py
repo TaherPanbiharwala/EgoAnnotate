@@ -88,6 +88,16 @@ RENDER_DILATION_PIXELS_AT_1080P = 8
 RENDER_FILL_YUV = (128, 128, 128)
 RENDER_FILL_TOLERANCE = 24
 RENDER_MAX_OUTSIDE_MASK_MAE = 12.0
+# Shared by _render_frames (the write path) and verify_rendered_video (the
+# read path) so a field added or removed on one side can't silently drift
+# out of sync with what the other side actually checks.
+RENDER_COLOR_FACT_FIELDS = (
+    "color_range",
+    "color_space",
+    "color_transfer",
+    "color_primaries",
+    "chroma_location",
+)
 
 EXPECTED_STAGE1 = {
     "gen": "2",
@@ -4966,16 +4976,9 @@ def _render_frames(
     ]
     if len(source_video_streams) != 1:
         raise Stage2Error("RENDER_SOURCE_INVALID", "Stage I must contain exactly one video stream.")
-    color_fields = (
-        "color_range",
-        "color_space",
-        "color_transfer",
-        "color_primaries",
-        "chroma_location",
-    )
     color_facts = {
         name: str(source_video_streams[0][name])
-        for name in color_fields
+        for name in RENDER_COLOR_FACT_FIELDS
         if source_video_streams[0].get(name)
     }
     masked_pixels = 0
@@ -5146,21 +5149,14 @@ def verify_rendered_video(
     source_video_streams = [
         stream for stream in source_media["streams"] if stream.get("codec_type") == "video"
     ]
-    color_fields = (
-        "color_range",
-        "color_space",
-        "color_transfer",
-        "color_primaries",
-        "chroma_location",
-    )
     source_color_facts = {
         name: str(source_video_streams[0][name])
-        for name in color_fields
+        for name in RENDER_COLOR_FACT_FIELDS
         if len(source_video_streams) == 1 and source_video_streams[0].get(name)
     }
     output_color_facts = {
         name: str(streams[0][name])
-        for name in color_fields
+        for name in RENDER_COLOR_FACT_FIELDS
         if len(streams) == 1 and streams[0].get(name)
     }
     for name, value in source_color_facts.items():

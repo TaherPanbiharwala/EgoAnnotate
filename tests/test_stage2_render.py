@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -248,6 +249,25 @@ def test_render_stage2_video_does_not_repeatedly_rehash_stage1_or_output(
     output_calls = [path for path in calls if path != stage1_path and path.suffix == ".mp4"]
     assert len(stage1_calls) == 1
     assert len(output_calls) == 1
+
+
+def test_render_and_verify_share_the_same_color_fields_constant(stage2_job):
+    assert stage2_job.RENDER_COLOR_FACT_FIELDS == (
+        "color_range",
+        "color_space",
+        "color_transfer",
+        "color_primaries",
+        "chroma_location",
+    )
+    render_frames_source = inspect.getsource(stage2_job._render_frames)
+    verify_source = inspect.getsource(stage2_job.verify_rendered_video)
+    assert "RENDER_COLOR_FACT_FIELDS" in render_frames_source
+    assert "RENDER_COLOR_FACT_FIELDS" in verify_source
+    # A literal color_fields = (...) tuple in either function would mean
+    # they've drifted back into two independently-maintained copies that
+    # could silently desync what gets written from what gets checked.
+    assert "color_fields = (" not in render_frames_source
+    assert "color_fields = (" not in verify_source
 
 
 def test_promote_render_output_fsyncs_content_before_rename(stage2_job, tmp_path, monkeypatch):
