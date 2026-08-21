@@ -150,6 +150,44 @@ def test_private_labels_seeds_and_evidence_stay_under_do_not_ship(stage2_job, tm
         assert "DO-NOT-SHIP" in Path(reference.path).parts
 
 
+def test_register_private_evidence_hashes_the_bytes_it_actually_writes(
+    stage2_job, tmp_path, monkeypatch
+):
+    stage1 = _stage1(stage2_job, tmp_path)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    evidence = tmp_path / "face-crop.jpg"
+    evidence.write_bytes(b"original private pixels")
+
+    # Simulate the source file being rewritten by another process in the
+    # narrow window between a hash pass and the read that actually gets
+    # persisted - the exact TOCTOU race this closes. artifact_ref is no
+    # longer called on the source at all after the fix, so this side
+    # effect never fires on the fixed code path.
+    original_artifact_ref = stage2_job.artifact_ref
+
+    def racing_artifact_ref(path, *args, **kwargs):
+        result = original_artifact_ref(path, *args, **kwargs)
+        if Path(path) == evidence:
+            evidence.write_bytes(b"tampered content written mid-race")
+        return result
+
+    monkeypatch.setattr(stage2_job, "artifact_ref", racing_artifact_ref)
+
+    evidence_ref, _metadata_ref = stage2_job.register_private_evidence(
+        paths,
+        clip_id="clip",
+        evidence_id="face-1-frame-3",
+        evidence_kind="face_crop",
+        source=evidence,
+        frame_start=3,
+        frame_end=3,
+    )
+    written_content = Path(evidence_ref.path).read_bytes()
+    actual_hash = stage2_job.hashlib.sha256(written_content).hexdigest()
+    assert actual_hash in Path(evidence_ref.path).name
+    assert evidence_ref.sha256 == actual_hash
+
+
 def test_invalid_or_duplicate_private_labels_fail_closed(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job, tmp_path)
     duplicate = (_label(stage2_job), _label(stage2_job))

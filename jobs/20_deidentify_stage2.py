@@ -2905,7 +2905,20 @@ def register_private_evidence(
     if not evidence_kind.strip() or not 0 <= frame_start <= frame_end:
         raise Stage2Error("INVALID_PRIVATE_EVIDENCE", "Evidence metadata is invalid.")
     source = resolve_input_file(source, "private evidence")
-    source_ref = artifact_ref(source)
+    # Hash the exact bytes read below rather than hashing via a separate
+    # artifact_ref(source) call: two independent reads of the same path can
+    # observe different content if the source changes in between, which
+    # would make the persisted filename's embedded hash a lie about what
+    # was actually written.
+    try:
+        content = source.read_bytes()
+    except OSError as exc:
+        raise Stage2Error(
+            "PRIVATE_EVIDENCE_READ_FAILED", "Could not read private evidence."
+        ) from exc
+    if not content:
+        raise Stage2Error("EMPTY_ARTIFACT", f"Artifact is empty: {source}")
+    source_sha256 = hashlib.sha256(content).hexdigest()
     suffix = (
         source.suffix.lower()
         if re.fullmatch(r"\.[a-z0-9]{1,10}", source.suffix.lower())
@@ -2913,14 +2926,8 @@ def register_private_evidence(
     )
     evidence_path = _private_path(
         paths,
-        Path("evidence") / f"{evidence_id}-{source_ref.sha256}{suffix}",
+        Path("evidence") / f"{evidence_id}-{source_sha256}{suffix}",
     )
-    try:
-        content = source.read_bytes()
-    except OSError as exc:
-        raise Stage2Error(
-            "PRIVATE_EVIDENCE_READ_FAILED", "Could not read private evidence."
-        ) from exc
     evidence_ref = write_immutable_bytes(evidence_path, content)
     metadata_ref = _write_private_json(
         paths,
