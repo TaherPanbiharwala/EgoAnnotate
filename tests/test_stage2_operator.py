@@ -83,6 +83,10 @@ def _completed_run(stage2_job, tmp_path: Path):
         verification={"passed": True, "publishable": False},
     )
     render_ref = stage2_job.write_immutable_json(paths.render, render_meta)
+    dino_ref = stage2_job.ArtifactRef(path="/private/dino/artifact.json", sha256="4" * 64, bytes=10)
+    sam_refs = [
+        stage2_job.ArtifactRef(path="/private/sam/window-0.npz", sha256="5" * 64, bytes=10),
+    ]
     manifest = {
         "schema_version": 1,
         "code_version": stage2_job.STAGE2_CODE_VERSION,
@@ -92,6 +96,8 @@ def _completed_run(stage2_job, tmp_path: Path):
         "processing_state": "PROCESSING_COMPLETE",
         "audit_status": "PASS_AUTOMATED_TECHNICAL",
         "review_status": "PENDING",
+        "dino_artifact": dino_ref,
+        "sam_mask_shards": sam_refs,
         "render_artifact": render_ref,
     }
     stage2_job.write_immutable_json(paths.manifest, manifest)
@@ -187,6 +193,51 @@ def test_human_acceptance_requires_complete_attestation_and_exact_hashes(stage2_
     raw["correction"] = "manual seed changed"
     stage2_job.atomic_write_json(paths.manifest, raw)
     assert stage2_job.effective_review_status(paths) == ("PENDING", None)
+
+
+def test_release_check_flags_dino_and_sam_artifacts_as_internal(stage2_job, tmp_path):
+    paths, output_ref = _completed_run(stage2_job, tmp_path)
+    paths.dino.parent.mkdir(parents=True, exist_ok=True)
+    paths.dino.write_bytes(b"dino proposals derived from the unredacted original")
+    dino_ref = stage2_job.artifact_ref(paths.dino)
+    paths.sam_dir.mkdir(parents=True, exist_ok=True)
+    sam_shard = paths.sam_dir / "window-0.npz"
+    sam_shard.write_bytes(b"sam mask shard derived from the unredacted original")
+    sam_ref = stage2_job.artifact_ref(sam_shard)
+    manifest = stage2_job.read_json(paths.manifest)
+    manifest["dino_artifact"] = stage2_job._jsonable(dino_ref)
+    manifest["sam_mask_shards"] = [stage2_job._jsonable(sam_ref)]
+    stage2_job.atomic_write_json(paths.manifest, manifest)
+    stage2_job.create_review_record(
+        paths,
+        reviewer="human",
+        reviewed_at="2026-08-20T12:00:00Z",
+        review_status="ACCEPTED",
+        full_clip_reviewed=True,
+        flagged_intervals_reviewed=True,
+    )
+
+    release = tmp_path / "release"
+    release.mkdir()
+    shutil.copyfile(output_ref.path, release / "accepted.mp4")
+    shutil.copyfile(paths.dino, release / "innocent-name.json")
+    with pytest.raises(stage2_job.Stage2Error) as leaked_dino:
+        stage2_job.release_check(paths, release_root=release)
+    assert "internal processing/review artifacts are present" in " ".join(
+        leaked_dino.value.details["problems"]
+    )
+    (release / "innocent-name.json").unlink()
+
+    shutil.copyfile(sam_shard, release / "also-innocent.npz")
+    with pytest.raises(stage2_job.Stage2Error) as leaked_sam:
+        stage2_job.release_check(paths, release_root=release)
+    assert "internal processing/review artifacts are present" in " ".join(
+        leaked_sam.value.details["problems"]
+    )
+    (release / "also-innocent.npz").unlink()
+
+    result = stage2_job.release_check(paths, release_root=release)
+    assert result["release_ready"] is True
 
 
 def test_release_check_rejects_private_content_even_when_renamed(stage2_job, tmp_path):

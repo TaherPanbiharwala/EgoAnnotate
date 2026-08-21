@@ -6007,6 +6007,21 @@ def release_check(paths: RunPaths, *, release_root: Path) -> dict[str, Any]:
     internal_hashes.update(reference.sha256 for reference, _record in load_review_records(paths))
     render_reference = _artifact_ref_from_raw(raw.get("render_artifact"), "render")
     internal_hashes.add(render_reference.sha256)
+    # dino_artifact and sam_mask_shards are derived from the unredacted
+    # original video (per-frame face boxes and binary face-silhouette
+    # masks) and live outside DO-NOT-SHIP as siblings of render/, so an
+    # operator copying the run root minus DO-NOT-SHIP/ into a release
+    # candidate could carry them along unnoticed unless they're also
+    # treated as internal, not-for-release content.
+    dino_reference = _artifact_ref_from_raw(raw.get("dino_artifact"), "dino")
+    internal_hashes.add(dino_reference.sha256)
+    sam_shard_values = raw.get("sam_mask_shards", [])
+    if not isinstance(sam_shard_values, list):
+        raise Stage2Error("INVALID_PROCESSING_MANIFEST", "sam_mask_shards must be a list.")
+    internal_hashes.update(
+        _artifact_ref_from_raw(value, f"sam_mask_shards[{index}]").sha256
+        for index, value in enumerate(sam_shard_values)
+    )
     for path in release_root.rglob("*"):
         if path.is_symlink():
             problems.append(f"release package contains symlink: {path.relative_to(release_root)}")
