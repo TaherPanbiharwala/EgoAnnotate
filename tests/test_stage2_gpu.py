@@ -81,6 +81,23 @@ def test_exact_sam_window_is_atomically_extracted_attested_and_reused(stage2_job
     assert second == first
 
 
+def test_extract_attested_sam_window_cache_hit_does_not_need_the_source_video(
+    stage2_job, tmp_path
+):
+    stage1 = _make_source_video(stage2_job, tmp_path)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    window = stage2_job.TemporalWindow(index=0, frame_start=1, frame_end=3)
+
+    first = stage2_job.extract_attested_sam_window(stage1=stage1, paths=paths, window=window)
+
+    # Simulate the source video being archived off the pod once every shard
+    # that needs it has already been cached.
+    Path(stage1.source.path).unlink()
+
+    reused = stage2_job.extract_attested_sam_window(stage1=stage1, paths=paths, window=window)
+    assert reused == first
+
+
 def test_real_sam_window_loader_matches_generate_sam_mask_shards_contract(stage2_job, tmp_path):
     """extract_attested_sam_window can't be window_loader=... directly (keyword-only args
     vs generate_sam_mask_shards calling window_loader(window) positionally) - real_sam_window_loader

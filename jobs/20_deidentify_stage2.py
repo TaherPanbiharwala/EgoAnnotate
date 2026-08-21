@@ -3207,7 +3207,6 @@ def extract_attested_sam_window(
     if not 0 <= window.frame_start <= window.frame_end < stage1.source_video.n_frames:
         raise Stage2Error("INVALID_FRAME_WINDOW", "SAM extraction window is out of bounds.")
     source_path = Path(stage1.source.path)
-    before_source = file_stamp(source_path)
     frame_parent = paths.frames_dir / f"source-{stage1.source.sha256[:16]}"
     target = frame_parent / f"window-{window.frame_start:06d}-{window.frame_end:06d}"
     for candidate in (paths.frames_dir, frame_parent, target):
@@ -3217,6 +3216,10 @@ def extract_attested_sam_window(
                 f"SAM frame payload path contains a symlink: {candidate}",
             )
     if target.exists():
+        # A cache hit only needs the already-extracted local frame files;
+        # touching the original source video here would make reuse fail
+        # once it's archived off the pod, even though nothing downstream
+        # needs it for a cached window.
         return load_attested_sam_window(
             target,
             source_sha256=stage1.source.sha256,
@@ -3224,6 +3227,7 @@ def extract_attested_sam_window(
             width=stage1.source_video.display_width,
             height=stage1.source_video.display_height,
         )
+    before_source = file_stamp(source_path)
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise Stage2Error(
