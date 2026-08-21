@@ -311,8 +311,13 @@ def test_offline_gpu_smoke_loads_models_sequentially_and_records_metrics(
         events.append("sam-load")
         return _FakeSam(stage2_job, events)
 
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    # setenv (not delenv(raising=False)) so monkeypatch actually registers an
+    # undo entry for these two: delenv on an already-absent key is a no-op
+    # that leaves nothing to restore, so run_offline_gpu_smoke's own direct
+    # os.environ[...] = "1" assignment below would otherwise leak past this
+    # test into every later test in the same pytest session.
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     result = stage2_job.run_offline_gpu_smoke(
         tmp_path,
         doctor_fn=lambda _root: {"status": "READY_FOR_MILESTONE_6_GPU_SMOKE"},
@@ -335,3 +340,25 @@ def test_offline_gpu_smoke_loads_models_sequentially_and_records_metrics(
     ]
     assert stage2_job.os.environ["TRANSFORMERS_OFFLINE"] == "1"
     assert stage2_job.os.environ["HF_HUB_OFFLINE"] == "1"
+
+
+def test_monkeypatch_setenv_survives_a_raw_os_environ_overwrite_on_undo(stage2_job):
+    """Guards the fix above: monkeypatch.setenv (not delenv(raising=False))
+    is required before calling run_offline_gpu_smoke, because delenv on an
+    already-absent key registers nothing to undo. Without this, the direct
+    os.environ[...] = "1" assignment run_offline_gpu_smoke performs itself
+    would leak past this test's teardown into every later test in the same
+    pytest session."""
+    name = "EGOANNOTE_STAGE2_TEST_ONLY_ENV_LEAK_PROBE"
+    assert name not in stage2_job.os.environ
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setenv(name, "0")
+        # Simulate run_offline_gpu_smoke's own direct assignment, which
+        # bypasses monkeypatch entirely - this is exactly what a naive
+        # delenv(raising=False) fails to track.
+        stage2_job.os.environ[name] = "1"
+        assert stage2_job.os.environ[name] == "1"
+    finally:
+        mp.undo()
+    assert name not in stage2_job.os.environ
