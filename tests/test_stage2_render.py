@@ -363,6 +363,62 @@ def test_finalize_carries_forward_a_skipped_stage1_yunet_check(stage2_job, tmp_p
     assert manifest.audit_status == "PASS_AUTOMATED_TECHNICAL_NO_YUNET"
 
 
+def test_finalize_distinguishes_missing_from_escaped_private_artifact(stage2_job, tmp_path):
+    stage1 = _make_video(stage2_job, tmp_path)
+    dino_path = tmp_path / "dino.json"
+    dino_path.write_text('{"artifact_type":"dino"}')
+    dino = stage2_job.artifact_ref(dino_path)
+    shard = _make_shard(stage2_job, tmp_path, stage1, dino_sha256=dino.sha256)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    stage2_job.transition_state(
+        paths.state,
+        run_id="run",
+        clip_id=stage1.clip_id,
+        mode="production",
+        target="SAM_COMPLETE",
+        completed_layers=("dino", "sam"),
+        reusable_layers=("dino", "sam"),
+    )
+    render = stage2_job.render_stage2_video(
+        stage1=stage1,
+        paths=paths,
+        sam_shards=(shard,),
+        config=stage2_job.RenderConfig(dilation_pixels_at_1080p=0),
+    )
+
+    paths.private_root.mkdir(parents=True, exist_ok=True)
+    seed_path = paths.private_root / "seed.json"
+    seed_path.write_text('{"schema_version": 1}')
+    seed_ref = stage2_job.artifact_ref(seed_path)
+    seed_path.unlink()
+    with pytest.raises(stage2_job.Stage2Error) as missing:
+        stage2_job.finalize_verified_processing(
+            stage1=stage1,
+            paths=paths,
+            run_id="run",
+            dino_artifact=dino,
+            sam_shards=(shard,),
+            render_result=render,
+            manual_seed_artifacts=(seed_ref,),
+        )
+    assert missing.value.code == "PRIVATE_ARTIFACT_MISSING"
+
+    escaped = tmp_path / "escaped-outside-do-not-ship.json"
+    escaped.write_text('{"schema_version": 1}')
+    escaped_ref = stage2_job.artifact_ref(escaped)
+    with pytest.raises(stage2_job.Stage2Error) as outside:
+        stage2_job.finalize_verified_processing(
+            stage1=stage1,
+            paths=paths,
+            run_id="run",
+            dino_artifact=dino,
+            sam_shards=(shard,),
+            render_result=render,
+            manual_seed_artifacts=(escaped_ref,),
+        )
+    assert outside.value.code == "PRIVATE_ARTIFACT_OUTSIDE_DO_NOT_SHIP"
+
+
 def test_renderer_uses_stage1_and_never_decodes_original(stage2_job, tmp_path, monkeypatch):
     stage1 = _make_video(stage2_job, tmp_path)
     original = tmp_path / "private-original.bin"

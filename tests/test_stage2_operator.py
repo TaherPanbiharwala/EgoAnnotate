@@ -188,6 +188,34 @@ def test_register_private_evidence_hashes_the_bytes_it_actually_writes(
     assert evidence_ref.sha256 == actual_hash
 
 
+def test_deleted_private_artifact_is_distinguished_from_an_escaped_one(stage2_job, tmp_path):
+    paths, _output_ref = _completed_run(stage2_job, tmp_path)
+    stage1 = _stage1(stage2_job, tmp_path / "private-inputs")
+    label_ref = stage2_job.write_private_labels(
+        paths, stage1=stage1, labels=(_label(stage2_job),)
+    )
+    manifest = stage2_job.read_json(paths.manifest)
+    manifest["label_artifacts"] = [stage2_job._jsonable(label_ref)]
+    stage2_job.atomic_write_json(paths.manifest, manifest)
+
+    # A routine deleted file must not read like it escaped DO-NOT-SHIP.
+    Path(label_ref.path).unlink()
+    with pytest.raises(stage2_job.Stage2Error) as missing:
+        stage2_job.run_status(paths)
+    assert missing.value.code == "PRIVATE_ARTIFACT_MISSING"
+
+    # An artifact actually relocated outside DO-NOT-SHIP must still be
+    # caught, and caught with the escaped code, not the missing one.
+    escaped = tmp_path / "escaped-outside-do-not-ship.json"
+    escaped.write_text('{"schema_version": 1}')
+    escaped_ref = stage2_job.artifact_ref(escaped)
+    manifest["label_artifacts"] = [stage2_job._jsonable(escaped_ref)]
+    stage2_job.atomic_write_json(paths.manifest, manifest)
+    with pytest.raises(stage2_job.Stage2Error) as outside:
+        stage2_job.run_status(paths)
+    assert outside.value.code == "PRIVATE_ARTIFACT_OUTSIDE_DO_NOT_SHIP"
+
+
 def test_invalid_or_duplicate_private_labels_fail_closed(stage2_job, tmp_path):
     stage1 = _stage1(stage2_job, tmp_path)
     duplicate = (_label(stage2_job), _label(stage2_job))

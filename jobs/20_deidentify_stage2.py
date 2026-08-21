@@ -5620,17 +5620,29 @@ def finalize_verified_processing(
     for group_name, references in private_groups.items():
         for reference in references:
             reference_path = Path(reference.path)
-            if reference_path.is_symlink() or artifact_ref(reference_path) != reference:
-                raise Stage2Error(
-                    "PRIVATE_ARTIFACT_CHANGED", f"{group_name} contains a changed artifact."
-                )
+            # A missing file is not the same situation as one that escaped
+            # DO-NOT-SHIP, and resolving it here (rather than only inside
+            # artifact_ref below) avoids letting a plain FileNotFoundError
+            # propagate unwrapped past this fail-closed check.
             try:
-                reference_path.resolve(strict=True).relative_to(private_root)
-            except (OSError, ValueError) as exc:
+                resolved = reference_path.resolve(strict=True)
+            except OSError as exc:
+                raise Stage2Error(
+                    "PRIVATE_ARTIFACT_MISSING",
+                    f"{group_name} references a private artifact that no longer exists.",
+                    recovery="Restore the missing file or recompute the layer that references it.",
+                ) from exc
+            try:
+                resolved.relative_to(private_root)
+            except ValueError as exc:
                 raise Stage2Error(
                     "PRIVATE_ARTIFACT_OUTSIDE_DO_NOT_SHIP",
                     f"{group_name} must remain under DO-NOT-SHIP.",
                 ) from exc
+            if reference_path.is_symlink() or artifact_ref(reference_path) != reference:
+                raise Stage2Error(
+                    "PRIVATE_ARTIFACT_CHANGED", f"{group_name} contains a changed artifact."
+                )
     advance_state(
         paths.state,
         run_id=run_id,
@@ -5711,9 +5723,22 @@ def _manifest_private_artifacts(paths: RunPaths, raw: dict[str, Any]) -> tuple[A
         for index, value in enumerate(values):
             reference = _artifact_ref_from_raw(value, f"{field_name}[{index}]")
             path = Path(reference.path)
+            # A routine deleted file (OSError, e.g. FileNotFoundError) and an
+            # artifact actually relocated outside DO-NOT-SHIP (ValueError
+            # from relative_to) are operationally very different situations
+            # - conflating them made a missing file read like a possible
+            # data-exfiltration incident.
             try:
-                path.resolve(strict=True).relative_to(private_root)
-            except (OSError, ValueError) as exc:
+                resolved = path.resolve(strict=True)
+            except OSError as exc:
+                raise Stage2Error(
+                    "PRIVATE_ARTIFACT_MISSING",
+                    f"{field_name} references a private artifact that no longer exists.",
+                    recovery="Restore the missing file or recompute the layer that references it.",
+                ) from exc
+            try:
+                resolved.relative_to(private_root)
+            except ValueError as exc:
                 raise Stage2Error(
                     "PRIVATE_ARTIFACT_OUTSIDE_DO_NOT_SHIP",
                     f"{field_name} escaped DO-NOT-SHIP.",
