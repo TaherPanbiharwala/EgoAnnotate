@@ -266,6 +266,42 @@ def test_only_verified_render_can_advance_processing_complete(stage2_job, tmp_pa
     assert state.state == "PROCESSING_COMPLETE"
 
 
+def test_finalize_carries_forward_a_skipped_stage1_yunet_check(stage2_job, tmp_path):
+    stage1 = replace(_make_video(stage2_job, tmp_path), stage1_status="PASS_AUTOMATED_NO_YUNET")
+    dino_path = tmp_path / "dino.json"
+    dino_path.write_text('{"artifact_type":"dino"}')
+    dino = stage2_job.artifact_ref(dino_path)
+    shard = _make_shard(stage2_job, tmp_path, stage1, dino_sha256=dino.sha256)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    stage2_job.transition_state(
+        paths.state,
+        run_id="run",
+        clip_id=stage1.clip_id,
+        mode="production",
+        target="SAM_COMPLETE",
+        completed_layers=("dino", "sam"),
+        reusable_layers=("dino", "sam"),
+    )
+    render = stage2_job.render_stage2_video(
+        stage1=stage1,
+        paths=paths,
+        sam_shards=(shard,),
+        config=stage2_job.RenderConfig(dilation_pixels_at_1080p=0),
+    )
+    manifest = stage2_job.finalize_verified_processing(
+        stage1=stage1,
+        paths=paths,
+        run_id="run",
+        dino_artifact=dino,
+        sam_shards=(shard,),
+        render_result=render,
+    )
+    # Must not read the same as a clip whose Stage I redaction got the full
+    # independent check (test_only_verified_render_can_advance_processing_complete
+    # asserts plain PASS_AUTOMATED_TECHNICAL for that case).
+    assert manifest.audit_status == "PASS_AUTOMATED_TECHNICAL_NO_YUNET"
+
+
 def test_renderer_uses_stage1_and_never_decodes_original(stage2_job, tmp_path, monkeypatch):
     stage1 = _make_video(stage2_job, tmp_path)
     original = tmp_path / "private-original.bin"

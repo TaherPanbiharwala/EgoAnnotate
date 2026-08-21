@@ -5591,11 +5591,16 @@ def finalize_verified_processing(
         reusable_layers=("dino", "sam", "render"),
     )
     review_flags = tuple(sorted({flag for meta in metas for flag in meta.review_flags}))
-    audit_status = (
-        "NEEDS_REVIEW"
-        if stage1.stage1_status == "NEEDS_REVIEW" or review_flags
-        else "PASS_AUTOMATED_TECHNICAL"
-    )
+    if stage1.stage1_status == "NEEDS_REVIEW" or review_flags:
+        audit_status = "NEEDS_REVIEW"
+    elif stage1.stage1_status == "PASS_AUTOMATED_NO_YUNET":
+        # A check that didn't run is never a pass (see AGENTS.md): Stage I's
+        # own audit degrades to this weaker status when the independent
+        # YuNet cross-check was skipped, and that distinction must not get
+        # silently collapsed into an unqualified pass one layer downstream.
+        audit_status = "PASS_AUTOMATED_TECHNICAL_NO_YUNET"
+    else:
+        audit_status = "PASS_AUTOMATED_TECHNICAL"
     manifest = ProcessingManifest(
         schema_version=STAGE2_SCHEMA_VERSION,
         code_version=STAGE2_CODE_VERSION,
