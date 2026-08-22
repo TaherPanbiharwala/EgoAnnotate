@@ -6812,6 +6812,194 @@ def run_fake_pipeline(
     return manifest
 
 
+def run_real_pipeline(
+    *,
+    source_video: Path,
+    stage1_video: Path,
+    stage1_manifest: Path,
+    work_dir: Path,
+    run_id: str,
+    workspace_root: Path,
+    window_size: int,
+    window_overlap: int,
+    accepted_proposal_threshold: float = DINO_PROPOSAL_FLOOR,
+    mode: str = "production",
+    expected_clip_id: str | None = None,
+    manual_seeds_path: Path | None = None,
+    labels_path: Path | None = None,
+    probe_fn: Callable[[Path], VideoFacts] = probe_video,
+    torch_module: Any | None = None,
+    dino_factory: Callable[[], Any] | None = None,
+    sam_factory: Callable[[], Any] | None = None,
+) -> ProcessingManifest:
+    """Wire the real DINO/SAM2 adapters through the same orchestration
+    run_fake_pipeline exercises with fakes: validate -> DINO -> SAM -> render
+    -> finalize. Loads DINO, generates proposals, then frees it before SAM
+    loads (mirroring run_offline_gpu_smoke's own discipline) so the two
+    large models are never resident on the GPU together. mode must never be
+    "fake" here - finalize_verified_processing already refuses that.
+    """
+    validated = validate_stage1(source_video, stage1_video, stage1_manifest, probe_fn=probe_fn)
+    if expected_clip_id is not None and expected_clip_id != validated.clip_id:
+        raise Stage2Error(
+            "CLIP_ID_MISMATCH",
+            f"Expected clip_id {expected_clip_id!r} but Stage I inputs are for "
+            f"{validated.clip_id!r}.",
+        )
+    paths = build_run_paths(work_dir, run_id, validated.clip_id)
+    ensure_run_not_stopped(paths)
+    resolved_inputs = {
+        Path(validated.source.path),
+        Path(validated.stage1_video.path),
+        Path(validated.stage1_manifest.path),
+    }
+    if any(paths.root == item or paths.root in item.parents for item in resolved_inputs):
+        raise Stage2Error(
+            "UNSAFE_OUTPUT_LOCATION",
+            "A Stage II run directory may not contain any input artifact.",
+        )
+
+    current = load_state(paths.state)
+    if current is None:
+        transition_state(
+            paths.state, run_id=run_id, clip_id=validated.clip_id, mode=mode, target="PENDING"
+        )
+    advance_state(
+        paths.state, run_id=run_id, clip_id=validated.clip_id, mode=mode, target="VALIDATED"
+    )
+
+    seeds: tuple[ManualSeed, ...] = ()
+    manual_seed_artifacts: tuple[ArtifactRef, ...] = ()
+    if manual_seeds_path is not None:
+        seeds = load_private_manual_seeds_file(manual_seeds_path, validated)
+        manual_seed_artifacts = (write_private_manual_seeds(paths, stage1=validated, seeds=seeds),)
+    label_artifacts: tuple[ArtifactRef, ...] = ()
+    if labels_path is not None:
+        labels = load_private_labels_file(labels_path, validated)
+        label_artifacts = (write_private_labels(paths, stage1=validated, labels=labels),)
+
+    if torch_module is None:
+        try:
+            import torch as torch_module
+        except ImportError as exc:
+            raise Stage2Error(
+                "TORCH_NOT_FOUND", "Torch is required for real Stage II execution."
+            ) from exc
+    cuda = getattr(torch_module, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        raise Stage2Error(
+            "CUDA_UNAVAILABLE", "A CUDA device is required for real Stage II execution."
+        )
+
+    asset_paths = stage2_asset_paths(workspace_root)
+    dino_factory = dino_factory or (
+        lambda: TransformersGroundingDinoAdapter(
+            device="cuda", model_path=asset_paths["dino_weights"].parent
+        )
+    )
+    dino = dino_factory()
+    dino_config = DinoGenerationConfig(
+        model=dino.identity,
+        preprocessing=(
+            ("color", "RGB"),
+            ("resize", "model-default"),
+            ("normalization", "model-default"),
+            ("frame_decoder", "ffmpeg-jpeg-q2-pil"),
+        ),
+    )
+    dino_result = generate_dino_proposals(
+        stage1=validated,
+        paths=paths,
+        config=dino_config,
+        adapter=dino,
+        frame_loader=real_dino_frame_loader(stage1=validated, paths=paths),
+    )
+    del dino
+    gc.collect()
+    cuda.empty_cache()
+    cuda.synchronize()
+    ensure_run_not_stopped(paths)
+    advance_state(
+        paths.state,
+        run_id=run_id,
+        clip_id=validated.clip_id,
+        mode=mode,
+        target="DINO_COMPLETE",
+        completed_layers=("dino",),
+        reusable_layers=("dino",),
+    )
+
+    sam_factory = sam_factory or (
+        lambda: MetaSam2VideoAdapter(checkpoint_path=asset_paths["sam_checkpoint"], device="cuda")
+    )
+    sam = sam_factory()
+    capability = cuda.get_device_capability(0)
+    precision = "bfloat16" if int(capability[0]) >= 8 else "float16"
+    sam_result = generate_sam_mask_shards(
+        stage1=validated,
+        paths=paths,
+        dino_artifact=dino_result.artifact,
+        dino_meta=dino_result.meta,
+        config=SamGenerationConfig(
+            model=sam.identity,
+            runtime=sam.runtime_identity,
+            accepted_proposal_threshold=accepted_proposal_threshold,
+            window_size=window_size,
+            window_overlap=window_overlap,
+            precision=precision,
+        ),
+        adapter=sam,
+        window_loader=real_sam_window_loader(stage1=validated, paths=paths),
+        manual_seeds=seeds,
+    )
+    review_flag_artifacts: tuple[ArtifactRef, ...] = ()
+    if sam_result.review_flags:
+        review_flag_artifacts = (
+            write_private_review_flags(
+                paths, clip_id=validated.clip_id, sam_shards=sam_result.shards
+            ),
+        )
+    del sam
+    gc.collect()
+    cuda.empty_cache()
+    cuda.synchronize()
+    ensure_run_not_stopped(paths)
+    advance_state(
+        paths.state,
+        run_id=run_id,
+        clip_id=validated.clip_id,
+        mode=mode,
+        target="SAM_COMPLETE",
+        completed_layers=("dino", "sam"),
+        reusable_layers=("dino", "sam"),
+    )
+
+    render_result = render_stage2_video(stage1=validated, paths=paths, sam_shards=sam_result.shards)
+    ensure_run_not_stopped(paths)
+    advance_state(
+        paths.state,
+        run_id=run_id,
+        clip_id=validated.clip_id,
+        mode=mode,
+        target="RENDER_COMPLETE",
+        completed_layers=("dino", "sam", "render"),
+        reusable_layers=("dino", "sam", "render"),
+    )
+
+    return finalize_verified_processing(
+        stage1=validated,
+        paths=paths,
+        run_id=run_id,
+        dino_artifact=dino_result.artifact,
+        sam_shards=sam_result.shards,
+        render_result=render_result,
+        mode=mode,
+        manual_seed_artifacts=manual_seed_artifacts,
+        label_artifacts=label_artifacts,
+        review_flag_artifacts=review_flag_artifacts,
+    )
+
+
 def _remove_layer_path(paths: RunPaths, candidate: Path) -> None:
     assert_run_root_safe(paths)
     if candidate.is_symlink():

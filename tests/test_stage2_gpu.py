@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -326,6 +328,142 @@ class _FakeSam:
             forward_complete=True,
             reverse_complete=True,
         )
+
+
+def _make_real_stage1_inputs(stage2_job, tmp_path: Path):
+    """A real, ffmpeg-encoded, validate_stage1-passing Stage I input triple.
+
+    Distinct from _make_source_video (which builds a StageIInput directly,
+    bypassing validate_stage1's manifest checks) - run_real_pipeline needs
+    real files and a real manifest, since it calls validate_stage1 itself
+    and its real DINO/SAM loaders actually ffmpeg-extract frames from them.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        pytest.skip("ffmpeg and ffprobe are required for the real-pipeline orchestration test")
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    source = tmp_path / "source.mp4"
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=4:duration=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        pytest.skip(f"test ffmpeg lacks libx264: {result.stderr}")
+    # validate_stage1 only requires three distinct PATHS, not distinct
+    # content - a plain copy is enough and far simpler than re-encoding.
+    stage1_video = tmp_path / "stage1.mp4"
+    shutil.copyfile(source, stage1_video)
+
+    facts = stage2_job.probe_video(source)
+    source_ref = stage2_job.artifact_ref(source)
+    stage1_ref = stage2_job.artifact_ref(stage1_video)
+    manifest_path = tmp_path / "stage1.manifest.json"
+    manifest = {
+        "schema_version": 1,
+        "clip_id": "clip",
+        "source": {
+            "sha256": source_ref.sha256,
+            "filename": source.name,
+            "width": facts.display_width,
+            "height": facts.display_height,
+            "fps": facts.fps,
+            "n_frames": facts.n_frames,
+            "duration_s": facts.duration_s,
+            "rotation": facts.rotation,
+        },
+        "output": {
+            "path": stage1_video.name,
+            "sha256": stage1_ref.sha256,
+            "bytes": stage1_ref.bytes,
+        },
+        "egoblur": dict(stage2_job.EXPECTED_STAGE1),
+        "audit": {
+            "status": "PASS_AUTOMATED",
+            "status_reasons": [],
+            "integrity_ran": True,
+            "fill_integrity_checked": facts.n_frames,
+            "fill_integrity_violations": 0,
+            "fill_integrity_frames": facts.n_frames,
+        },
+        "status": "PASS_AUTOMATED",
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return source, stage1_video, manifest_path
+
+
+def test_run_real_pipeline_sequences_layers_with_fake_adapters_and_real_render(
+    stage2_job, tmp_path
+):
+    """The orchestration itself - sequencing, state transitions, free-before-
+    next-load, real extraction/render - is fully testable with only the two
+    model inference calls faked. Only real weight loading and actual
+    detection/segmentation quality require the pod."""
+    source, stage1_video, manifest_path = _make_real_stage1_inputs(stage2_job, tmp_path / "inputs")
+    work_dir = tmp_path / "work"
+    cuda = _FakeCuda(capability=(8, 0))
+
+    manifest = stage2_job.run_real_pipeline(
+        source_video=source,
+        stage1_video=stage1_video,
+        stage1_manifest=manifest_path,
+        work_dir=work_dir,
+        run_id="pilot-test",
+        workspace_root=tmp_path / "workspace",
+        window_size=4,
+        window_overlap=1,
+        expected_clip_id="clip",
+        torch_module=SimpleNamespace(cuda=cuda),
+        dino_factory=stage2_job.FakeDinoAdapter,
+        sam_factory=stage2_job.FakeSamAdapter,
+    )
+
+    assert manifest.processing_state == "PROCESSING_COMPLETE"
+    assert manifest.mode == "production"
+    assert manifest.review_status == "PENDING"
+    paths = stage2_job.build_run_paths(work_dir, "pilot-test", "clip")
+    assert stage2_job.load_state(paths.state).state == "PROCESSING_COMPLETE"
+    assert Path(manifest.render_artifact.path).exists()
+    # DINO must be freed before SAM loads (never co-resident): two separate
+    # empty-cache/synchronize rounds, not one shared round.
+    assert cuda.events.count("empty-cache") == 2
+    assert cuda.events.count("synchronize") == 2
+
+
+def test_run_real_pipeline_rejects_a_clip_id_mismatch(stage2_job, tmp_path):
+    source, stage1_video, manifest_path = _make_real_stage1_inputs(stage2_job, tmp_path / "inputs")
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.run_real_pipeline(
+            source_video=source,
+            stage1_video=stage1_video,
+            stage1_manifest=manifest_path,
+            work_dir=tmp_path / "work",
+            run_id="pilot-test",
+            workspace_root=tmp_path / "workspace",
+            window_size=4,
+            window_overlap=1,
+            expected_clip_id="not-the-real-clip-id",
+            torch_module=SimpleNamespace(cuda=_FakeCuda()),
+            dino_factory=stage2_job.FakeDinoAdapter,
+            sam_factory=stage2_job.FakeSamAdapter,
+        )
+    assert caught.value.code == "CLIP_ID_MISMATCH"
 
 
 @pytest.mark.parametrize(
