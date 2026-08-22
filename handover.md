@@ -345,6 +345,55 @@ Once the batch of 16 clips clears EgoBlur:
 - **`verify/` and `pack/`** — both empty files. Dataset assembly/
   validation not started.
 
+## Deferred — hand-tracking occlusion, revisit when hands actually gets wired up
+
+Raised while planning ahead (WiLoR + MediaPipe for hand detection, and
+separately DepthV3/SAM2 for depth), **not yet built, explicitly parked
+for later**:
+
+- **`src/egoannote/layers/hands.py`'s `run()` is fully generic today** —
+  no redaction/fill_map awareness, no occlusion detection at all. Feed it
+  a frame where a gray box covers part of a hand and it silently returns
+  whatever MediaPipe/WiLoR guess, no warning. Nothing currently
+  distinguishes "no hand, correctly" from "hand was there, occluded by
+  our own redaction."
+- **A real tension worth resolving, not just noting:** the README/
+  AGENTS.md's stated design runs hand tracking on the *redacted* video
+  specifically (defense in depth — this stage never touches original
+  pixels at all). That default is only safe if redaction essentially
+  never legitimately covers a hand — which this session's own
+  measurements directly disproved for the *pre*-fix pipeline (77.7% of
+  redacted area was noise, much of it landing on hands) and
+  significantly improved but did **not** prove is now zero. Decide
+  explicitly whether "hands on redacted video" stays the default, or
+  switches to original — see the next point for why original is likely
+  right for DepthV3/SAM2 at least.
+- **DepthV3 and SAM2** (if used for general segmentation, separate from
+  Stage II's DINO/SAM2 de-identification use): should almost certainly
+  run on the **original** video — both need real pixel signal for
+  quality (a flat gray box gives a depth model zero signal and produces
+  a hallucinated value or an edge artifact exactly where the wearer's
+  hands/the person they're interacting with are), and both produce
+  derived, non-identity-revealing outputs (depth arrays, mask arrays —
+  not pixels), so this doesn't reopen the privacy question as long as no
+  intermediate visual artifact (debug overlay, cached crop) derived from
+  the original ever reaches a published directory. Same `DO-NOT-SHIP`-
+  style boundary Stage II already has, applied to whatever pipeline
+  produces these.
+- **Two ways to actually detect a hand frame corrupted by redaction,
+  neither built yet:**
+  1. Cheap: watch MediaPipe/WiLoR's own per-frame confidence. An
+     unexplained drop or gap — not a smooth "hand left frame" pattern —
+     is suspect.
+  2. Precise: rebuild the exact `fill_map` for the clip from its
+     detection checkpoint + manifest (same technique as
+     `diag_integrity.py`/`diag_hand_noise.py` this session — zero GPU
+     cost) and directly check spatial overlap between the hand-detection
+     region and any redacted box for that frame. Overlap → mark that
+     frame's hand data explicitly unreliable rather than trusting it.
+     Same "a check that can't verify something is never a pass"
+     principle the rest of this pipeline is built on.
+
 ## Immediate next action, concretely
 
 1. Decide whether to commit the uncommitted work above (recommended —
