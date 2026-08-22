@@ -569,7 +569,26 @@ def test_operator_command_surface_and_dry_run(stage2_job, capsys, tmp_path):
     help_text = stage2_job.parse_args
     assert callable(help_text)
     exit_code = stage2_job.main(
-        ["--json", "--dry-run", "pilot", "GX010057", "--work-dir", str(tmp_path)]
+        [
+            "--json",
+            "--dry-run",
+            "pilot",
+            "GX010057",
+            "--work-dir",
+            str(tmp_path),
+            "--source-video",
+            str(tmp_path / "source.mp4"),
+            "--stage1-video",
+            str(tmp_path / "stage1.mp4"),
+            "--stage1-manifest",
+            str(tmp_path / "stage1.manifest.json"),
+            "--run-id",
+            "dry-run-test",
+            "--window-size",
+            "10",
+            "--window-overlap",
+            "2",
+        ]
     )
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
@@ -577,6 +596,35 @@ def test_operator_command_surface_and_dry_run(stage2_job, capsys, tmp_path):
     assert payload["gpu_execution_enabled"] is False
     parser_source = Path(stage2_job.__file__).read_text()
     assert all(f'"{command}"' in parser_source for command in commands)
+
+
+def test_pilot_dry_run_surfaces_window_size(stage2_job, capsys, tmp_path):
+    exit_code = stage2_job.main(
+        [
+            "--json",
+            "--dry-run",
+            "pilot",
+            "GX010057",
+            "--work-dir",
+            str(tmp_path),
+            "--source-video",
+            str(tmp_path / "source.mp4"),
+            "--stage1-video",
+            str(tmp_path / "stage1.mp4"),
+            "--stage1-manifest",
+            str(tmp_path / "stage1.manifest.json"),
+            "--run-id",
+            "dry-run-test",
+            "--window-size",
+            "12",
+            "--window-overlap",
+            "3",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["window_size"] == 12
+    assert payload["window_overlap"] == 3
 
 
 def test_sweep_dry_run_surfaces_thresholds(stage2_job, capsys, tmp_path):
@@ -608,11 +656,45 @@ def test_sweep_rejects_out_of_range_threshold(stage2_job, capsys, tmp_path):
     assert "must be in" in capsys.readouterr().err
 
 
-def test_real_gpu_commands_fail_with_actionable_boundary(stage2_job, capsys, tmp_path):
-    exit_code = stage2_job.main(["--json", "pilot", "GX010057", "--work-dir", str(tmp_path)])
+def test_sweep_still_defers_real_gpu_execution(stage2_job, capsys, tmp_path):
+    exit_code = stage2_job.main(["--json", "sweep", "GX010057", "--work-dir", str(tmp_path)])
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
     assert error["error_code"] == "REAL_GPU_EXECUTION_DEFERRED"
+    assert "runpod_setup_stage2.sh" in error["recovery"]
+
+
+def test_pilot_fails_closed_when_gpu_setup_is_incomplete(stage2_job, capsys, tmp_path):
+    """pilot is now real (wired to run_real_pipeline), not deferred - but it
+    still fails closed, just on a different, more specific gate: the
+    real-GPU readiness check, before ever touching the (here nonexistent)
+    input files."""
+    exit_code = stage2_job.main(
+        [
+            "--json",
+            "pilot",
+            "GX010057",
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--workspace-root",
+            str(tmp_path / "workspace"),
+            "--source-video",
+            str(tmp_path / "does-not-exist-source.mp4"),
+            "--stage1-video",
+            str(tmp_path / "does-not-exist-stage1.mp4"),
+            "--stage1-manifest",
+            str(tmp_path / "does-not-exist-manifest.json"),
+            "--run-id",
+            "pilot-test",
+            "--window-size",
+            "10",
+            "--window-overlap",
+            "2",
+        ]
+    )
+    assert exit_code == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["error_code"] == "STAGE2_SETUP_INCOMPLETE"
     assert "runpod_setup_stage2.sh" in error["recovery"]
 
 

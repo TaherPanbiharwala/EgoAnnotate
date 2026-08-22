@@ -7529,6 +7529,10 @@ def operator_dry_run(args: argparse.Namespace) -> dict[str, Any]:
         thresholds = getattr(args, "thresholds", None)
         if thresholds is not None:
             payload["thresholds"] = tuple(thresholds)
+        window_size = getattr(args, "window_size", None)
+        if window_size is not None:
+            payload["window_size"] = window_size
+            payload["window_overlap"] = args.window_overlap
     elif args.command == "review":
         payload["planned_review_status"] = args.decision
     elif args.command == "release-check":
@@ -7606,9 +7610,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     smoke.add_argument("--work-dir", type=Path, required=True)
     smoke.add_argument("--run-id", required=True)
 
-    pilot = subcommands.add_parser("pilot", help="plan the real-GPU pilot boundary")
+    pilot = subcommands.add_parser(
+        "pilot", help="run the real-GPU pilot against a bounded operator-prepared slice"
+    )
     pilot.add_argument("clip_id")
+    _add_input_arguments(pilot)
     pilot.add_argument("--work-dir", type=Path, default=Path("/workspace/stage2"))
+    pilot.add_argument("--workspace-root", type=Path, default=Path("/workspace"))
+    pilot.add_argument("--run-id", required=True)
+    pilot.add_argument("--window-size", type=int, required=True)
+    pilot.add_argument("--window-overlap", type=int, required=True)
+    pilot.add_argument("--proposal-threshold", type=_dino_threshold, default=DINO_PROPOSAL_FLOOR)
     pilot.add_argument("--manual-seeds", type=Path)
     pilot.add_argument("--labels", type=Path)
 
@@ -7766,8 +7778,32 @@ def main(argv: list[str] | None = None) -> int:
                 work_dir=args.work_dir,
                 run_id=args.run_id,
             )
-        elif args.command in {"pilot", "sweep"}:
-            raise _deferred_gpu_error(args.command)
+        elif args.command == "sweep":
+            raise _deferred_gpu_error("sweep")
+        elif args.command == "pilot":
+            _require_real_gpu_execution_ready(args.workspace_root)
+            manifest = run_real_pipeline(
+                source_video=args.source_video,
+                stage1_video=args.stage1_video,
+                stage1_manifest=args.stage1_manifest,
+                work_dir=args.work_dir,
+                run_id=args.run_id,
+                workspace_root=args.workspace_root,
+                window_size=args.window_size,
+                window_overlap=args.window_overlap,
+                accepted_proposal_threshold=args.proposal_threshold,
+                mode="pilot",
+                expected_clip_id=args.clip_id,
+                manual_seeds_path=args.manual_seeds,
+                labels_path=args.labels,
+            )
+            paths = _paths_from_args(args)
+            result = {
+                "manifest": manifest,
+                "calibration_summary": pilot_calibration_summary(paths, manifest),
+                "window_size": args.window_size,
+                "window_overlap": args.window_overlap,
+            }
         elif args.command == "status":
             result = run_status(_paths_from_args(args))
         elif args.command == "stop":
