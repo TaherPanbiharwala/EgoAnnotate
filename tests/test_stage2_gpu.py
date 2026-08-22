@@ -114,6 +114,50 @@ def test_real_sam_window_loader_matches_generate_sam_mask_shards_contract(stage2
     assert loader(window) == direct
 
 
+def test_real_dino_frame_loader_matches_the_exact_requested_anchor_frame(stage2_job, tmp_path):
+    stage1 = _make_source_video(stage2_job, tmp_path)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    loader = stage2_job.real_dino_frame_loader(stage1=stage1, paths=paths)
+
+    from PIL import Image
+
+    frame_idx = 2
+    window = stage2_job.TemporalWindow(index=0, frame_start=frame_idx, frame_end=frame_idx)
+    direct = stage2_job.extract_attested_sam_window(stage1=stage1, paths=paths, window=window)
+    with Image.open(Path(direct.payload) / "000000.jpg") as expected:
+        expected.load()
+        expected_bytes = expected.tobytes()
+        expected_size = expected.size
+
+    image = loader(frame_idx)
+    assert image.size == expected_size == (
+        stage1.source_video.display_width,
+        stage1.source_video.display_height,
+    )
+    assert image.tobytes() == expected_bytes
+    # The actual contract generate_dino_proposals' tiling code needs
+    # (frame_views/_image_size) - a PIL-compatible crop(), not just a size.
+    cropped = image.crop((0, 0, 8, 8))
+    assert cropped.size == (8, 8)
+
+
+def test_real_dino_frame_loader_cache_hit_does_not_need_the_source_video(stage2_job, tmp_path):
+    stage1 = _make_source_video(stage2_job, tmp_path)
+    paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)
+    loader = stage2_job.real_dino_frame_loader(stage1=stage1, paths=paths)
+
+    first = loader(2)
+    first_bytes = first.tobytes()
+
+    # Simulate the source video being archived off the pod once every anchor
+    # frame that needs it has already been cached - same guarantee
+    # extract_attested_sam_window itself already provides for SAM windows.
+    Path(stage1.source.path).unlink()
+
+    reused = loader(2)
+    assert reused.tobytes() == first_bytes
+
+
 def test_changed_or_extra_sam_frame_payload_fails_closed(stage2_job, tmp_path):
     stage1 = _make_source_video(stage2_job, tmp_path)
     paths = stage2_job.build_run_paths(tmp_path / "work", "run", stage1.clip_id)

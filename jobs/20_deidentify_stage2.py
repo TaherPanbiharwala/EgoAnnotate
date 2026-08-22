@@ -3382,6 +3382,36 @@ def real_sam_window_loader(
     return loader
 
 
+def real_dino_frame_loader(*, stage1: StageIInput, paths: RunPaths) -> Callable[[int], Any]:
+    """Real per-anchor frame loader for generate_dino_proposals.
+
+    A DINO anchor frame is exactly a SAM temporal window of size one, so
+    this reuses extract_attested_sam_window rather than a parallel
+    extraction path — same ffmpeg extraction, atomic promotion, TOCTOU-safe
+    source-video checks, and cache-hit reuse under paths.frames_dir, keyed
+    only off stage1.source (the original video; DINO must never see the
+    Stage I redacted video). The one cosmetic wrinkle: cache paths and any
+    failure messages still say "SAM window" even for a DINO anchor — not
+    worth renaming three milestones of stable, tested SAM naming for.
+    """
+
+    def loader(frame_idx: int) -> Any:
+        window = TemporalWindow(index=0, frame_start=frame_idx, frame_end=frame_idx)
+        extracted = extract_attested_sam_window(stage1=stage1, paths=paths, window=window)
+        frame_path = Path(extracted.payload) / "000000.jpg"
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise Stage2Error(
+                "PILLOW_NOT_FOUND", "Pillow is required to load a real DINO anchor frame."
+            ) from exc
+        with Image.open(frame_path) as image:
+            image.load()
+            return image
+
+    return loader
+
+
 def sam_shard_path(paths: RunPaths, window: TemporalWindow, fingerprint_value: str) -> Path:
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint_value):
         raise Stage2Error("INVALID_SAM_FINGERPRINT", "SAM fingerprint is not a SHA-256.")
