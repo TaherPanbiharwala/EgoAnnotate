@@ -67,8 +67,13 @@ jobs/20_deidentify_stage2.py
                              technical verification, atomic output promotion,
                              guarded processing finalization, private labels,
                              immutable review/release gates, stop/resume, and
-                             the complete operator command surface. Real model
-                             adapters are lazy/cache-only until Milestone 6.
+                             the complete operator command surface. Milestone
+                             6 adds a real (non-fake) DINO/SAM2 orchestration
+                             path (`run_real_pipeline`) and a `pilot` command
+                             gated by a real-GPU readiness check that also
+                             detects stale smoke evidence; real inference has
+                             passed an offline GPU smoke test on a pod but has
+                             not yet processed a real clip slice.
 jobs/_contract.py           the shard-metadata contract other future GPU
                              jobs (hand-pose, depth, SLAM) will vendor by
                              copy — NOT imported (see PEP 723 section).
@@ -188,7 +193,7 @@ and pinned with a regression test:
 | Stage | Status |
 |---|---|
 | EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
-| Stage II DINO/SAM2 | Milestones 1-5 complete on `feature/stage2-deidentification`. Milestone 6 is in progress: the persistent offline CUDA smoke path, exact verified DINO snapshot binding, and source/frame-attested SAM window extraction are implemented and locally tested. The actual RunPod smoke, safe-window pilot, private `GX010057` answer sheet, full threshold sweep, and human acceptance remain pending. |
+| Stage II DINO/SAM2 | Milestones 1-5 complete on `feature/stage2-deidentification`. Milestone 6: the real offline GPU smoke test has now **passed for real** on a RunPod L4 pod (DINO + SAM2 both load and run sequentially, all pinned assets hash-verified). The real (non-fake) pipeline is now wired end to end — `run_real_pipeline`, a real DINO frame loader, and a `pilot` command gated by `_require_real_gpu_execution_ready` (which also catches stale smoke evidence, not just its existence) — and pushed to `feature/stage2-deidentification`. What remains: actually running `pilot` on a trimmed real slice on the pod to pick a safe SAM window size, then the private `GX010057` answer sheet, full threshold sweep, and human acceptance. |
 | MediaPipe hands | Code complete, unit-tested, proven working (Metal-accelerated, fast). Never run against real *redacted* output — only a synthetic test clip. |
 | VLM captioning | Code complete, unit-tested. `models.toml` still has placeholder model IDs / $0.00 prices — cannot run for real until filled in with two real models from different labs. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
@@ -215,25 +220,41 @@ reviews, fail-closed release checks, explicit stop/resume/recompute, the full
 operator command surface, and verified persistent setup. The Stage II job is
 now version `0.5.0` with code version `milestone-5`.
 
-The in-progress Milestone 6 preparation reports job version `0.6.0` and code
-version `milestone-6`; those identifiers do not mean the real calibration gate
-has passed. Its local implementation checkpoint is `39d23ed`.
+Milestone 6 reports job version `0.6.0` and code version `milestone-6`. The
+real offline GPU smoke test has now passed for real on a RunPod L4 pod (not
+just locally with fakes) — see `handover.md` for the exact runtime pin and
+verification evidence.
 
-Continue **Milestone 6 — real-GPU smoke test and full `GX010057`
-calibration** in `STAGE2_DEIDENTIFICATION_PLAN.md`. The local implementation now
-forces the persistent setup to run DINO then SAM2 offline on CUDA and records
-`/workspace/models/stage2/gpu-smoke.json`; real SAM directories are exact,
-source-bound, frame-hashed payloads. Run that setup on the pod, review the
-30-60 second smoke slice, select the safe SAM window size, and only then begin
-the full threshold sweep.
+With the smoke test passed, the plan `pilot` = `run_real_pipeline(mode="pilot",
+...)` against an operator-prepared slice was scoped, implemented, and pushed
+(commits `3308e50`, `7b4accc`, `c6d7f4b`, `eb8b45c`; plan file
+`encapsulated-hugging-peacock.md` if still present locally). `pilot` now
+requires `--source-video`/`--stage1-video`/`--stage1-manifest`,
+`--workspace-root`, `--run-id`, `--window-size`, `--window-overlap`, and is
+gated by `_require_real_gpu_execution_ready`, which re-verifies pinned assets
+against the persisted smoke evidence (catching a swapped weight/runtime after
+the smoke test passed, not just checking a file exists) before calling
+`run_real_pipeline`. `sweep` and non-fake `run` are untouched — still
+unconditionally deferred with `REAL_GPU_EXECUTION_DEFERRED`.
+
+Continue **Milestone 6 — real-GPU pilot and full `GX010057` calibration** in
+`STAGE2_DEIDENTIFICATION_PLAN.md`. The next step is entirely pod-side and
+manual, not more Python: trim a 30-60 second slice of `GX010057`, re-run
+`jobs/10_blur_egoblur.py` on that trim to get a real, self-consistent Stage I
+manifest under a distinct `clip_id` (e.g. `GX010057-pilot` — Stage II never
+fabricates a Stage I manifest for content it didn't itself process), then run
+`pilot` against it to pick a safe SAM window size before the full sweep.
 
 Review concerns intentionally carried into later milestones:
 
-- before real SAM2 execution, verify the extracted frame directory's actual
-  count, ordering, and content identity rather than trusting only loader-supplied
-  metadata;
+- ~~before real SAM2 execution, verify the extracted frame directory's actual
+  count, ordering, and content identity rather than trusting only
+  loader-supplied metadata~~ — done: `extract_attested_sam_window` (reused by
+  both the real SAM window loader and the new real DINO frame loader) verifies
+  exact frame count, names, dimensions, hashes, and source/range binding before
+  reuse or inference;
 - profile the real adapter's full-resolution GPU-to-CPU mask transfers and
-  Python-list conversion during the Milestone 6 GPU pilot;
+  Python-list conversion during the real pod pilot run;
 - describe the conservative fallback accurately as a held padded DINO box, not
   learned tracking or true interpolation.
 

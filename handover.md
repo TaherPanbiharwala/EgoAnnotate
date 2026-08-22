@@ -1,22 +1,35 @@
 # egoannote Stage II session handover
 
-Updated 2026-08-20 after starting Milestone 6.
+Updated 2026-08-23 after the real GPU smoke test passed on a RunPod pod and
+the real (non-fake) pilot pipeline was wired.
 
 ## Start here
 
 - Worktree: `/Users/taherpanbiharwala/Desktop/Annotated_Data/egoannote-stage2`
-- Branch: `feature/stage2-deidentification`
+- Branch: `feature/stage2-deidentification` (pushed to `origin`; **not**
+  merged into `master` — keep it that way unless explicitly told otherwise)
+- Latest pushed HEAD: `eb8b45c` — pilot CLI wiring (`parse_args`/`main()`)
+- Real pipeline wiring commits: `3308e50` (real DINO frame loader), `7b4accc`
+  (`run_real_pipeline`), `c6d7f4b` (real-GPU readiness gate + calibration
+  summary), `eb8b45c` (pilot CLI wiring) — see
+  `/Users/taherpanbiharwala/.claude/plans/encapsulated-hugging-peacock.md`
+  for the plan these came from, if it's still present locally.
+- EgoBlur sync commit: `2b3c5b9` pulled in `--min-track-confirmations`
+  support from `master`; `f005062` pinned it to `2` in Stage II's
+  `EXPECTED_STAGE1`.
 - Milestone 6 local preparation checkpoint: `39d23ed`
 - Milestone 5 implementation HEAD: `dba85a9`
 - Baseline HEAD before Milestone 5: `f0754f1`
 - Base merged from `master`: `9acfe07`
 - Milestones through 5 are implemented, tested, and documented on this branch.
-- Milestone 6 is in progress locally. The offline sequential CUDA smoke,
-  verified persistent DINO snapshot binding, and exact source/frame-attested
-  SAM window extraction are implemented; the actual pod and `GX010057` work
-  have not run.
-- Nothing from this branch has been pushed or merged into `master` by this
-  session.
+- Milestone 6: the offline GPU smoke test has **passed for real** on a RunPod
+  L4 pod (see "Real GPU smoke test result" below). The real DINO/SAM2
+  orchestration and a runnable `pilot` command are now implemented, tested
+  (with fake adapters standing in for actual inference — the sequencing,
+  state transitions, and readiness gate are all real, GPU-free-testable
+  code), and pushed. **What has not run yet: `pilot` against a real trimmed
+  slice on the pod.** That is the next and only remaining step before the
+  full threshold sweep.
 
 In a new chat, set the workspace to the worktree above, then read these files
 in order:
@@ -166,7 +179,7 @@ Do not mix those unrelated cleanup items into a Stage II milestone commit.
 
 ## Milestone 6 progress and next external gate
 
-Milestone 6 has started. Local code now:
+Local code (all pushed to `origin/feature/stage2-deidentification`):
 
 - makes persistent setup run DINO and SAM2 sequentially with networking
   disabled and saves `models/stage2/gpu-smoke.json` atomically;
@@ -174,35 +187,91 @@ Milestone 6 has started. Local code now:
 - records device/model/runtime identity, runtime, peak VRAM, and residual DINO
   memory before SAM loads;
 - loads DINO from the exact persistent snapshot whose weights were hash
-  verified; and
+  verified;
 - atomically extracts numeric SAM JPEG windows, verifies exact frame count,
   names, dimensions, hashes, source/range binding, and revalidates the payload
-  before inference and reuse.
+  before inference and reuse; the same extraction path (`extract_attested_sam_window`)
+  now also backs a real single-frame DINO loader (`real_dino_frame_loader`) —
+  a DINO anchor is just a size-1 SAM window, so there is one attested
+  extraction path, not two;
+- wires the real (non-fake) DINO → SAM2 → render → finalize sequence end to
+  end (`run_real_pipeline`), with the same sequential load-then-free GPU
+  discipline (`del`+`gc.collect()`+`cuda.empty_cache()`+`cuda.synchronize()`
+  between DINO and SAM2) `run_offline_gpu_smoke` already used; and
+- gates `pilot` behind `_require_real_gpu_execution_ready`, which re-derives
+  the doctor/asset check fresh and compares it against the persisted smoke
+  evidence — not just "does gpu-smoke.json exist," but "does it still match
+  what's actually installed right now" (`GPU_SMOKE_EVIDENCE_STALE` if not).
 
-The local complete suite currently passes at **453 tests** and the focused
-M6/DINO/SAM/operator suite passes at **124 tests**. No model assets were
-downloaded and no CUDA execution occurred locally.
+### Real GPU smoke test result (RunPod L4 pod, passed for real)
 
-On RunPod, run the persistent setup, verify the exact assets and offline
-CUDA/model load, attest the extracted frame-window payload, and select a safe
-SAM window size on a 30-60 second slice before paying for the full-clip sweep.
-Then create the private full-clip answer sheet and compare thresholds `0.15`,
-`0.20`, `0.25`, and `0.30`. Real GPU execution remains structurally deferred
-by the Milestone 5 command implementation until this work begins.
+`bash scripts/runpod_setup_stage2.sh --workspace-root /workspace` completed
+with `status: PASS_OFFLINE_GPU_SMOKE`. Both DINO and SAM2 loaded and ran
+offline (networking disabled) on CUDA, sequentially, with all pinned assets
+hash-verified:
+
+- device: L4, compute capability `[8, 9]` → BF16 precision chosen, as
+  designed;
+- DINO peak VRAM: ~2 GB; SAM2 peak VRAM: ~1.9 GB;
+- DINO residual VRAM before SAM2 loads: ~8 MB — confirms the sequential
+  free actually released the model, not just deleted a Python reference.
+
+Two real pod-side issues were hit and fixed along the way, in case they
+recur on a fresh pod/volume:
+
+- `SAM_RUNTIME_UNVERIFIABLE` on a symlink inside the installed SAM2 package
+  (`sam2/sam2_hiera_t.yaml` → `configs/sam2/sam2_hiera_t.yaml`, a real,
+  benign, in-tree symlink shipped by upstream SAM2 revision `2b90b9f`).
+  `sha256_directory_tree` originally rejected *any* symlink; fixed (commit
+  `80c3359`) to allow one only if its resolved target stays inside the
+  hashed root.
+- `/workspace/.uv-cache` silently consumed ~12 GB (invisible to
+  `du -sh /workspace/*`, which doesn't glob dotfiles) and tripped the
+  network-volume disk-usage warning. Safe to `rm -rf /workspace/.uv-cache/*`
+  — it's a cache, not data. Note also: switching git branches is a cheap
+  metadata operation and does **not** itself consume additional disk space;
+  don't delete `master` locally to "make room" for a branch switch.
+
+### Next external gate: run `pilot` on a real trimmed slice
+
+This is now pure operator work, not more Python. On the pod:
+
+1. Trim a 30-60 second slice of `GX010057`.
+2. Re-run `jobs/10_blur_egoblur.py` on that trim (same settings as the
+   "EgoBlur context" section below, with a distinct `--run-id`/`clip_id`,
+   e.g. `GX010057-pilot`) to get a real, self-consistent Stage I manifest.
+   Stage II never fabricates a Stage I manifest for content it didn't
+   itself process — `validate_stage1`'s fail-closed checks need genuinely
+   consistent audit/integrity fields.
+3. Run `pilot` against that trim's source video, Stage I video, and Stage I
+   manifest, with an explicit `--window-size`/`--window-overlap` (no
+   default — forcing a value each time is the point of the calibration
+   loop) and `--run-id`/`--workspace-root`. It reports
+   `{manifest, calibration_summary, window_size, window_overlap}` on
+   success, or fails closed with one of `STAGE2_SETUP_INCOMPLETE`,
+   `GPU_SMOKE_EVIDENCE_MISSING`, `GPU_SMOKE_NOT_PASSED`, or
+   `GPU_SMOKE_EVIDENCE_STALE` from the readiness gate — distinct from
+   `REAL_GPU_EXECUTION_DEFERRED`, which `sweep` and non-fake `run` still
+   unconditionally raise.
+4. Use `calibration_summary`'s per-window runtime/VRAM numbers to pick a
+   safe SAM window size, then move on to the full threshold sweep (`0.15`,
+   `0.20`, `0.25`, `0.30`) — that tooling does not exist yet and is
+   deliberately out of scope until there's real pilot output to design it
+   against.
 
 ## Remaining concerns, not current failing tests
 
 These were identified during review and should be addressed in their planned
 milestones:
 
-- Before real SAM2 execution in Milestone 6, attest the actual extracted
-  frame-window payload, not just loader-supplied metadata. Verify frame count,
-  names/order, and content identity so an off-by-one or wrong directory cannot
-  reach SAM2 with plausible metadata. This belongs with the Milestone 6
-  real-adapter path.
+- ~~Before real SAM2 execution in Milestone 6, attest the actual extracted
+  frame-window payload, not just loader-supplied metadata.~~ Done —
+  `extract_attested_sam_window` verifies frame count, names/order, and
+  content identity for both the real SAM window loader and the real DINO
+  frame loader.
 - Profile the real SAM2 adapter's full-resolution GPU-to-CPU mask copies and
   Python-list conversion. Forward/reverse overlap may duplicate work. Measure
-  this during the Milestone 6 GPU pilot before optimizing.
+  this during the real pod pilot run before optimizing.
 - The fallback currently holds a conservative padded DINO box over its local
   interval. Do not describe it as learned tracking or true interpolation.
 - Global cross-window person identity tracking remains intentionally deferred.
@@ -251,15 +320,26 @@ Two older EgoBlur issues remain outside current Stage II scope:
 - Keep model/checkpoint caches and Stage II setup under `/workspace`.
 - Use full SSH over an exposed TCP port for file transfer; RunPod Basic SSH does
   not support SCP/SFTP.
-- The production-shaped commands and persistent setup exist, but real GPU
-  execution deliberately returns `REAL_GPU_EXECUTION_DEFERRED` until Milestone
-  6. No model assets were downloaded and no real Stage II clip was processed in
-  Milestone 5.
+- The persistent setup's offline GPU smoke test has passed for real on a
+  RunPod L4 pod (see "Real GPU smoke test result" above). `pilot` is now
+  wired to the real DINO/SAM2 pipeline and gated by
+  `_require_real_gpu_execution_ready`, but has not yet been run against a
+  real clip slice on the pod — that is the next step. `sweep` and non-fake
+  `run` still deliberately return `REAL_GPU_EXECUTION_DEFERRED`.
+- After a fresh pod boot: `cd /workspace/egoannote && git pull origin
+  feature/stage2-deidentification`, then `bash scripts/runpod_setup_stage2.sh
+  --workspace-root /workspace` (idempotent — re-verifies assets and re-checks
+  the smoke test even if it already ran once), then `source
+  /workspace/stage2-env.sh`.
 
 ## Suggested first message in the new chat
 
 > Work in the `egoannote-stage2` worktree on
 > `feature/stage2-deidentification`. Read `AGENTS.md`, `handover.md`, and
 > `STAGE2_DEIDENTIFICATION_PLAN.md` completely. Confirm the branch and clean
-> status, then start Milestone 6 with the RunPod setup and short real-GPU smoke
-> slice. Do not modify EgoBlur or begin the full sweep before the smoke gate.
+> status. The real GPU smoke test has already passed on the pod, and `pilot`
+> is fully wired and pushed — the next step is trimming a 30-60 second
+> `GX010057` slice, producing its own Stage I manifest via EgoBlur, and
+> running `pilot` against it to pick a safe SAM window size. Do not modify
+> EgoBlur, merge to `master`, or begin the full threshold sweep before that
+> pilot run has real results.
