@@ -7169,6 +7169,7 @@ def stage2_asset_paths(workspace_root: Path) -> dict[str, Path]:
         "sam_checkpoint": root / "models" / "stage2" / "sam2" / "sam2.1_hiera_large.pt",
         "sam_runtime": root / "models" / "stage2" / "sam2-runtime",
         "asset_manifest": root / "models" / "stage2" / "assets.manifest.json",
+        "gpu_smoke_result": root / "models" / "stage2" / "gpu-smoke.json",
         "work_dir": root / "stage2",
     }
 
@@ -7419,6 +7420,90 @@ def run_offline_gpu_smoke(
         "dino": dino_metrics,
         "dino_residual_vram_before_sam_bytes": dino_residual_vram,
         "sam": sam_metrics,
+    }
+
+
+def _require_real_gpu_execution_ready(
+    workspace_root: Path, *, doctor_fn: Callable[[Path], dict[str, Any]] = doctor_stage2
+) -> dict[str, Any]:
+    """Fail closed before any real GPU command unless the persisted smoke
+    evidence still matches what's actually installed right now.
+
+    More than "does gpu-smoke.json exist": re-verifies tools/assets via the
+    same doctor_fn run_offline_gpu_smoke itself uses, then compares the
+    smoke evidence's own recorded verified_assets snapshot against that
+    fresh result. A mismatch means the pinned weights/runtime were swapped
+    (or setup was re-run in verify-only mode) since the smoke test passed,
+    without the smoke test itself being rerun to confirm the new assets
+    still actually load.
+    """
+    doctor = doctor_fn(workspace_root)
+    if doctor.get("status") != "READY_FOR_MILESTONE_6_GPU_SMOKE":
+        raise Stage2Error(
+            "STAGE2_SETUP_INCOMPLETE",
+            "Pinned Stage II assets are not ready for real execution.",
+            details={"problems": doctor.get("problems", [])},
+            recovery="Run bash scripts/runpod_setup_stage2.sh, then retry.",
+        )
+    smoke_path = stage2_asset_paths(workspace_root)["gpu_smoke_result"]
+    if smoke_path.is_symlink():
+        raise Stage2Error(
+            "UNSAFE_GPU_SMOKE_EVIDENCE", "GPU smoke evidence may not be a symbolic link."
+        )
+    if not smoke_path.exists():
+        raise Stage2Error(
+            "GPU_SMOKE_EVIDENCE_MISSING",
+            "No offline GPU smoke evidence exists yet.",
+            recovery="Run bash scripts/runpod_setup_stage2.sh, which also writes gpu-smoke.json.",
+        )
+    smoke = read_json(smoke_path)
+    if smoke.get("status") != "PASS_OFFLINE_GPU_SMOKE":
+        raise Stage2Error(
+            "GPU_SMOKE_NOT_PASSED",
+            "The persisted GPU smoke evidence did not record a pass.",
+            recovery="Run bash scripts/runpod_stage2.sh doctor --workspace-root ... --load-models.",
+        )
+    if smoke.get("verified_assets") != doctor.get("assets"):
+        raise Stage2Error(
+            "GPU_SMOKE_EVIDENCE_STALE",
+            "Persisted GPU smoke evidence does not match the currently installed model assets.",
+            recovery="Rerun bash scripts/runpod_setup_stage2.sh to refresh gpu-smoke.json.",
+        )
+    return doctor
+
+
+def pilot_calibration_summary(paths: RunPaths, manifest: ProcessingManifest) -> dict[str, Any]:
+    """Reload DINO/SAM runtime and VRAM metrics from the already-written
+    immutable artifacts, matching how run_status/current_processing_evidence
+    already treat on-disk artifacts (not in-memory intermediates) as the
+    source of truth for anything reported to an operator."""
+    dino_meta = dino_meta_from_dict(read_json(Path(manifest.dino_artifact.path)))
+    sam_metas = [
+        load_sam_mask_shard(Path(reference.path)).meta for reference in manifest.sam_mask_shards
+    ]
+    return {
+        "dino": {
+            "runtime_seconds": dino_meta.metrics.get("runtime_seconds"),
+            "peak_vram_bytes": dino_meta.metrics.get("peak_vram_bytes"),
+        },
+        "sam": {
+            "window_count": len(sam_metas),
+            "peak_vram_bytes": max(
+                (meta.metrics.get("peak_vram_bytes", 0) for meta in sam_metas), default=0
+            ),
+            "total_runtime_seconds": sum(
+                meta.metrics.get("runtime_seconds", 0.0) for meta in sam_metas
+            ),
+            "per_window": [
+                {
+                    "frame_start": meta.frame_start,
+                    "frame_end": meta.frame_end,
+                    "runtime_seconds": meta.metrics.get("runtime_seconds"),
+                    "peak_vram_bytes": meta.metrics.get("peak_vram_bytes"),
+                }
+                for meta in sam_metas
+            ],
+        },
     }
 
 

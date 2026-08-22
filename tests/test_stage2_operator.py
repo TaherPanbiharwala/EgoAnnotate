@@ -625,6 +625,86 @@ def test_doctor_reports_persistent_paths_without_mutating(stage2_job, tmp_path):
     assert not workspace.exists()
 
 
+def _ready_doctor_fn(assets):
+    def doctor_fn(_workspace_root):
+        return {"status": "READY_FOR_MILESTONE_6_GPU_SMOKE", "problems": [], "assets": assets}
+
+    return doctor_fn
+
+
+def test_real_gpu_readiness_gate_requires_ready_assets(stage2_job, tmp_path):
+    def not_ready(_workspace_root):
+        return {"status": "SETUP_REQUIRED", "problems": ["dino_weights missing"], "assets": {}}
+
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job._require_real_gpu_execution_ready(tmp_path, doctor_fn=not_ready)
+    assert caught.value.code == "STAGE2_SETUP_INCOMPLETE"
+
+
+def test_real_gpu_readiness_gate_requires_smoke_evidence_to_exist(stage2_job, tmp_path):
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job._require_real_gpu_execution_ready(
+            tmp_path, doctor_fn=_ready_doctor_fn({"dino_weights": {"verified": True}})
+        )
+    assert caught.value.code == "GPU_SMOKE_EVIDENCE_MISSING"
+
+
+def test_real_gpu_readiness_gate_rejects_a_symlinked_smoke_result(stage2_job, tmp_path):
+    smoke_path = stage2_job.stage2_asset_paths(tmp_path)["gpu_smoke_result"]
+    smoke_path.parent.mkdir(parents=True, exist_ok=True)
+    real_elsewhere = tmp_path / "elsewhere.json"
+    real_elsewhere.write_text("{}")
+    smoke_path.symlink_to(real_elsewhere)
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job._require_real_gpu_execution_ready(
+            tmp_path, doctor_fn=_ready_doctor_fn({"dino_weights": {"verified": True}})
+        )
+    assert caught.value.code == "UNSAFE_GPU_SMOKE_EVIDENCE"
+
+
+def test_real_gpu_readiness_gate_requires_a_passed_smoke_result(stage2_job, tmp_path):
+    assets = {"dino_weights": {"verified": True}}
+    smoke_path = stage2_job.stage2_asset_paths(tmp_path)["gpu_smoke_result"]
+    smoke_path.parent.mkdir(parents=True, exist_ok=True)
+    stage2_job.atomic_write_json(
+        smoke_path, {"status": "SAM_GPU_SMOKE_INCOMPLETE", "verified_assets": assets}
+    )
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job._require_real_gpu_execution_ready(tmp_path, doctor_fn=_ready_doctor_fn(assets))
+    assert caught.value.code == "GPU_SMOKE_NOT_PASSED"
+
+
+def test_real_gpu_readiness_gate_rejects_stale_smoke_evidence(stage2_job, tmp_path):
+    smoke_path = stage2_job.stage2_asset_paths(tmp_path)["gpu_smoke_result"]
+    smoke_path.parent.mkdir(parents=True, exist_ok=True)
+    stage2_job.atomic_write_json(
+        smoke_path,
+        {
+            "status": "PASS_OFFLINE_GPU_SMOKE",
+            "verified_assets": {"dino_weights": {"verified": True, "sha256": "old"}},
+        },
+    )
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job._require_real_gpu_execution_ready(
+            tmp_path,
+            doctor_fn=_ready_doctor_fn({"dino_weights": {"verified": True, "sha256": "new"}}),
+        )
+    assert caught.value.code == "GPU_SMOKE_EVIDENCE_STALE"
+
+
+def test_real_gpu_readiness_gate_passes_when_evidence_matches_current_assets(stage2_job, tmp_path):
+    assets = {"dino_weights": {"verified": True, "sha256": "matching"}}
+    smoke_path = stage2_job.stage2_asset_paths(tmp_path)["gpu_smoke_result"]
+    smoke_path.parent.mkdir(parents=True, exist_ok=True)
+    stage2_job.atomic_write_json(
+        smoke_path, {"status": "PASS_OFFLINE_GPU_SMOKE", "verified_assets": assets}
+    )
+    result = stage2_job._require_real_gpu_execution_ready(
+        tmp_path, doctor_fn=_ready_doctor_fn(assets)
+    )
+    assert result["status"] == "READY_FOR_MILESTONE_6_GPU_SMOKE"
+
+
 def test_stage2_setup_dry_run_is_idempotent_and_non_mutating(stage2_job, tmp_path):
     repo = Path(stage2_job.__file__).resolve().parents[1]
     script = repo / "scripts" / "runpod_setup_stage2.sh"

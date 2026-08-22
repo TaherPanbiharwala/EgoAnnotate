@@ -445,6 +445,14 @@ def test_run_real_pipeline_sequences_layers_with_fake_adapters_and_real_render(
     assert cuda.events.count("empty-cache") == 2
     assert cuda.events.count("synchronize") == 2
 
+    summary = stage2_job.pilot_calibration_summary(paths, manifest)
+    assert summary["dino"]["runtime_seconds"] >= 0
+    assert isinstance(summary["dino"]["peak_vram_bytes"], int)
+    assert summary["sam"]["window_count"] == len(manifest.sam_mask_shards)
+    assert len(summary["sam"]["per_window"]) == summary["sam"]["window_count"]
+    for window in summary["sam"]["per_window"]:
+        assert window["frame_start"] <= window["frame_end"]
+
 
 def test_run_real_pipeline_rejects_a_clip_id_mismatch(stage2_job, tmp_path):
     source, stage1_video, manifest_path = _make_real_stage1_inputs(stage2_job, tmp_path / "inputs")
