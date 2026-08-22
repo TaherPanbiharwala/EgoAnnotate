@@ -1750,3 +1750,147 @@ def test_fill_area_ceiling_is_a_boundary_not_a_typo(blur_job):
     just_over = _audit(blur_job, fill={"n_frames_with_fill": 10,
                                        "max_fill_area_frac": blur_job.MAX_FILL_AREA_FRAC_CEILING + 0.001})
     assert just_over["status"] == "NEEDS_REVIEW"
+
+
+# ---------------------------------------------------------------------------
+# --min-track-confirmations. Measured on real footage (test-run-3, GX010057):
+# 335 of 392 face tracks had exactly one confident detection, and those
+# tracks alone accounted for 77.7% of redacted area -- one false positive on
+# a hand or shadow gets amplified by the hold window into ~3s of gray box
+# identically to a real, persistently-seen face. A hand-checked sample of
+# the worst single-detection tracks was 0-for-7 real persistent faces.
+# Default 1 = off, byte-identical to every test above this section.
+# ---------------------------------------------------------------------------
+
+
+def test_min_confident_hits_default_reproduces_old_behaviour(blur_job):
+    """A single detection must still get the full hold when the gate isn't
+    explicitly raised -- every test above this section depends on that."""
+    d = blur_job.Detection(frame_idx=0, cls="face", box=(100.0, 100.0, 200.0, 200.0),
+                            score=0.9)
+    tracks = blur_job.build_tracks([d], 8, 0.2, hold_frames=5, back_hold_frames=5)
+    assert len(tracks) == 1
+    assert sorted(tracks[0].frames) == list(range(0, 6)), (
+        "a lone detection lost its hold with the gate at its default (off)")
+
+
+def test_single_hit_track_is_dropped_entirely_when_confirmation_required(blur_job):
+    """The whole point: with min_confident_hits=2, an isolated blip
+    contributes NOTHING -- not a shortened hold, zero fill -- because the
+    amplification this gate exists to stop happens entirely in the hold
+    step. Dropping it before that step is what removes it."""
+    d = blur_job.Detection(frame_idx=0, cls="face", box=(100.0, 100.0, 200.0, 200.0),
+                            score=0.9)
+    tracks = blur_job.build_tracks([d], 8, 0.2, hold_frames=45, back_hold_frames=45,
+                                    min_confident_hits=2)
+    assert tracks == [], f"an isolated single detection produced fill: {tracks}"
+
+
+def test_two_hit_track_is_completely_unaffected_by_the_gate(blur_job):
+    """Tracks that clear the bar get the exact same hold as with the gate
+    off -- this can only ever REMOVE coverage from single-hit tracks, never
+    touch a persistent one."""
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.90)]
+    off = blur_job.build_tracks(dets, 8, blur_job.TRACK_IOU_DEFAULT,
+                                 hold_frames=10, back_hold_frames=10, stride=3)
+    on = blur_job.build_tracks(dets, 8, blur_job.TRACK_IOU_DEFAULT,
+                                hold_frames=10, back_hold_frames=10, stride=3,
+                                min_confident_hits=2)
+    assert len(off) == 1 and len(on) == 1
+    assert off[0].frames == on[0].frames, (
+        "a 2-detection track's coverage changed even though it clears the "
+        "confirmation bar either way")
+
+
+def test_unconfirmed_out_parameter_collects_the_rejected_track(blur_job):
+    """Mirrors dropped_small/low_absorbed: a confident detection that gets
+    suppressed must never vanish without a trace."""
+    d = blur_job.Detection(frame_idx=0, cls="face", box=(100.0, 100.0, 200.0, 200.0),
+                            score=0.9)
+    unconfirmed = []
+    tracks = blur_job.build_tracks([d], 8, 0.2, hold_frames=45, back_hold_frames=45,
+                                    min_confident_hits=2, unconfirmed=unconfirmed)
+    assert tracks == []
+    assert len(unconfirmed) == 1
+    assert unconfirmed[0].frames[0][0] == d.box, (
+        "the rejected track's own detection box should still be recoverable "
+        "from the unconfirmed list for debugging")
+
+
+def test_det_low_counts_toward_confirmation(blur_job):
+    """A det_low absorption is real (if weak) persistence evidence -- it can
+    only ever attach to an already-active track (never seed one), so it
+    demonstrates the same kind of repeated sighting a second "det" would."""
+    dets = [_d(blur_job, 0, 0.90), _d(blur_job, 3, 0.18)]  # seeds, then hysteresis-absorbs
+    tracks = _tracks(blur_job, dets, min_confident_hits=2)
+    assert len(tracks) == 1, (
+        "one det + one det_low should clear a confirmation bar of 2, since "
+        "det_low is real persistence evidence, not just interpolation/hold")
+    assert tracks[0].frames[3][1] == "det_low", "fixture did not absorb"
+
+
+def test_min_track_confirmations_defaults_to_one(blur_job):
+    assert blur_job.parse_args(BASE_ARGS).min_track_confirmations == 1
+
+
+def test_min_track_confirmations_is_overridable(blur_job):
+    cfg = blur_job.parse_args([*BASE_ARGS, "--min-track-confirmations", "2"])
+    assert cfg.min_track_confirmations == 2
+
+
+def test_min_track_confirmations_below_one_is_rejected(blur_job):
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--min-track-confirmations", "0"])
+
+
+def test_min_track_confirmations_is_not_in_the_checkpoint_fingerprint(blur_job):
+    """Like the operating thresholds, it's applied post-hoc to stored
+    detections (it's a property of how tracks get BUILT from them, not of
+    what the detector scored) -- changing it must REUSE the checkpoint, not
+    re-run 25 minutes of GPU."""
+    base = blur_job.parse_args([*BASE_ARGS])
+    raised = blur_job.parse_args([*BASE_ARGS, "--min-track-confirmations", "2"])
+    assert (blur_job.checkpoint_fingerprint(base, "2", False)
+            == blur_job.checkpoint_fingerprint(raised, "2", False))
+
+
+def test_build_audit_reports_n_unconfirmed_tracks(blur_job):
+    a = _audit(blur_job)
+    assert a["n_unconfirmed_tracks"] == 0, "must default to 0, not be absent"
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5}, {"fill_integrity_violations": 0},
+        {"n_candidate_misses": 0}, {"n_yunet_uncovered": 0}, "2",
+        n_unconfirmed_tracks=7)
+    assert audit["n_unconfirmed_tracks"] == 7
+
+
+def test_n_unconfirmed_tracks_does_not_force_needs_review(blur_job):
+    """Deliberate design choice, not an oversight: suppressing isolated-blip
+    noise is this gate's INTENDED behaviour whenever it's enabled, not a
+    symptom something went wrong. Gating status on it would flood
+    NEEDS_REVIEW on essentially every clip the gate is turned on for, and
+    defeat the point of having it -- unlike n_dropped_small, which pins a
+    genuinely rare edge case worth a human's attention every time."""
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5}, {"fill_integrity_violations": 0,
+                                          "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"n_yunet_uncovered": 0}, "2",
+        n_unconfirmed_tracks=50)
+    assert audit["status"] == "PASS_AUTOMATED", (
+        f"n_unconfirmed_tracks alone must never gate status: {audit['status_reasons']}")
+
+
+def test_audit_summary_prints_n_unconfirmed_tracks(blur_job, tmp_path):
+    clip = _clip(blur_job)
+    audit = blur_job.build_audit(
+        clip, {"n_frames_with_fill": 5}, {"fill_integrity_violations": 0,
+                                          "fill_integrity_checked": 5},
+        {"n_candidate_misses": 0}, {"yunet_skipped": "no model"}, "2",
+        n_unconfirmed_tracks=42)
+    p = tmp_path / "s.md"
+    blur_job.write_audit_summary(audit, clip, p)
+    text = p.read_text()
+    assert "n_unconfirmed_tracks: 42" in text, (
+        f"reaches the JSON manifest but not the markdown a human reads:\n{text}")

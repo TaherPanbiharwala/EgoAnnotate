@@ -275,6 +275,7 @@ class Config:
     back_hold_frames: int
     gen2_resize_px: int | None
     detect_batch: int
+    min_track_confirmations: int
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
@@ -315,6 +316,21 @@ def parse_args(argv: list[str] | None = None) -> Config:
                          "into view shipped unredacted from the moment it appeared "
                          "until the detector first caught it, typically 5-25 frames.")
     p.add_argument("--min-box-px", type=int, default=8)
+    p.add_argument("--min-track-confirmations", type=int, default=1,
+                    help="confident (det/det_low) hits a track needs before it "
+                         "gets ANY hold/fill at all. Default 1 = off, identical "
+                         "to previous behaviour: every track gets the full hold "
+                         "regardless of how many times it was actually seen. "
+                         "Measured on real footage (test-run-3): 335 of 392 "
+                         "face tracks had exactly one confident hit, and those "
+                         "alone accounted for 77.7%% of all redacted area — one "
+                         "false positive on a hand gets amplified into ~3s of "
+                         "gray box the same as a real, persistently-seen face. "
+                         "Raising this to 2 trades away a genuinely brief "
+                         "(single-hit) real sighting in exchange for "
+                         "suppressing that amplification; tracks with 2+ hits "
+                         "are completely unaffected either way. See "
+                         "build_tracks()'s docstring for the full measurement.")
     p.add_argument("--encode-preset", default="slow")
     p.add_argument("--encode-crf", type=int, default=18)
     p.add_argument("--budget-usd", type=float, default=3.00)
@@ -388,6 +404,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error(f"--gen2-resize-px {a.gen2_resize_px} is implausibly small.")
     if a.min_box_px < 0:
         p.error(f"--min-box-px {a.min_box_px} is negative.")
+    if a.min_track_confirmations < 1:
+        p.error(f"--min-track-confirmations {a.min_track_confirmations} must be >= 1 "
+                 f"— every track has at least one confident hit by construction, so "
+                 f"anything below 1 cannot mean anything stricter than 'off'.")
     for name, val in (("--face-threshold", a.face_threshold),
                        ("--lp-threshold", a.lp_threshold),
                        ("--sweep-threshold", a.sweep_threshold)):
@@ -459,6 +479,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         gen2_resize_px=a.gen2_resize_px,
         detect_batch=a.detect_batch,
         continue_threshold=a.continue_threshold,
+        min_track_confirmations=a.min_track_confirmations,
     )
 
 
@@ -1804,7 +1825,9 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
                   max_low_run: int = MAX_LOW_RUN_DEFAULT,
                   low_absorbed: list | None = None,
                   stride: int = 1,
-                  low_assoc_iou: float = LOW_ASSOC_IOU_DEFAULT) -> list[Track]:
+                  low_assoc_iou: float = LOW_ASSOC_IOU_DEFAULT,
+                  min_confident_hits: int = 1,
+                  unconfirmed: list | None = None) -> list[Track]:
     """Greedy nearest-IoU association across consecutive DETECTION frames
     (not every video frame — detections are already sparse at detect_hz),
     then linear interpolation across the gap between consecutive detection
@@ -1863,7 +1886,35 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
     absorptions — counting absorptions made the bound depend silently on
     --detect-hz (a coarser stride let the same "N absorptions" cover
     proportionally more real time). low_absorbed collects the accepted
-    low-band detections so the count is auditable instead of invisible."""
+    low-band detections so the count is auditable instead of invisible.
+
+    min_confident_hits (default 1, i.e. this gate off — byte-identical to
+    every existing caller and test). A track normally gets hold_frames
+    forward AND back_hold_frames backward regardless of how many real
+    detections seeded it — meaning one isolated false-positive blip (a
+    hand, a shadow, a doorknob at just the wrong angle) is amplified into
+    hold_frames + back_hold_frames video-frames of gray box, identically to
+    a track backed by fifty real sightings. Measured directly on real
+    footage (GX010057, test-run-3): 335 of 392 face tracks had exactly one
+    confident detection, and those tracks alone accounted for 77.7% of all
+    redacted area — 93.9% of all redacted area came from `hold` frames, not
+    real detections. A hand-checked sample of the worst single-detection
+    tracks was 0-for-7 real persistent faces (5 pure noise, 2 a genuine but
+    2-3-frame glimpse followed by more noise) — including both of the
+    highest-confidence ones (0.85, 0.87), so score does not discriminate
+    signal from noise here; persistence does. Real ByteTrack-style trackers
+    gate a track's output on a `min_hits`-style confirmation count for
+    exactly this reason.
+
+    Raising this above 1 trades away recall on a genuinely brief (sub-
+    min_confident_hits) real sighting in exchange for suppressing the
+    isolated-blip amplification above. Tracks that DO clear the bar are
+    completely unaffected — same hold, same interpolation, byte-identical
+    output — so this can only ever remove coverage from single-hit tracks,
+    never touch a persistent one. unconfirmed collects the rejected Track
+    objects so the count is auditable, the same reasoning as dropped_small
+    and low_absorbed above: a confident detection that gets suppressed must
+    never vanish without a trace."""
     if dropped_small is None:
         dropped_small = []
     hysteresis = start_thresh is not None and cont_thresh is not None
@@ -2034,7 +2085,22 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
     # fill_integrity only inspects frames the fill_map already claims, and
     # YuNet samples on the same stride, so it looks at the very frame that
     # IS covered.
+    if unconfirmed is None:
+        unconfirmed = []
+    confirmed: list[Track] = []
     for tr in tracks:
+        # See min_confident_hits in the docstring above: a track under the
+        # bar gets NO hold and NO fill at all, not a shortened one — the
+        # amplification this gate exists to stop happens entirely in the
+        # hold/interpolation step below, so skipping straight past it is
+        # what removes it. tr.frames still holds exactly the raw det/det_low
+        # entries it was matched on; nothing here mutates or grows it.
+        n_confident = sum(1 for _box, source in tr.frames.values()
+                           if source in ("det", "det_low"))
+        if n_confident < min_confident_hits:
+            unconfirmed.append(tr)
+            continue
+
         last_frame = max(tr.frames)
         last_box, _ = tr.frames[last_frame]
         for f in range(last_frame + 1, last_frame + 1 + hold_frames):
@@ -2044,8 +2110,9 @@ def build_tracks(detections: list[Detection], min_box_px: int, iou_thresh: float
         first_box, _ = tr.frames[first_frame]
         for f in range(max(0, first_frame - back_hold_frames), first_frame):
             tr.frames.setdefault(f, (first_box, "hold"))
+        confirmed.append(tr)
 
-    return tracks
+    return confirmed
 
 
 def _interpolate(tr: Track, f0: int, box0: tuple, f1: int, box1: tuple) -> None:
@@ -2439,7 +2506,8 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
                  yunet: dict, gen: str, n_dropped_small: int = 0,
                  lp_checked: bool = True, n_face_fill_frames: int | None = None,
                  n_low_absorbed: int = 0,
-                 det_low_frames: list[int] | None = None) -> dict:
+                 det_low_frames: list[int] | None = None,
+                 n_unconfirmed_tracks: int = 0) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -2549,6 +2617,16 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # could otherwise put thousands of entries in every manifest.
         "det_low_frames": (det_low_frames or [])[:AUDIT_MAX_ITEMS],
         "det_low_frames_truncated": max(0, len(det_low_frames or []) - AUDIT_MAX_ITEMS),
+        # How many tracks --min-track-confirmations suppressed for having too
+        # few confident hits (see build_tracks()'s docstring for the
+        # measurement motivating this). Deliberately NOT a status_reasons
+        # trigger, unlike n_dropped_small: suppressing isolated-blip noise is
+        # this gate's INTENDED, expected behaviour whenever it's enabled, not
+        # a symptom something went wrong — flagging every occurrence would
+        # flood NEEDS_REVIEW on essentially every clip the gate is turned on
+        # for, and defeat the point of having it. Reported here so the
+        # count is never invisible, not so it's alarming.
+        "n_unconfirmed_tracks": n_unconfirmed_tracks,
         # False means no plate detector ran at all. Recorded so a face-only
         # run is never later read as "this clip has no license plates".
         "lp_checked": lp_checked,
@@ -2620,6 +2698,9 @@ def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
         f"yunet_uncovered: {audit.get('n_yunet_uncovered', 'n/a') if audit.get('yunet_ran') else 'SKIPPED — see note'}  (hard gate when run — review these first)",
         f"max_fill_area_frac: {audit.get('max_fill_area_frac', 0):.4f}  (runaway false-positive canary)",
         f"n_low_absorbed: {n_low_absorbed}  (hysteresis-absorbed low-confidence detections{low_detail})",
+        f"n_unconfirmed_tracks: {audit.get('n_unconfirmed_tracks', 0)}  "
+        f"(isolated single-hit tracks suppressed by --min-track-confirmations; "
+        f"0 when it's at its default of 1)",
         "",
         audit["note"],
     ]
@@ -2669,6 +2750,10 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             "dilate_scale": cfg.dilate_scale, "motion_margin_px": cfg.motion_margin_px,
             "hold_frames": hold_frames, "back_hold_frames": back_hold_frames,
             "min_box_px": cfg.min_box_px,
+            # 1 = off (every track held regardless of hit count, prior
+            # behaviour). Changes what a track's hold/fill actually reflects,
+            # so it belongs here for the same reason hold_frames does.
+            "min_track_confirmations": cfg.min_track_confirmations,
             # None = native resolution. Recorded because it changes the scale
             # the model runs at, and therefore what a score MEANS — two runs
             # at different values are not comparable.
@@ -2793,13 +2878,20 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     stride = max(1, round(clip.fps / cfg.detect_hz))
     dropped_small: list[Detection] = []
     low_absorbed: list[Detection] = []
+    unconfirmed: list[Track] = []
     track_input, start_thresh, cont_thresh = resolve_hysteresis(
         cfg, detections, redact_dets, operating)
     tracks = build_tracks(track_input, cfg.min_box_px, iou_thresh=TRACK_IOU_DEFAULT,
                            hold_frames=hold_frames, back_hold_frames=back_hold,
                            dropped_small=dropped_small,
                            start_thresh=start_thresh, cont_thresh=cont_thresh,
-                           low_absorbed=low_absorbed, stride=stride)
+                           low_absorbed=low_absorbed, stride=stride,
+                           min_confident_hits=cfg.min_track_confirmations,
+                           unconfirmed=unconfirmed)
+    if cfg.min_track_confirmations > 1:
+        log.info("%s: %d track(s) suppressed for having fewer than %d confident "
+                  "hit(s) (isolated-blip amplification guard)", clip.clip_id,
+                  len(unconfirmed), cfg.min_track_confirmations)
     if cfg.continue_threshold:
         log.info("%s: hysteresis absorbed %d low-confidence detection(s) into "
                   "existing tracks (continue>%.2f, start>%.2f)", clip.clip_id,
@@ -2856,7 +2948,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                          lp_checked=lp_det is not None,
                          n_face_fill_frames=n_face_fill_frames,
                          n_low_absorbed=len(low_absorbed),
-                         det_low_frames=det_low_frames)
+                         det_low_frames=det_low_frames,
+                         n_unconfirmed_tracks=len(unconfirmed))
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {
