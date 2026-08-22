@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -697,3 +698,40 @@ def test_directory_tree_hash_uses_caller_specific_error_codes(stage2_job, tmp_pa
     assert dino_caught.value.code == "DINO_SNAPSHOT_UNVERIFIABLE"
     assert "DINO" in dino_caught.value.message
     assert "SAM2" not in dino_caught.value.message
+
+
+def test_directory_tree_hash_allows_a_symlink_contained_within_the_tree(stage2_job, tmp_path):
+    # Matches the real facebookresearch/sam2 layout: a legacy top-level
+    # config file is a symlink into configs/ within the SAME installed tree
+    # -- e.g. sam2_hiera_t.yaml -> configs/sam2/sam2_hiera_t.yaml. The git
+    # revision/remote/clean-worktree checks already prove this exact tree,
+    # symlink included, is what the pinned upstream commit contains, so this
+    # must not be rejected as unverifiable.
+    package = tmp_path / "sam2"
+    (package / "configs" / "sam2").mkdir(parents=True)
+    real_config = package / "configs" / "sam2" / "sam2_hiera_t.yaml"
+    real_config.write_bytes(b"model: hiera_t")
+    legacy_alias = package / "sam2_hiera_t.yaml"
+    legacy_alias.symlink_to(Path("configs/sam2/sam2_hiera_t.yaml"))
+
+    before = stage2_job.sha256_directory_tree(package)
+
+    # The symlink's target content must actually be covered by the hash,
+    # not silently skipped once let through.
+    real_config.write_bytes(b"model: hiera_t_tampered")
+    after = stage2_job.sha256_directory_tree(package)
+    assert before != after
+
+
+def test_directory_tree_hash_rejects_a_symlink_escaping_the_tree(stage2_job, tmp_path):
+    package = tmp_path / "sam2"
+    package.mkdir()
+    (package / "config.yaml").write_bytes(b"model: hiera_l")
+    outside = tmp_path / "outside-secret.yaml"
+    outside.write_bytes(b"attacker controlled")
+    (package / "escaped.yaml").symlink_to(outside)
+
+    with pytest.raises(stage2_job.Stage2Error) as caught:
+        stage2_job.sha256_directory_tree(package)
+    assert caught.value.code == "SAM_RUNTIME_UNVERIFIABLE"
+    assert "outside its own tree" in caught.value.message

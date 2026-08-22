@@ -651,10 +651,22 @@ def sha256_directory_tree(
             if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
                 continue
             if path.is_symlink():
-                raise Stage2Error(
-                    unverifiable_code,
-                    f"The {description} contains a symbolic link: {path}",
-                )
+                # A symlink whose target stays inside root is just another
+                # way this exact, already-verified tree names one of its own
+                # files (e.g. SAM2 ships legacy top-level config symlinks
+                # pointing into configs/) — the caller's own revision/
+                # remote/clean-worktree checks already prove the whole tree,
+                # symlink included, is exactly what the pinned upstream
+                # commit contains. Only a symlink that ESCAPES root points
+                # at content this function can't vouch for.
+                try:
+                    resolved_target = path.resolve(strict=True)
+                    resolved_target.relative_to(root)
+                except (OSError, ValueError) as exc:
+                    raise Stage2Error(
+                        unverifiable_code,
+                        f"The {description} contains a symbolic link outside its own tree: {path}",
+                    ) from exc
             if path.is_file():
                 found.append(path)
         return sorted(found, key=lambda item: item.relative_to(root).as_posix())
