@@ -278,7 +278,7 @@ cost):
 uv run jobs/10_blur_egoblur.py --input-dir /workspace/in --output-dir /workspace/out2 \
   --run-id test-run-3 --gen 2 \
   --face-weights-gen2 /workspace/weights/ego_blur_face_gen2.jit \
-  --face-threshold 0.30 --hold-frames 45 \
+  --face-threshold 0.30 --hold-frames 45 --min-track-confirmations 2 \
   --gpu-rate-usd-per-hr <actual $/hr> --skip-shutdown
 ```
 
@@ -292,6 +292,16 @@ not lower the threshold again without re-testing against real footage
 first (visually, not just by the numbers — this exact regression looked
 fine in aggregate stats and only showed up when a human watched the
 video).
+
+`--min-track-confirmations 2` (commit `39055e2` on `master`) suppresses
+hold/fill entirely for tracks with fewer than 2 confident detections —
+measured directly on this clip, single-hit tracks were 335 of 392 face
+tracks and accounted for 77.7% of all redacted area, almost entirely
+noise. Default is `1` (off, byte-identical to the prior behavior); `2`
+is the value this Stage II worktree's `EXPECTED_STAGE1` pin now
+requires — a Stage I manifest produced without it will fail Stage II's
+input validation closed rather than silently proceeding on a redaction
+config Stage II never recorded.
 
 ## Known open work (real, scoped, not busywork)
 

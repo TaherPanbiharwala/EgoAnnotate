@@ -217,7 +217,7 @@ The current best-known `GX010057` Stage I settings remain:
 uv run jobs/10_blur_egoblur.py --input-dir /workspace/in --output-dir /workspace/out2 \
   --run-id test-run-3 --gen 2 \
   --face-weights-gen2 /workspace/weights/ego_blur_face_gen2.jit \
-  --face-threshold 0.30 --hold-frames 45 \
+  --face-threshold 0.30 --hold-frames 45 --min-track-confirmations 2 \
   --gpu-rate-usd-per-hr <actual $/hr> --skip-shutdown
 ```
 
@@ -226,6 +226,14 @@ wearer's hands heavily. The Stage I fill-integrity findings were measured and
 confirmed to be mild H.264 quantization, not exposed face pixels. Preserve the
 `NEEDS_REVIEW` evidence rather than treating the clip as an invalid Stage II
 input.
+
+`--min-track-confirmations 2` (EgoBlur commit `39055e2` on `master`, after
+this worktree's base) suppresses hold/fill for tracks with fewer than 2
+confident detections — single-hit tracks were 335 of 392 face tracks and
+77.7% of all redacted area on this clip, almost entirely noise. This
+worktree's `EXPECTED_STAGE1` now pins it to `2`; a Stage I manifest produced
+without this flag (or with a different value) fails Stage II input
+validation closed.
 
 Two older EgoBlur issues remain outside current Stage II scope:
 

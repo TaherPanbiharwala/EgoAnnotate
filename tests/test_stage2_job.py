@@ -65,6 +65,7 @@ def _inputs(stage2_job, tmp_path, *, status="NEEDS_REVIEW", violations=12):
             "min_box_px": 8,
             "gen2_resize_px": None,
             "detect_batch": 8,
+            "min_track_confirmations": 2,
         },
         "output": {
             "path": stage1.name,
@@ -172,6 +173,7 @@ def test_zero_integrity_checks_without_zero_redaction_reason_fail(stage2_job, tm
         ("motion_margin_px", 0),
         ("hold_frames", 44),
         ("back_hold_frames", 44),
+        ("min_track_confirmations", 1),
     ],
 )
 def test_stage1_frozen_settings_are_strict(stage2_job, tmp_path, field, bad_value):

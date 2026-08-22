@@ -128,6 +128,7 @@ Do not modify EgoBlur's known completed-manifest config-matching behavior in thi
 - Gen2 face detector;
 - face threshold `0.30`;
 - hold frames `45`;
+- track confirmation minimum `2` (suppresses hold/fill for single-hit tracks — see `AGENTS.md`);
 - hysteresis disabled;
 - plate detector disabled;
 - expected dilation/motion-margin settings;

@@ -109,6 +109,13 @@ EXPECTED_STAGE1 = {
     "motion_margin_px": 8,
     "hold_frames": 45,
     "back_hold_frames": 45,
+    # Suppresses hold/fill entirely for tracks with fewer than 2 confident
+    # detections (single-hit tracks were 77.7% of all redacted area on
+    # GX010057 and almost entirely noise). Changes what a track's hold/fill
+    # actually reflects, same as hold_frames/back_hold_frames above, so it
+    # gets the same fail-closed pin — a batch must not silently mix clips
+    # produced with and without this gate.
+    "min_track_confirmations": 2,
 }
 
 PROCESSING_STATES = (
