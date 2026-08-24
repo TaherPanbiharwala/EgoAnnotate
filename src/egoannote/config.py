@@ -85,7 +85,7 @@ MAX_PLAUSIBLE_DELTA_PER_FRAME: Final[float] = 0.25
 # Caption generation knobs
 # ---------------------------------------------------------------------------
 
-CAPTION_PROMPT_VERSION: Final[str] = "v3"
+CAPTION_PROMPT_VERSION: Final[str] = "v4"
 CAPTION_PROMPT_FILE: Final[Path] = PROMPTS_DIR / f"caption_{CAPTION_PROMPT_VERSION}.txt"
 
 # S1's ordered-list-of-actions schema is longer than v1's single v2.5 object;

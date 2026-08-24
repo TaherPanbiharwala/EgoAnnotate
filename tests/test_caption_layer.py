@@ -191,6 +191,20 @@ def test_zero_extracted_frames_is_not_a_silent_success(monkeypatch, tmp_path):
     store.close()
 
 
+def test_pilot_rejects_a_window_outside_the_video(stub_media, tmp_path):
+    store = Store(tmp_path / "run.db")
+    with pytest.raises(ValueError, match="do not exist"):
+        capmod.caption_video(
+            Path("fake.mp4"),
+            "v",
+            _Backend(),
+            store,
+            frames_dir=tmp_path / "frames",
+            window_indices={99},
+        )
+    store.close()
+
+
 def test_resume_reuses_cached_frames_instead_of_re_extracting(monkeypatch, tmp_path):
     """Measured before this fix: extracting 1.5h of 1080p cost ~14.5 min and
     up to 2.8 GB, into a TemporaryDirectory that was deleted on exit. A
@@ -254,8 +268,38 @@ def test_frame_cache_is_isolated_per_video_id(monkeypatch, tmp_path):
 
     assert len(seen_dirs) == 2, "distinct video_ids must each extract"
     assert seen_dirs[0] != seen_dirs[1]
-    assert seen_dirs[0].name == "vid-a"
-    assert seen_dirs[1].name == "vid-b"
+    assert seen_dirs[0].name == ".vid-a.partial"
+    assert seen_dirs[1].name == ".vid-b.partial"
+    store.close()
+
+
+def test_nonempty_cache_without_completion_marker_is_rebuilt(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        capmod,
+        "probe",
+        lambda v: VideoInfo(6.0, 640, 360, 30.0, 180, False),
+    )
+    frames = tmp_path / "frames"
+    stale = frames / "vid"
+    stale.mkdir(parents=True)
+    (stale / "frame_000001.jpg").write_bytes(b"interrupted")
+    extractions = {"n": 0}
+
+    def _extract(video, fps, out_dir, long_edge=None):
+        extractions["n"] += 1
+        paths = []
+        for i in range(8):
+            p = Path(out_dir) / f"frame_{i:06d}.jpg"
+            p.write_bytes(b"jpeg")
+            paths.append(p)
+        return paths
+
+    monkeypatch.setattr(capmod, "extract_frames", _extract)
+    store = Store(tmp_path / "run.db")
+    capmod.caption_video(Path("fake.mp4"), "vid", _Backend(), store, frames_dir=frames)
+    assert extractions["n"] == 1
+    assert (stale / "_COMPLETE.json").exists()
+    assert len(list(stale.glob("frame_*.jpg"))) == 8
     store.close()
 
 

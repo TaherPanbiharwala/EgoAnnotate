@@ -1,0 +1,100 @@
+You are annotating egocentric (first-person) video for a robotics training dataset.
+Below are {n_frames} consecutive frames sampled from one clip, evenly spaced. The
+camera is worn on the person's head or wrist -- you see what they see. Each frame is
+labeled "Frame N" (N = 0..{max_frame_idx}) immediately before the image.
+
+Create three synchronized descriptions covering the whole {window_seconds} seconds:
+1. ONE holistic activity caption describing the wearer's overall activity now.
+2. An ordered list of every distinct atomic action, with visible frame boundaries.
+3. For every atomic action, one natural-language caption for EACH visible hand.
+
+Return ONE JSON object, no markdown fences, no prose before or after:
+
+{
+  "activity": {
+    "caption":    "<one complete sentence describing the overall activity in this window>",
+    "goal":       "<one short sentence for the visible immediate subgoal, or null>",
+    "phase":      "starting|preparing|executing|checking|transitioning|finishing|idle",
+    "progression": "starts|continues|changes|completes|unclear"
+  },
+  "actions": [
+    {
+      "start_frame": 0,
+      "end_frame": 3,
+      "action_caption": "<one complete sentence describing this atomic action>",
+      "task_step":      "<snake_case_label, <=24 chars, e.g. rinse_carrot>",
+      "left_hand": {
+        "caption":      "<one sentence saying what the wearer's left hand does, or null>",
+        "verb":         "<gerund: grasping, pinching, twisting, holding, reaching, ...>",
+        "object":       "<short noun phrase: 'ceramic mug', 'green stem'>",
+        "target":       "<noun phrase where action is directed, or null>",
+        "contact_type": "grip|push|pull|tap|slide|twist|pinch|reach|release|none",
+        "visible":      true
+      },
+      "right_hand": { "same shape as left_hand" },
+      "tool_in_use":    "knife|peeler|spatula|spoon|tongs|cloth|brush|none|<short_other>",
+      "coordination":   "independent|supporting|coordinated|none",
+      "handover_event": false,
+      "scene": {
+        "what":     "<2 sentences describing the action, third person>",
+        "how":      "<2 sentences: grip type, posture, or coordination>",
+        "why":      "<1 sentence: the immediate goal of THIS action only>",
+        "location": "<short noun phrase, 2-5 words>"
+      }
+    }
+  ]
+}
+
+Activity rules:
+- activity.caption is the ONE holistic caption for this window. Describe the combined
+  activity, not separate left/right-hand motions. Use present progressive, begin with
+  "The person", and name the main manipulated objects when visible.
+- activity.goal is only the immediate visible subgoal. Use null when the goal cannot
+  be supported by these frames; do not guess a recipe, repair, or long-horizon task.
+- progression describes change visible INSIDE this window. Because you cannot see the
+  previous or next window, use "continues" only when one activity spans these frames,
+  "starts" or "completes" only when that transition is visibly contained here, and
+  "unclear" when the sampled frames do not support a choice.
+- phase describes the current role of this window in the visible activity, not its
+  absolute place in the full unseen video.
+
+Atomic action and hand rules:
+- start_frame / end_frame are INTEGERS 0-{max_frame_idx}, referring to the labeled "Frame N" images
+  above. Use the frame where the action visibly BEGINS and the frame where it visibly
+  ENDS (or the last frame, if it continues past the end of this clip). Do NOT invent a
+  fractional or in-between value. If you cannot tell exactly, pick the nearest sampled
+  frame.
+- If ONLY ONE action occurs across the whole clip, return a single action with
+  start_frame=0, end_frame={max_frame_idx}.
+- If a SHORT action is fully visible within 1-2 frames, still list it separately.
+- action_caption is one concise, complete sentence for the atomic action. It may
+  mention both hands, but must stay within that action's frame range.
+- left_hand / right_hand refer to the WEARER'S anatomical hands, not screen-left/right.
+- For each visible hand, caption is REQUIRED and must state that hand's specific action,
+  object, and target when visible. Start with "The left hand" or "The right hand".
+- If a hand is off-frame for the majority of this action's frame range, set
+  visible=false and set caption, verb, object, target, and contact_type to null.
+- Do not infer that an occluded hand keeps holding an object. Record only visible evidence.
+- target is distinct from object: for "placing berry into bowl", object="berry",
+  target="blue bowl". For "twisting jar lid", object="jar lid", target=null.
+- contact_type is closed vocabulary. Use "none" only when visible=true but the hand is
+  not in contact with anything, such as reaching.
+- task_step is snake_case, present-tense, and verb-led ("rinse_carrot",
+  "transfer_to_pan", "open_drawer"). Choose a predictable generic verb_noun label.
+- handover_event is true only when one hand visibly passes an object to the other.
+- tool_in_use names ONE primary tool. If multiple tools are visible, choose the one
+  actively wielded. Use "none" when hands are bare.
+- coordination is "supporting" when one hand stabilizes what the other manipulates,
+  "coordinated" when both act on the same object together, "independent" when acting
+  on different objects, and "none" when one or both hands are not visible.
+- scene.what describes the manipulation and names objects concretely. Start with
+  "Person" or "The person" and prefer specific verbs.
+- scene.why is the immediate intent served by THIS action, not the whole clip.
+
+Hard rules:
+- Output a single JSON object. No code fences, no leading "Here is", no trailing notes.
+- No "appears to", "seems to", or "is probably". State supported observations directly.
+- No long-horizon speculation. Stay within the visible frame range.
+- Do not invent objects that are off-frame or hidden by privacy blur.
+- Split whenever the hands visibly change what they are doing. Do not merge distinct
+  actions because they are adjacent, and do not invent a transition you cannot see.

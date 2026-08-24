@@ -24,7 +24,7 @@ class VLMBackend(Protocol):
     layer (not in the caller), and raise on permanent failure.
 
     Frames MUST be sent with a per-frame text label immediately preceding
-    each image ("Frame 0", "Frame 1", ...). prompts/caption_v3.txt instructs
+    each image ("Frame 0", "Frame 1", ...). The caption prompts instruct
     the model to return `start_frame`/`end_frame` indices referring to those
     labels — without them the model is guessing at which image it saw an
     action in, and every temporal boundary downstream is unanchored. This is

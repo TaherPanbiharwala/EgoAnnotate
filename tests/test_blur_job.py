@@ -1713,7 +1713,7 @@ def test_low_run_budget_scales_with_stride(blur_job):
     must become CORRECT regardless of --detect-hz."""
     dets = [_d(blur_job, 0, 0.90)] + [_d(blur_job, f, 0.18) for f in (10, 20, 30, 40)]
     absorbed = []
-    tracks = blur_job.build_tracks(
+    blur_job.build_tracks(
         dets, 8, blur_job.TRACK_IOU_DEFAULT, hold_frames=60, back_hold_frames=60,
         stride=10, max_low_run=4, low_absorbed=absorbed,
         start_thresh=_HYST_START, cont_thresh=_HYST_CONT)

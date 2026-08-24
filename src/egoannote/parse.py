@@ -1,6 +1,6 @@
 """Parse the VLM's ordered-action-list response into validated records.
 
-Schema (see prompts/caption_v3.txt): one window returns a LIST of actions,
+Legacy V3 schema (see prompts/caption_v3.txt): one window returns a LIST of actions,
 each shaped like v1's single v2.5 object, plus start_frame/end_frame giving
 its position within the window's 8 frames:
 
@@ -41,7 +41,7 @@ import logging
 import re
 from typing import Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from . import config
 
@@ -54,6 +54,10 @@ CONTACT_TYPE_VOCAB = {
     "grip", "push", "pull", "tap", "slide", "twist", "pinch", "reach", "release", "none",
 }
 COORDINATION_VOCAB = {"independent", "supporting", "coordinated", "none"}
+ACTIVITY_PHASE_VOCAB = {
+    "starting", "preparing", "executing", "checking", "transitioning", "finishing", "idle",
+}
+PROGRESSION_VOCAB = {"starts", "continues", "changes", "completes", "unclear"}
 
 TASK_STEP_RE = re.compile(r"^[a-z][a-z0-9_]{0,23}$")
 
@@ -66,6 +70,10 @@ LEN_CAP = {
     "object": 80,
     "target": 80,
     "tool_in_use": 24,
+    "activity.caption": 500,
+    "activity.goal": 240,
+    "action_caption": 400,
+    "hand.caption": 240,
 }
 
 # A frame index outside [0, VLM_WINDOW_FRAMES-1] is a schema violation, not
@@ -103,6 +111,32 @@ class ActionItem(BaseModel):
 
 class ActionsResponse(BaseModel):
     actions: list[ActionItem]
+
+
+class DenseHandBlock(HandBlock):
+    """The structured hand relation plus a natural-language hand track."""
+
+    caption: str | None = None
+
+
+class ActivityBlock(BaseModel):
+    """One holistic caption for the current window, independent of hand slots."""
+
+    caption: str = Field(min_length=1)
+    goal: str | None = None
+    phase: str | None = None
+    progression: str | None = None
+
+
+class DenseActionItem(ActionItem):
+    action_caption: str = Field(min_length=1)
+    left_hand: DenseHandBlock = DenseHandBlock()
+    right_hand: DenseHandBlock = DenseHandBlock()
+
+
+class DenseCaptionResponse(BaseModel):
+    activity: ActivityBlock
+    actions: list[DenseActionItem]
 
 
 def _strip_code_fence(raw: str) -> str:
@@ -201,14 +235,15 @@ def _clamp_hand(hand: HandBlock) -> dict:
     obj = _clamp_str(hand.object, LEN_CAP["object"])
     target = _clamp_str(hand.target, LEN_CAP["target"])
     contact = _normalize_vocab(hand.contact_type, CONTACT_TYPE_VOCAB)
+    caption = _clamp_str(getattr(hand, "caption", None), LEN_CAP["hand.caption"])
 
     if visible is True and verb is None:
-        visible, verb, obj, target, contact = False, None, None, None, None
+        visible, verb, obj, target, contact, caption = False, None, None, None, None, None
     if visible is False:
-        verb, obj, target, contact = None, None, None, None
+        verb, obj, target, contact, caption = None, None, None, None, None
 
     return {"verb": verb, "object": obj, "target": target,
-            "contact_type": contact, "visible": visible}
+            "contact_type": contact, "visible": visible, "caption": caption}
 
 
 def _frame_range_ok(item: ActionItem, n_frames: int) -> bool:
@@ -247,6 +282,9 @@ def _clamp_action(item: ActionItem) -> dict:
     return {
         "start_frame": item.start_frame,
         "end_frame": item.end_frame,
+        "action_caption": _clamp_str(
+            getattr(item, "action_caption", None), LEN_CAP["action_caption"]
+        ),
         "task_step": _slugify_task_step(item.task_step),
         "left_hand": _clamp_hand(item.left_hand),
         "right_hand": _clamp_hand(item.right_hand),
@@ -258,6 +296,35 @@ def _clamp_action(item: ActionItem) -> dict:
         "scene_why": _clamp_str(item.scene.why, LEN_CAP["scene.why"]),
         "scene_location": _clamp_str(item.scene.location, LEN_CAP["scene.location"]),
     }
+
+
+def _clamp_activity(activity: ActivityBlock) -> dict:
+    return {
+        "caption": _clamp_str(activity.caption, LEN_CAP["activity.caption"]),
+        "goal": _clamp_str(activity.goal, LEN_CAP["activity.goal"]),
+        "phase": _normalize_vocab(activity.phase, ACTIVITY_PHASE_VOCAB),
+        "progression": _normalize_vocab(activity.progression, PROGRESSION_VOCAB),
+    }
+
+
+def _dense_hand_ok(hand: DenseHandBlock) -> bool:
+    """Check the dense-hand fields *after* their output normalization.
+
+    Pydantic accepts whitespace-only strings and the closed vocabularies are
+    deliberately normalized after validation.  The schema-validity flag must
+    describe the stored record, not the pre-normalized response: otherwise a
+    model can return ``visible=true`` plus ``caption=\"   \"`` and the stored
+    caption becomes ``None`` while ``schema_ok`` incorrectly remains true.
+    """
+    visible = hand.visible
+    if not isinstance(visible, bool):
+        return False
+    if not visible:
+        return True
+    return bool(
+        _clamp_str(hand.caption, LEN_CAP["hand.caption"])
+        and _clamp_str(hand.verb, LEN_CAP["verb"])
+    )
 
 
 def parse_caption_v3(raw: str, n_frames: int = config.VLM_WINDOW_FRAMES) -> dict:
@@ -328,3 +395,64 @@ def parse_caption_v3(raw: str, n_frames: int = config.VLM_WINDOW_FRAMES) -> dict
         ]
 
     return {"actions": actions, "raw_json": raw, "_schema_ok": schema_ok}
+
+
+def parse_caption_v4(raw: str, n_frames: int = config.VLM_WINDOW_FRAMES) -> dict:
+    """Parse the dense multi-track caption schema used by ``caption_v4``.
+
+    V4 deliberately keeps three parallel representations in one atomic VLM
+    response: a holistic window activity caption, ordered atomic actions, and
+    a natural-language caption for each visible hand. The v3 parser remains
+    available for old stored responses; new runs are strict about the v4
+    fields so a legacy-looking response cannot silently masquerade as dense.
+    """
+    s = _strip_code_fence(raw)
+    obj = _try_json_loads(s)
+    if obj is None:
+        obj = _try_json_repair(s)
+
+    if obj is not None:
+        try:
+            validated = DenseCaptionResponse.model_validate(obj)
+            if validated.actions:
+                ranges_ok = all(_frame_range_ok(a, n_frames) for a in validated.actions)
+                activity = _clamp_activity(validated.activity)
+                actions = [_clamp_action(a) for a in validated.actions]
+                dense_fields_ok = (
+                    bool(activity["caption"])
+                    and activity["phase"] is not None
+                    and activity["progression"] is not None
+                    and all(
+                        bool(action["action_caption"])
+                        and _dense_hand_ok(source.left_hand)
+                        and _dense_hand_ok(source.right_hand)
+                        for action, source in zip(actions, validated.actions, strict=True)
+                    )
+                )
+                schema_ok = ranges_ok and dense_fields_ok
+                if not schema_ok:
+                    log.warning(
+                        "parse v4: invalid frame range or incomplete dense fields "
+                        "for a %d-frame window", n_frames,
+                    )
+                return {
+                    "activity": activity,
+                    "actions": actions,
+                    "raw_json": raw,
+                    "_schema_ok": schema_ok,
+                }
+        except ValidationError:
+            pass
+
+    log.warning(
+        "parse v4: dense schema validation failed; preserving a degraded v3 "
+        "action so the raw response remains inspectable (first 200 chars: %r)",
+        s[:200],
+    )
+    legacy = parse_caption_v3(raw, n_frames=n_frames)
+    return {
+        "activity": {"caption": None, "goal": None, "phase": None, "progression": None},
+        "actions": legacy["actions"],
+        "raw_json": raw,
+        "_schema_ok": False,
+    }

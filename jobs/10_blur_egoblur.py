@@ -2828,7 +2828,7 @@ def resolve_hysteresis(cfg: Config, detections: list, redact_dets: list,
         return redact_dets, None, None
     # The FULL list, low band included. build_tracks does the filtering:
     # above-operating seeds a track, above-continue merely extends one.
-    return detections, operating, {c: cfg.continue_threshold for c in operating}
+    return detections, operating, dict.fromkeys(operating, cfg.continue_threshold)
 
 
 def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,

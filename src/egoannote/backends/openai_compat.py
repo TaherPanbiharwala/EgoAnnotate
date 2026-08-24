@@ -136,7 +136,7 @@ class OpenAICompatBackend:
             )
 
         # Instruction first, then LABEL-then-IMAGE pairs. The per-frame text
-        # label is not decoration: prompts/caption_v3.txt asks the model to
+        # label is not decoration: the caption prompt asks the model to
         # return start_frame/end_frame referring to these markers. Sending
         # bare images (as an earlier version of this file did) leaves every
         # temporal index the model returns completely unanchored.

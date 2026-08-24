@@ -46,6 +46,31 @@ _DETECTOR_VERSION = f"mediapipe-{mp.__version__}-hand_landmarker.task"
 Landmarks = list[float]  # 63 floats: 21 x (x, y, z)
 
 
+class HandDecodeError(RuntimeError):
+    """The decoder did not yield every frame advertised by ffprobe."""
+
+
+def _expected_sample_count(source_frames: int, stride: int) -> int:
+    """Number of indices in ``range(0, source_frames, stride)``."""
+    return (source_frames + stride - 1) // stride
+
+
+def _require_complete_sampling(*, emitted: int, expected: int, video: Path) -> None:
+    """Reject a partial decode instead of publishing a truncated hand track.
+
+    OpenCV returns ``False`` both at ordinary EOF and after a decoder error.
+    Comparing its emitted sample count to ffprobe's source-frame count keeps
+    those states distinct. A partial parquet is deliberately left for
+    diagnostics, but the caller must not mark the stage complete.
+    """
+    if emitted != expected:
+        raise HandDecodeError(
+            f"decoded only {emitted}/{expected} expected sampled frames from {video}. "
+            "The video is truncated or corrupt; regenerate/restore the redacted "
+            "artifact before running MediaPipe."
+        )
+
+
 def _ensure_model(models_dir: Path) -> Path:
     """Download the HandLandmarker model, atomically.
 
@@ -398,6 +423,11 @@ def run(
         log.info(
             "hands: %s -- %d frames in %.1fs (%.1f fps)",
             video_id, emitted_idx, elapsed, emitted_idx / max(elapsed, 1e-9),
+        )
+        _require_complete_sampling(
+            emitted=emitted_idx,
+            expected=_expected_sample_count(info.n_frames, stride),
+            video=video,
         )
     finally:
         detector.close()

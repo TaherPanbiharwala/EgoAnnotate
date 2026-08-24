@@ -6,8 +6,34 @@ visual spot-check) and two of the three remaining hysteresis blockers got
 fixed. Repo HEAD at time of writing: **`5cca081`** — but the working tree
 has real, tested, uncommitted changes on top of that (see "What's
 uncommitted right now" below); this is **not** a clean-tree handoff.
-279 tests passing (`uv run --extra test pytest tests/ -q`), including the
+316 tests passing (`uv run --extra test pytest tests/ -q`), including the
 uncommitted work.
+
+## Latest pipeline attempt — blocked on a corrupt redacted artifact (2026-08-24)
+
+The first real MediaPipe/VLM pilot was started from `master` using
+`GX010057.blurred.mp4`; Stage 2 was not invoked. The result is **not
+usable**: ffprobe advertises 8,134 frames / 271.4 seconds, but a full
+FFmpeg decode reports a 99.5% H.264 decode-error rate. MediaPipe emitted
+only 14 of the expected 4,067 samples at the configured ~15 FPS. The
+private pilot manifest records `hands.status = failed_incomplete_decode`;
+do not publish or reuse its `hands.parquet`.
+
+The pipeline now rejects this failure mode in two places: the MediaPipe
+generator compares its emitted sample count with ffprobe's expected count,
+and a pre-existing `hands.parquet` is checked before resume. A partial
+decode can no longer be marked complete or silently reused. Focused tests
+for both guards pass.
+
+**Resume path:** restore/locate the original `GX010057`, regenerate a new
+EgoBlur derivative with the documented `test-run-3` settings and preserve
+its passing manifest, then run a fresh MediaPipe/VLM pilot directory. The
+original is not presently in this repository, and the old derivative must
+not be repaired or used as an annotation input. Captioning additionally
+needs two real, cross-lab VLM entries (including verified prices/provider
+pins) in `models.toml` and `OPENROUTER_API_KEY`; only placeholders exist
+today. MediaPipe and VLM continue to read redacted video only. WiLoR,
+SAM2, and DepthV3 remain future original-only private stages.
 
 ## The project, in one paragraph
 
@@ -401,9 +427,14 @@ for later**:
 2. Optionally address the resumed-batch config-drift gap (see "Still
    open" above) — lower urgency, doesn't block a single uninterrupted
    16-clip run.
-3. Run the 16-clip batch with the settings block above, one clip's
-   `--input-dir` pointed at all 16 source files via `rclone` (remote
-   name `gdrive`, folder `nbt-videos`, config at
+3. Restore/locate the original `GX010057`, regenerate its redacted video
+   with the settings block above, retain its passing manifest, and verify a
+   complete decode before MediaPipe/VLM. The existing
+   `GX010057.blurred.mp4` is corrupt and must not be annotated or shipped.
+4. Configure the two real VLM models, then run the five-window pilot on the
+   newly generated redacted video. Keep Stage 2 paused; WiLoR/SAM2/DepthV3
+   remain later, private original-only stages.
+5. After that pilot passes, run the 16-clip EgoBlur batch with the settings
+   block above, one clip's `--input-dir` pointed at all 16 source files via
+   `rclone` (remote name `gdrive`, folder `nbt-videos`, config at
    `/workspace/.rclone.conf`).
-4. The fill-integrity question that used to gate this is closed — no
-   need to re-litigate it unless settings change materially.

@@ -8,9 +8,10 @@ numbers for how good each field actually is, instead of just shipping a
 demo. Runs on one laptop plus a small amount of rented GPU time.
 
 > **Status: early build.** The core pipeline (frame extraction, hand
-> tracking, VLM captioning, storage) is implemented and tested. Segmentation,
-> the review UI, GPU perception layers (objects/depth/pose), and HF packaging
-> are in progress — see `docs/` and the task list in this repo for current
+> tracking, dense VLM captioning, storage, privacy-safe HF packaging, and
+> verified Drive archiving) is implemented and tested. Segmentation is paused;
+> the review UI and GPU perception layers (objects/depth/pose) remain in progress
+> — see `docs/` and the task list in this repo for current
 > status. This README will grow a results table and a hero clip once real
 > footage has been annotated (currently blocked on Google Drive access — see
 > Known limitations below).
@@ -49,9 +50,10 @@ doesn't demonstrate.
 
 ## Usage — annotate your own footage
 
-There is deliberately no CLI or package to install — fork the repo and call
-the layers directly. This mirrors what `scripts/demo.py` does, pointed at a
-real clip instead of the bundled synthetic one.
+The resumable MediaPipe + dense-caption batch workflow, including the pilot,
+Hugging Face upload, and Drive archive commands, is documented in
+[`docs/MEDIAPIPE_VLM_PIPELINE.md`](docs/MEDIAPIPE_VLM_PIPELINE.md). The Python
+layer APIs below remain available for custom experiments.
 
 ### Hand tracking (local CPU, free — no API key needed)
 
@@ -150,7 +152,7 @@ uv run --with ruff ruff check src scripts jobs tests
 - `src/egoannote/store.py` — one SQLite database (laptop-only — GPU pods
   write immutable artifact shards, never a shared database file, so two
   machines can never silently overwrite each other's rows).
-- `tests/` — 103 tests, pytest, no GPU or network required. A large share are
+- `tests/` — pytest, no GPU or network required. A large share are
   regression guards for specific bugs found in review; each names the defect
   it pins.
 
@@ -160,17 +162,18 @@ uv run --with ruff ruff check src scripts jobs tests
   design is finalized but deliberately not implemented until real hand-
   tracking data exists to calibrate its thresholds against. See that file's
   docstring for the full design and why it's staged this way.
-- The review UI, GPU perception layers (objects/depth/camera-pose), dataset
-  packaging, and the published benchmarks.
+- The review UI, GPU perception layers (objects/depth/camera-pose), and the
+  published benchmarks.
 
 ## Known limitations (stated here, not buried)
 
-- No real egocentric footage has been processed yet — the source video is
-  on Google Drive and getting local access is an open item.
+- A real redacted clip is available locally, but the real two-model caption
+  pilot still needs final model/provider entries and credentials.
 - The annotation quality claims in the project plan are targets, not
   results, until real data runs through the pipeline.
 
 ## License
 
-Code: MIT (see `LICENSE`). The eventual published dataset will be licensed
-separately under CC BY 4.0 — see `docs/DATASHEET.md` once written.
+Code: MIT (see `LICENSE`). The dataset uses Hugging Face's `other` license
+metadata. Private uploads receive conservative prerelease terms; a public
+release is blocked until the owner supplies an approved license file and name.

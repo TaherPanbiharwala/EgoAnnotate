@@ -1,5 +1,5 @@
 """Windowing + VLM calls. Ties together media.frames, backends.base, and
-parse.parse_caption_v3, writing WindowCaption records to the Store.
+parse.parse_caption_v4, writing WindowCaption records to the Store.
 
 Resume semantics: Store.done_set() returns unit_idx values with no error, so
 a re-run skips completed windows and retries failed ones — the retry
@@ -9,7 +9,9 @@ no possibility of the duplicate-record bug v1 had with append-mode JSONL.
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -18,7 +20,7 @@ from .. import config
 from ..backends.base import PermanentBackendError, SpendLimitExceeded, VLMBackend
 from ..media.frames import Window, extract_frames, iter_window_indices
 from ..media.probe import VideoInfo, probe
-from ..parse import parse_caption_v3
+from ..parse import parse_caption_v4
 from ..schema import WindowCaption, hash_prompt, utc_now_isoformat
 from ..store import Store
 
@@ -110,7 +112,7 @@ def _caption_one_window(
         # frame that was not sent.
         n_in_window = len(jpegs)
         resp = backend.caption(jpegs, _render_prompt(prompt_text, n_in_window))
-        parsed = parse_caption_v3(resp.text, n_frames=n_in_window)
+        parsed = parse_caption_v4(resp.text, n_frames=n_in_window)
 
         return WindowCaption(
             video_id=video_id,
@@ -125,6 +127,7 @@ def _caption_one_window(
             run_id=run_id,
             latency_ms=resp.latency_ms,
             actions=parsed["actions"],
+            activity=parsed["activity"],
             raw_json=parsed["raw_json"],
             schema_ok=parsed["_schema_ok"],
             input_tokens=resp.input_tokens,
@@ -211,6 +214,7 @@ def caption_video(
     run_id: str | None = None,
     frames_dir: Path | None = None,
     max_workers: int = config.CAPTION_MAX_WORKERS,
+    window_indices: set[int] | None = None,
 ) -> int:
     """Caption every window of `video` with `backend`, writing to `store`
     under stage="caption", model_id=backend.model_id. Returns count written
@@ -230,6 +234,8 @@ def caption_video(
             guarantee as serial execution, just not the same completion
             order. Pass 1 for strictly serial, deterministic-order
             execution.
+        window_indices: optional exact subset for a pilot. A later call with
+            ``None`` resumes the same store and fills every remaining window.
 
     Concurrency and control-flow exceptions: once any window raises
     SpendLimitExceeded / PermanentBackendError / KeyboardInterrupt, no NEW
@@ -265,22 +271,64 @@ def caption_video(
     # during iteration.
     cache_root = frames_dir if frames_dir is not None else config.DATA_DIR / "frames"
     window_cache = cache_root / video_id
-    window_cache.mkdir(parents=True, exist_ok=True)
+    cache_root.mkdir(parents=True, exist_ok=True)
     cached = sorted(window_cache.glob("frame_*.jpg"))
+    marker = window_cache / "_COMPLETE.json"
+    source_stat = video.stat() if video.exists() else None
+    source_size = source_stat.st_size if source_stat else None
+    source_mtime_ns = source_stat.st_mtime_ns if source_stat else None
+    cache_complete = False
+    if marker.exists():
+        try:
+            metadata = json.loads(marker.read_text(encoding="utf-8"))
+            cache_complete = (
+                metadata.get("frame_count") == len(cached)
+                and metadata.get("source_size") == source_size
+                and metadata.get("source_mtime_ns") == source_mtime_ns
+            )
+        except (json.JSONDecodeError, OSError):
+            cache_complete = False
 
-    if cached:
+    if cached and cache_complete:
         log.info(
             "caption_video: reusing %d cached frames in %s (delete that "
             "directory to force re-extraction)", len(cached), window_cache,
         )
         frame_paths = cached
     else:
-        frame_paths = extract_frames(
+        # An interrupted eager extraction can leave a non-empty directory.
+        # Non-empty is not proof of completeness: using it would silently
+        # truncate the video to however many JPEGs landed before the crash.
+        # Extract to a sibling and atomically swap it in only after a marker
+        # recording the complete count and source identity has been written.
+        partial_cache = cache_root / f".{video_id}.partial"
+        if partial_cache.exists():
+            shutil.rmtree(partial_cache)
+        partial_cache.mkdir(parents=True)
+        extracted = extract_frames(
             video,
             fps=config.VLM_FPS_STR,
-            out_dir=window_cache,
+            out_dir=partial_cache,
             long_edge=config.VLM_FRAME_RESIZE_LONG_EDGE,
         )
+        if not extracted:
+            shutil.rmtree(partial_cache)
+            frame_paths = []
+        else:
+            (partial_cache / "_COMPLETE.json").write_text(
+                json.dumps(
+                    {
+                        "frame_count": len(extracted),
+                        "source_size": source_size,
+                        "source_mtime_ns": source_mtime_ns,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            if window_cache.exists():
+                shutil.rmtree(window_cache)
+            partial_cache.replace(window_cache)
+            frame_paths = sorted(window_cache.glob("frame_*.jpg"))
 
     n_frames = len(frame_paths)
     if n_frames == 0:
@@ -294,9 +342,19 @@ def caption_video(
             f"likely truncated or uses a codec ffmpeg can't decode."
         )
 
+    all_windows = list(iter_window_indices(n_frames, config.VLM_WINDOW_FRAMES))
+    if window_indices is not None:
+        available = {w.window_idx for w in all_windows}
+        missing = window_indices - available
+        if missing:
+            raise ValueError(
+                f"requested caption window(s) {sorted(missing)} do not exist; "
+                f"available range is 0..{max(available)}"
+            )
     todo = [
-        w for w in iter_window_indices(n_frames, config.VLM_WINDOW_FRAMES)
+        w for w in all_windows
         if w.window_idx not in done
+        and (window_indices is None or w.window_idx in window_indices)
     ]
 
     # ThreadPoolExecutor(max_workers=1) is not a special case here: with one

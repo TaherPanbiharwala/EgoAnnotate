@@ -98,8 +98,6 @@ def test_window_duration_is_templated_not_hardcoded():
 
 
 def test_no_placeholder_survives_rendering():
-    import re
-    from egoannote.layers.caption import _load_prompt, _render_prompt
     template, _ = _load_prompt()
     for n in (1, 3, 8):
         left = re.findall(r"\{(n_frames|max_frame_idx|window_seconds)\}",

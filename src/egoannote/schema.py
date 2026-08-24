@@ -162,6 +162,7 @@ class WindowCaption:
     run_id: str
     latency_ms: int
     actions: list[dict[str, Any]]  # see parse.ActionItem for shape
+    activity: dict[str, Any] = field(default_factory=dict)
     raw_json: str | None = None
     schema_ok: bool = False
     input_tokens: int | None = None

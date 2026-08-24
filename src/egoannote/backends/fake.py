@@ -22,18 +22,27 @@ from .base import VLMResponse
 
 _DEFAULT_RESPONSE = json.dumps(
     {
+        "activity": {
+            "caption": "The person is preparing a carrot by cutting it on a board.",
+            "goal": "Prepare the carrot for cooking.",
+            "phase": "executing",
+            "progression": "continues",
+        },
         "actions": [
             {
                 "start_frame": 0,
                 "end_frame": 7,
+                "action_caption": "The person chops a carrot while stabilizing it.",
                 "task_step": "example_action",
                 "left_hand": {
                     "verb": "holding", "object": "carrot", "target": None,
                     "contact_type": "grip", "visible": True,
+                    "caption": "The left hand holds the carrot steady on the board.",
                 },
                 "right_hand": {
                     "verb": "chopping", "object": "knife", "target": "carrot",
                     "contact_type": "grip", "visible": True,
+                    "caption": "The right hand grips the knife and chops the carrot.",
                 },
                 "tool_in_use": "knife",
                 "coordination": "coordinated",

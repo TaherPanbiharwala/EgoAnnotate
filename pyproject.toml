@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "A reusable annotation pipeline for egocentric video: dense subtask segmentation, hand pose, and measured quality — not asserted."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
-    "mediapipe>=0.10.18",
+    "mediapipe==0.10.35",
     "opencv-contrib-python>=4.10",
     "pyarrow>=18.0",
     "pillow>=11.0",
@@ -15,7 +15,11 @@ dependencies = [
     "httpx>=0.27",
     "numpy>=1.26,<2.3",
     "json-repair>=0.30",
+    "huggingface-hub>=0.34",
 ]
+
+[project.scripts]
+egoannote-run = "egoannote.pipeline:main"
 
 [project.optional-dependencies]
 # imageio-ffmpeg ships a self-contained static ffmpeg. The integrity check
