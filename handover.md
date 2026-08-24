@@ -3,8 +3,8 @@
 ## Current redaction-review work (2026-08-24)
 
 The local working tree contains the uncommitted YuNet review implementation
-plus the new private Pose-prior shadow pilot. It is intentionally separate
-from Stage 2, which remains paused.
+plus the new private Pose-prior/EgoBlur pilot. Stage 2 and YuNet are paused for
+the current run; the active protocol is Pose plus EgoBlur only.
 
 - `egoannote-run pose-prior` reads an original video only, downloads the
   versioned MediaPipe Pose Landmarker Full task if needed, and writes a private
@@ -14,9 +14,12 @@ from Stage 2, which remains paused.
   for a wearer candidate and blue for other detected poses, held between the
   10 Hz samples.
 - The pose artifact identifies **camera-near wearer candidates**, not people
-  with certainty. EgoBlur's `--pose-prior` and `--pose-shadow-report` validate
-  it and write a private overlap report; they do not alter detection, tracking,
-  fill, encoded bytes, audit, or manifest status.
+  with certainty. Default `--pose-prior` and `--pose-shadow-report` are
+  shadow-only. The explicit experimental `--pose-suppress-wearer-hands` is the
+  only behavior-changing mode: it requires a stable (12 samples), camera-edge
+  hand, four raw track detections, and >=98% overlap on every raw box. It never
+  suppresses arms/legs or uncertain poses, and a nonzero suppression count
+  forces `NEEDS_REVIEW`; consult the private report before any delivery.
 - EgoBlur's raw detector checkpoints are original-derived and now require a
   private `--checkpoint-dir`; never keep them beside a publishable redacted
   output directory.
@@ -30,7 +33,7 @@ from Stage 2, which remains paused.
   the existing EgoBlur `--forced-boxes` JSON. `uncertain` is not a privacy
   clearance.
 
-Focused tests, the complete suite (331 tests), Ruff, CLI help, and diff checks
+Focused tests, the complete suite (334 tests), Ruff, CLI help, and diff checks
 pass at this point. Do not run a batch until the shadow pilot is visually
 reviewed on the corrected `GX010057` artifact.
 

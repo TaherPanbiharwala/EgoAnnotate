@@ -142,6 +142,16 @@ YUNET_SCORE_MIN = 0.5
 POSE_PRIOR_SCHEMA_VERSION = 1
 POSE_PRIOR_ARTIFACT_TYPE = "pre_redaction_pose_prior"
 POSE_OVERLAP_GRID = 24
+# Active suppression is intentionally stricter than the shadow-ranking
+# signal. A face detector box must live completely inside a stable, camera-edge
+# wearer *hand* region over several samples before a track can be withheld.
+# Arms/legs and all other people remain normal face-redaction territory.
+POSE_ACTIVE_HAND_KINDS = frozenset({"hand"})
+POSE_ACTIVE_HAND_EDGE_FRAC = 0.12
+POSE_ACTIVE_HAND_LOWER_FRAC = 0.72
+POSE_ACTIVE_MIN_STABLE_SAMPLES = 12  # 1.2 seconds at the fixed 10 Hz cadence
+POSE_ACTIVE_MIN_TRACK_HITS = 4
+POSE_ACTIVE_MIN_OVERLAP = 0.98
 
 # How many DETECTION-STRIDE intervals a track may be carried on
 # LOW-confidence evidence alone, measured in real VIDEO FRAMES since its
@@ -287,6 +297,7 @@ class Config:
     min_track_confirmations: int
     pose_prior: Path | None
     pose_shadow_report: Path | None
+    pose_suppress_wearer_hands: bool
 
 
 def _require_private_artifact_path(path: Path, option: str) -> None:
@@ -381,6 +392,102 @@ def pose_overlap_fraction(box: tuple, regions: list[dict]) -> float | None:
     return inside / (POSE_OVERLAP_GRID * POSE_OVERLAP_GRID)
 
 
+def _is_camera_edge_wearer_hand(region: dict, clip: ClipInfo) -> bool:
+    """Whether a persisted region is eligible for the active hand gate.
+
+    The artifact's broader ``wearer`` set remains useful for private shadow
+    diagnostics. Active suppression is deliberately much narrower: a hand
+    circle itself must originate at a lower or side frame edge, which is the
+    most defensible geometric cue that it belongs to the camera wearer.
+    """
+    if region.get("kind") not in POSE_ACTIVE_HAND_KINDS or region.get("shape") != "circle":
+        return False
+    center = region.get("center")
+    if not isinstance(center, list) or len(center) != 2:
+        return False  # loader validation already rejects this; retain a safe guard here.
+    x, y = (float(value) for value in center)
+    return (
+        x <= clip.width * POSE_ACTIVE_HAND_EDGE_FRAC
+        or x >= clip.width * (1.0 - POSE_ACTIVE_HAND_EDGE_FRAC)
+        or y >= clip.height * POSE_ACTIVE_HAND_LOWER_FRAC
+    )
+
+
+def stable_wearer_hand_regions(regions_by_frame: dict[int, dict], clip: ClipInfo) -> dict[int, list[dict]]:
+    """Return only hand regions stable for >=1.2 seconds at the pose cadence.
+
+    A one-frame (or brief) mistaken amber assignment cannot affect redaction.
+    This is intentionally temporal presence rather than person identity: it
+    removes only very persistent, camera-edge hand evidence and leaves all
+    uncertain cases detectable/redactable.
+    """
+    eligible = {
+        frame_idx: [
+            region for region in frame_regions["wearer"]
+            if _is_camera_edge_wearer_hand(region, clip)
+        ]
+        for frame_idx, frame_regions in regions_by_frame.items()
+    }
+    stable: dict[int, list[dict]] = {}
+    run: list[int] = []
+
+    def commit_run() -> None:
+        if len(run) >= POSE_ACTIVE_MIN_STABLE_SAMPLES:
+            for frame_idx in run:
+                stable[frame_idx] = eligible[frame_idx]
+
+    for frame_idx in sorted(eligible):
+        if eligible[frame_idx]:
+            run.append(frame_idx)
+        else:
+            commit_run()
+            run = []
+    commit_run()
+    return stable
+
+
+def suppress_stable_wearer_hand_tracks(
+    tracks: list[Track], stable_regions_by_frame: dict[int, list[dict]]
+) -> tuple[list[Track], list[dict]]:
+    """Withhold only all-hand face tracks; return private evidence for review.
+
+    A real face track survives if *any* raw detection lacks near-total overlap,
+    if the hand was not stable long enough, or if the track has fewer than four
+    repeated raw detections. Suppression is therefore an explicit opt-in
+    quality tradeoff, never a generic pose ROI or detector-input filter.
+    """
+    kept: list[Track] = []
+    suppressed: list[dict] = []
+    for track in tracks:
+        if track.cls != "face":
+            kept.append(track)
+            continue
+        raw = [
+            (frame_idx, box)
+            for frame_idx, (box, source) in track.frames.items()
+            if source in {"det", "det_low"}
+        ]
+        overlaps = [
+            pose_overlap_fraction(box, stable_regions_by_frame.get(frame_idx, []))
+            for frame_idx, box in raw
+        ]
+        if (
+            len(raw) >= POSE_ACTIVE_MIN_TRACK_HITS
+            and all(value is not None and value >= POSE_ACTIVE_MIN_OVERLAP for value in overlaps)
+        ):
+            suppressed.append({
+                "track_id": track.track_id,
+                "n_raw_detections": len(raw),
+                "raw_detections": [
+                    {"frame_idx": frame_idx, "box": list(box), "stable_hand_overlap": overlap}
+                    for (frame_idx, box), overlap in zip(raw, overlaps, strict=True)
+                ],
+            })
+            continue
+        kept.append(track)
+    return kept, suppressed
+
+
 def load_pose_prior_for_clip(cfg: Config, clip: ClipInfo) -> tuple[Path, str, dict[int, dict]] | None:
     """Fail closed on a stale, incomplete or non-private pose artifact.
 
@@ -457,8 +564,10 @@ def load_pose_prior_for_clip(cfg: Config, clip: ClipInfo) -> tuple[Path, str, di
 
 def build_pose_shadow_report(clip: ClipInfo, cfg: Config, prior_path: Path, prior_sha256: str,
                              regions_by_frame: dict[int, dict], detections: list[Detection],
-                             tracks: list[Track]) -> dict:
-    """Summarise soft wearer-limb overlap without changing redaction input."""
+                             tracks: list[Track], *,
+                             stable_hand_regions: dict[int, list[dict]] | None = None,
+                             suppressed_tracks: list[dict] | None = None) -> dict:
+    """Summarise private pose evidence and any explicit active suppression."""
     face_detections = [d for d in detections if d.cls == "face"]
     samples = []
     for det in face_detections:
@@ -469,6 +578,9 @@ def build_pose_shadow_report(clip: ClipInfo, cfg: Config, prior_path: Path, prio
             "score": det.score,
             "all_limb_overlap": pose_overlap_fraction(det.box, frame_regions["all"]),
             "wearer_limb_overlap": pose_overlap_fraction(det.box, frame_regions["wearer"]),
+            "stable_wearer_hand_overlap": pose_overlap_fraction(
+                det.box, (stable_hand_regions or {}).get(det.frame_idx, [])
+            ),
         })
 
     track_rows = []
@@ -498,7 +610,7 @@ def build_pose_shadow_report(clip: ClipInfo, cfg: Config, prior_path: Path, prio
         "schema_version": 1,
         "review_type": "egoblur_pose_shadow",
         "privacy": "private_original_derived_do_not_ship",
-        "shadow_only": True,
+        "shadow_only": not bool(getattr(cfg, "pose_suppress_wearer_hands", False)),
         "input": {
             "clip_id": clip.clip_id,
             "source_sha256": clip.sha256,
@@ -511,6 +623,15 @@ def build_pose_shadow_report(clip: ClipInfo, cfg: Config, prior_path: Path, prio
             "min_track_confirmations": cfg.min_track_confirmations,
             "overlap_grid": POSE_OVERLAP_GRID,
             "wearer_only_priority": True,
+            "active_wearer_hand_suppression": bool(
+                getattr(cfg, "pose_suppress_wearer_hands", False)
+            ),
+            "active_hand_policy": {
+                "kinds": sorted(POSE_ACTIVE_HAND_KINDS),
+                "min_stable_samples": POSE_ACTIVE_MIN_STABLE_SAMPLES,
+                "min_track_hits": POSE_ACTIVE_MIN_TRACK_HITS,
+                "min_overlap": POSE_ACTIVE_MIN_OVERLAP,
+            },
         },
         "summary": {
             "n_face_detections": len(face_detections),
@@ -521,6 +642,15 @@ def build_pose_shadow_report(clip: ClipInfo, cfg: Config, prior_path: Path, prio
         },
         "detection_samples": samples,
         "tracks": track_rows,
+        "active_wearer_hand_suppression": {
+            "stable_pose_frames": len(stable_hand_regions or {}),
+            "n_suppressed_tracks": len(suppressed_tracks or []),
+            "suppressed_tracks": suppressed_tracks or [],
+            "warning": (
+                "Human review remains required whenever active pose suppression withheld a "
+                "face track; this is not a publication approval."
+            ),
+        },
     }
 
 
@@ -604,6 +734,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--pose-shadow-report", type=Path,
                    help="private JSON report (or directory) for pose overlap scores; required "
                         "with --pose-prior and never written into --output-dir.")
+    p.add_argument("--pose-suppress-wearer-hands", action="store_true",
+                   help="EXPERIMENTAL: withhold only face tracks repeatedly contained inside a "
+                        "temporally-stable, camera-edge wearer hand. Requires --pose-prior and "
+                        "--pose-shadow-report; suppression always keeps the audit in NEEDS_REVIEW.")
     p.add_argument("--watchdog-hours", type=float, default=8.0)
     p.add_argument("--no-watchdog", action="store_true")
     p.add_argument("--skip-shutdown", action="store_true", help="for local/laptop testing")
@@ -690,6 +824,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         )
     if (a.pose_prior is None) != (a.pose_shadow_report is None):
         p.error("--pose-prior and --pose-shadow-report must be supplied together")
+    if a.pose_suppress_wearer_hands and a.pose_prior is None:
+        p.error("--pose-suppress-wearer-hands requires --pose-prior and --pose-shadow-report")
     od = a.output_dir.expanduser().resolve()
     checkpoint_dir = (
         a.checkpoint_dir.expanduser().resolve()
@@ -770,6 +906,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         min_track_confirmations=a.min_track_confirmations,
         pose_prior=a.pose_prior,
         pose_shadow_report=a.pose_shadow_report,
+        pose_suppress_wearer_hands=a.pose_suppress_wearer_hands,
     )
 
 
@@ -2808,7 +2945,8 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
                  lp_checked: bool = True, n_face_fill_frames: int | None = None,
                  n_low_absorbed: int = 0,
                  det_low_frames: list[int] | None = None,
-                 n_unconfirmed_tracks: int = 0) -> dict:
+                 n_unconfirmed_tracks: int = 0,
+                 n_pose_suppressed_tracks: int = 0) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -2885,6 +3023,10 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         reasons.append(
             f"{n_dropped_small} confident detection(s) discarded by --min-box-px "
             f"and never redacted or audited")
+    if n_pose_suppressed_tracks > 0:
+        reasons.append(
+            f"{n_pose_suppressed_tracks} face track(s) withheld by experimental "
+            "pose-based wearer-hand suppression — review the private pose report before shipping")
 
     status = "NEEDS_REVIEW" if reasons else "PASS_AUTOMATED"
     if status == "PASS_AUTOMATED" and not yunet_ran:
@@ -2928,6 +3070,7 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # for, and defeat the point of having it. Reported here so the
         # count is never invisible, not so it's alarming.
         "n_unconfirmed_tracks": n_unconfirmed_tracks,
+        "n_pose_suppressed_tracks": n_pose_suppressed_tracks,
         # False means no plate detector ran at all. Recorded so a face-only
         # run is never later read as "this clip has no license plates".
         "lp_checked": lp_checked,
@@ -3000,8 +3143,11 @@ def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
         f"max_fill_area_frac: {audit.get('max_fill_area_frac', 0):.4f}  (runaway false-positive canary)",
         f"n_low_absorbed: {n_low_absorbed}  (hysteresis-absorbed low-confidence detections{low_detail})",
         f"n_unconfirmed_tracks: {audit.get('n_unconfirmed_tracks', 0)}  "
-        f"(isolated single-hit tracks suppressed by --min-track-confirmations; "
-        f"0 when it's at its default of 1)",
+            f"(isolated single-hit tracks suppressed by --min-track-confirmations; "
+            f"0 when it's at its default of 1)",
+        f"n_pose_suppressed_tracks: {audit.get('n_pose_suppressed_tracks', 0)}  "
+            f"(experimental active wearer-hand suppression; any nonzero count requires "
+            f"private review before shipping)",
         "",
         audit["note"],
     ]
@@ -3055,6 +3201,7 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             # behaviour). Changes what a track's hold/fill actually reflects,
             # so it belongs here for the same reason hold_frames does.
             "min_track_confirmations": cfg.min_track_confirmations,
+            "pose_suppress_wearer_hands": cfg.pose_suppress_wearer_hands,
             # None = native resolution. Recorded because it changes the scale
             # the model runs at, and therefore what a score MEANS — two runs
             # at different values are not comparable.
@@ -3203,10 +3350,25 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                   "existing tracks (continue>%.2f, start>%.2f)", clip.clip_id,
                   len(low_absorbed), cfg.continue_threshold, cfg.face_threshold)
     pose_shadow = None
+    stable_hand_regions: dict[int, list[dict]] = {}
+    pose_suppressed_tracks: list[dict] = []
+    all_tracks = tracks
     if pose_prior is not None:
         prior_path, prior_sha256, regions_by_frame = pose_prior
+        stable_hand_regions = stable_wearer_hand_regions(regions_by_frame, clip)
+        if cfg.pose_suppress_wearer_hands:
+            tracks, pose_suppressed_tracks = suppress_stable_wearer_hand_tracks(
+                tracks, stable_hand_regions
+            )
+            log.warning(
+                "%s: EXPERIMENTAL active pose suppression withheld %d face track(s); "
+                "private human review is mandatory before shipping",
+                clip.clip_id, len(pose_suppressed_tracks),
+            )
         pose_shadow = build_pose_shadow_report(
-            clip, cfg, prior_path, prior_sha256, regions_by_frame, detections, tracks
+            clip, cfg, prior_path, prior_sha256, regions_by_frame, detections, all_tracks,
+            stable_hand_regions=stable_hand_regions,
+            suppressed_tracks=pose_suppressed_tracks,
         )
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
@@ -3261,7 +3423,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                          n_face_fill_frames=n_face_fill_frames,
                          n_low_absorbed=len(low_absorbed),
                          det_low_frames=det_low_frames,
-                         n_unconfirmed_tracks=len(unconfirmed))
+                         n_unconfirmed_tracks=len(unconfirmed),
+                         n_pose_suppressed_tracks=len(pose_suppressed_tracks))
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {

@@ -185,6 +185,48 @@ def test_pose_shadow_flags_must_be_private_and_paired(blur_job):
                 "--pose-shadow-report", "/tmp/private/report.json",
             ]
         )
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--pose-suppress-wearer-hands"])
+
+
+def test_active_pose_suppression_requires_stable_edge_hand_and_all_track_hits(blur_job):
+    clip = _clip(blur_job)
+    hand = {"shape": "circle", "kind": "hand", "center": [5, 50], "radius": 20}
+    stable_input = {
+        frame_idx: {"all": [hand], "wearer": [hand]}
+        for frame_idx in range(0, 36, 3)
+    }
+    stable = blur_job.stable_wearer_hand_regions(stable_input, clip)
+    assert set(stable) == set(stable_input)
+
+    all_hand = blur_job.Track(track_id=1, cls="face", last_frame=9)
+    for frame_idx in (0, 3, 6, 9):
+        all_hand.frames[frame_idx] = ((0.0, 45.0, 10.0, 55.0), "det")
+    mixed = blur_job.Track(track_id=2, cls="face", last_frame=9)
+    for frame_idx, box in (
+        (0, (0.0, 45.0, 10.0, 55.0)),
+        (3, (0.0, 45.0, 10.0, 55.0)),
+        (6, (35.0, 0.0, 55.0, 20.0)),  # cannot be proven to be the hand
+        (9, (0.0, 45.0, 10.0, 55.0)),
+    ):
+        mixed.frames[frame_idx] = (box, "det")
+
+    kept, suppressed = blur_job.suppress_stable_wearer_hand_tracks(
+        [all_hand, mixed], stable
+    )
+
+    assert kept == [mixed]
+    assert [entry["track_id"] for entry in suppressed] == [1]
+
+
+def test_active_pose_suppression_rejects_a_brief_amber_misassignment(blur_job):
+    clip = _clip(blur_job)
+    hand = {"shape": "circle", "kind": "hand", "center": [5, 50], "radius": 20}
+    brief = {
+        frame_idx: {"all": [hand], "wearer": [hand]}
+        for frame_idx in range(0, 33, 3)  # eleven samples; active policy requires twelve
+    }
+    assert blur_job.stable_wearer_hand_regions(brief, clip) == {}
 
 
 def test_checkpoint_dir_must_be_private_and_outside_publishable_output(blur_job):
@@ -207,7 +249,8 @@ def test_checkpoint_dir_must_be_private_and_outside_publishable_output(blur_job)
 # ---------------------------------------------------------------------------
 
 
-def _audit(blur_job, *, fill=None, integrity=None, sweep=None, yunet=None):
+def _audit(blur_job, *, fill=None, integrity=None, sweep=None, yunet=None,
+           pose_suppressed=0):
     return blur_job.build_audit(
         _clip(blur_job),
         fill if fill is not None else {"n_frames_with_fill": 10},
@@ -216,6 +259,7 @@ def _audit(blur_job, *, fill=None, integrity=None, sweep=None, yunet=None):
         sweep if sweep is not None else {"n_candidate_misses": 0},
         yunet if yunet is not None else {"n_yunet_uncovered": 0},
         "2",
+        n_pose_suppressed_tracks=pose_suppressed,
     )
 
 
@@ -227,6 +271,12 @@ def test_skipped_yunet_is_a_visibly_weaker_pass(blur_job):
     a = _audit(blur_job, yunet={"yunet_skipped": "no --yunet-model provided"})
     assert a["status"] == "PASS_AUTOMATED_NO_YUNET"
     assert a["yunet_ran"] is False
+
+
+def test_active_pose_suppression_always_requires_review(blur_job):
+    audit = _audit(blur_job, pose_suppressed=1)
+    assert audit["status"] == "NEEDS_REVIEW"
+    assert "pose-based wearer-hand suppression" in " ".join(audit["status_reasons"])
 
 
 def test_zero_redacted_frames_never_passes(blur_job):

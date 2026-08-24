@@ -106,11 +106,47 @@ Pass that artifact to the pod alongside a private report destination:
 ```
 
 The GPU job rejects a stale, incomplete, geometry-mismatched, or non-private
-artifact before it spends GPU time. In this shadow pilot, the output video and
-normal EgoBlur manifest must match the same command run without pose input;
-only the private overlap report is new.
+artifact before it spends GPU time. In this default shadow pilot, the output
+video and normal EgoBlur manifest must match the same command run without pose
+input; only the private overlap report is new.
+
+### Experimental active wearer-hand suppression
+
+The current redaction pilot uses **EgoBlur plus Pose only**. YuNet is not part
+of this protocol. After visually reviewing the pose preview, the explicit
+`--pose-suppress-wearer-hands` opt-in can withhold a persistent hand false
+positive from EgoBlur's fill map. It is deliberately much stricter than an
+amber pose-preview label:
+
+- only a `hand` mask is eligible—never arms, legs, feet, or another person's
+  generic limb;
+- its centre must be at a lower or side frame edge;
+- eligible hand evidence must persist for at least 12 adjacent 10 Hz samples
+  (1.2 seconds);
+- a face track needs at least four raw detections, and every one must be at
+  least 98% inside that stable hand region.
+
+Any uncertain, intermittent, blue wearer pose, or momentary amber assignment
+remains a normal face detection. A run with one or more withheld tracks is
+always `NEEDS_REVIEW`; it is not automatically publishable. Its private pose
+report records every withheld track and overlap score for visual review.
+
+Use a new output/checkpoint/report destination so the original shadow result
+remains available for comparison:
+
+```bash
+... jobs/10_blur_egoblur.py ... \
+  --output-dir /workspace/out-gx010057-active-pose \
+  --checkpoint-dir /workspace/private/checkpoints/GX010057-active-pose \
+  --pose-prior /workspace/private/pose-prior/GX010057.pose_prior.json \
+  --pose-shadow-report /workspace/private/pose-shadow/GX010057.active_pose.json \
+  --pose-suppress-wearer-hands
+```
 
 ## Independent YuNet verification
+
+YuNet is an optional separate verifier, but is not part of the current
+Pose-plus-EgoBlur pilot.
 
 YuNet runs **after** redaction. It is a CPU-only, independent detector over the
 redacted video: any face it finds outside EgoBlur's reconstructed fill map is
