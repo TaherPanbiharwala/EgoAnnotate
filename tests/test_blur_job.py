@@ -21,12 +21,19 @@ run against actual footage — see the probe section at the bottom.
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-BASE_ARGS = ["--input-dir", "/tmp/in", "--output-dir", "/tmp/out", "--run-id", "r"]
+BASE_ARGS = [
+    "--input-dir", "/tmp/in",
+    "--output-dir", "/tmp/out",
+    "--checkpoint-dir", "/tmp/private/checkpoints",
+    "--run-id", "r",
+]
 
 
 def _clip(blur_job, **over):
@@ -137,6 +144,61 @@ def test_sweep_threshold_must_be_below_operating_thresholds(blur_job):
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--sweep-threshold", "0.9",
                              "--face-threshold", "0.3"])
+
+
+def test_pose_shadow_reports_wearer_overlap_without_mutating_detection_or_tracks(blur_job, tmp_path):
+    """The pre-redaction prior is review-only: it may never change fill input."""
+    clip = _clip(blur_job, sha256="a" * 64)
+    detection = blur_job.Detection(0, "face", (0.0, 0.0, 10.0, 10.0), 0.9)
+    track = blur_job.Track(track_id=7, cls="face", last_frame=0)
+    track.frames[0] = (detection.box, "det")
+    before_detections = copy.deepcopy([detection])
+    before_frames = copy.deepcopy(track.frames)
+    cfg = SimpleNamespace(detect_hz=10.0, face_threshold=0.3, min_track_confirmations=2)
+    prior_path = tmp_path / "private" / "clip.pose_prior.json"
+    prior_path.parent.mkdir()
+    prior_path.write_text("{}", encoding="utf-8")
+    report = blur_job.build_pose_shadow_report(
+        clip,
+        cfg,
+        prior_path,
+        "b" * 64,
+        {0: {"all": [], "wearer": []}},
+        [detection],
+        [track],
+    )
+
+    assert [detection] == before_detections
+    assert track.frames == before_frames
+    assert report["shadow_only"] is True
+    assert report["detection_samples"][0]["wearer_limb_overlap"] is None
+
+
+def test_pose_shadow_flags_must_be_private_and_paired(blur_job):
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--pose-prior", "/tmp/private/prior.json"])
+    with pytest.raises(SystemExit):
+        blur_job.parse_args(
+            [
+                *BASE_ARGS,
+                "--pose-prior", "/tmp/prior.json",
+                "--pose-shadow-report", "/tmp/private/report.json",
+            ]
+        )
+
+
+def test_checkpoint_dir_must_be_private_and_outside_publishable_output(blur_job):
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--checkpoint-dir", "/tmp/checkpoints"])
+    with pytest.raises(SystemExit):
+        blur_job.parse_args(
+            [
+                "--input-dir", "/tmp/in",
+                "--output-dir", "/tmp/private/out",
+                "--checkpoint-dir", "/tmp/private/out/checkpoints",
+                "--run-id", "r",
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +733,22 @@ def test_yunet_covered_face_is_not_flagged(blur_job, monkeypatch, tmp_path):
                                 tmp_path / "o.mp4", 64, 64,
                                 {0: [(0.0, 0.0, 64.0, 64.0)]}, 10.0, 30.0, 1)
     assert out["n_yunet_uncovered"] == 0
+
+
+def test_yunet_can_return_private_detection_geometry_for_a_local_preview(
+    blur_job, monkeypatch, tmp_path
+):
+    row = _yunet_row(10, 10, 20, 20, score=0.92)
+    _patch_yunet(monkeypatch, blur_job, [row], [_planes()])
+    out = blur_job.check_yunet(
+        _yunet_cfg(blur_job, tmp_path), "ffmpeg", tmp_path / "o.mp4", 64, 64,
+        {0: [(0.0, 0.0, 64.0, 64.0)]}, 10.0, 30.0, 1, record_detections=True,
+    )
+    detection = out["yunet_detections"][0]
+    assert detection["frame_idx"] == 0
+    assert detection["box"] == (10.0, 10.0, 30.0, 30.0)
+    assert detection["score"] == pytest.approx(0.92)
+    assert detection["covered"] is True
 
 
 def test_yunet_fails_closed_on_a_short_decode(blur_job, monkeypatch, tmp_path):

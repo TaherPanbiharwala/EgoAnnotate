@@ -1,5 +1,39 @@
 # egoannote — session handover
 
+## Current redaction-review work (2026-08-24)
+
+The local working tree contains the uncommitted YuNet review implementation
+plus the new private Pose-prior shadow pilot. It is intentionally separate
+from Stage 2, which remains paused.
+
+- `egoannote-run pose-prior` reads an original video only, downloads the
+  versioned MediaPipe Pose Landmarker Full task if needed, and writes a private
+  artifact with the source/model hashes, complete sampled-frame coverage, and
+  limb-only landmarks/masks. It does not retain face/torso landmarks. Its
+  optional `--preview-video` draws private original-only limb overlays: amber
+  for a wearer candidate and blue for other detected poses, held between the
+  10 Hz samples.
+- The pose artifact identifies **camera-near wearer candidates**, not people
+  with certainty. EgoBlur's `--pose-prior` and `--pose-shadow-report` validate
+  it and write a private overlap report; they do not alter detection, tracking,
+  fill, encoded bytes, audit, or manifest status.
+- EgoBlur's raw detector checkpoints are original-derived and now require a
+  private `--checkpoint-dir`; never keep them beside a publishable redacted
+  output directory.
+- `verify-yunet` still scans the entire redacted video. It now groups all
+  uncovered hits into temporal candidates and produces redacted-only contact
+  sheets. Only repeated overlap with a likely wearer limb is amber/lower
+  priority. Other people's limbs stay normal priority; no candidate is
+  dropped or removed from `NEEDS_REVIEW`.
+- `init-yunet-decisions` creates a hash-bound private decision template.
+  `decisions-to-forced-boxes` accepts only `confirmed_face` entries and emits
+  the existing EgoBlur `--forced-boxes` JSON. `uncertain` is not a privacy
+  clearance.
+
+Focused tests, the complete suite (331 tests), Ruff, CLI help, and diff checks
+pass at this point. Do not run a batch until the shadow pilot is visually
+reviewed on the corrected `GX010057` artifact.
+
 Written 2026-08-11, substantially rewritten in a later session once the
 "do this first" item below was actually resolved (with evidence, not a
 visual spot-check) and two of the three remaining hysteresis blockers got

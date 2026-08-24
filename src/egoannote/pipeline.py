@@ -22,6 +22,7 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from . import config
+from . import pose_prior as pose_prior_layer
 from .archive import archive_files
 from .backends.registry import build_backend
 from .layers import caption as caption_layer
@@ -29,6 +30,7 @@ from .layers import hands as hands_layer
 from .media.probe import probe
 from .pack.huggingface import build_video_bundle, install_public_license, upload_bundle
 from .store import Store, write_hands_parquet_streaming
+from .verify_yunet import create_decision_template, decisions_to_forced_boxes, verify_yunet
 
 log = logging.getLogger("egoannote.pipeline")
 
@@ -523,6 +525,65 @@ def _build_parser() -> argparse.ArgumentParser:
     archive.add_argument("--drive-root", required=True)
     archive.add_argument("--delete-local-originals", action="store_true")
     archive.add_argument("--delete-local-redacted", action="store_true")
+
+    yunet = sub.add_parser(
+        "verify-yunet",
+        help="CPU-only independent face audit on a redacted video; writes a private report",
+    )
+    yunet.add_argument("--redacted-video", type=Path, required=True)
+    yunet.add_argument("--blur-manifest", type=Path, required=True)
+    yunet.add_argument("--checkpoint-dir", type=Path, required=True)
+    yunet.add_argument("--yunet-model", type=Path, required=True)
+    yunet.add_argument("--job-script", type=Path, required=True)
+    yunet.add_argument("--ffmpeg", default="ffmpeg")
+    yunet.add_argument("--report", type=Path, required=True)
+    yunet.add_argument(
+        "--preview-video",
+        type=Path,
+        help="optional redacted-only local overlay; path must include private or DO-NOT-SHIP",
+    )
+    yunet.add_argument(
+        "--pose-prior",
+        type=Path,
+        help="optional private pre-redaction pose prior; ranks likely wearer-limb false positives",
+    )
+    yunet.add_argument(
+        "--candidate-contact-sheet-dir",
+        type=Path,
+        help="optional private redacted-only contact sheets, one per temporal YuNet candidate",
+    )
+
+    pose = sub.add_parser(
+        "pose-prior",
+        help="private pre-redaction MediaPipe Pose pass; creates a shadow-only limb prior",
+    )
+    pose.add_argument("--original-video", type=Path, required=True)
+    pose.add_argument("--video-id", required=True)
+    pose.add_argument("--output", type=Path, required=True)
+    pose.add_argument("--models-dir", type=Path, default=Path("private/models"))
+    pose.add_argument(
+        "--preview-video",
+        type=Path,
+        help="optional private original-only pose overlay (amber wearer candidate; blue other pose)",
+    )
+    pose.add_argument("--detect-hz", type=float, default=pose_prior_layer.POSE_DETECT_HZ)
+    pose.add_argument("--num-poses", type=int, default=pose_prior_layer.POSE_NUM_POSES)
+    pose.add_argument("--confidence", type=float, default=pose_prior_layer.POSE_MIN_CONFIDENCE)
+
+    decisions = sub.add_parser(
+        "init-yunet-decisions",
+        help="create a private all-uncertain review-decision template from a YuNet report",
+    )
+    decisions.add_argument("--report", type=Path, required=True)
+    decisions.add_argument("--output", type=Path, required=True)
+
+    forced = sub.add_parser(
+        "decisions-to-forced-boxes",
+        help="convert only confirmed private YuNet candidate tracks into EgoBlur --forced-boxes JSON",
+    )
+    forced.add_argument("--report", type=Path, required=True)
+    forced.add_argument("--decisions", type=Path, required=True)
+    forced.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -573,6 +634,52 @@ def main(argv: list[str] | None = None) -> int:
             license_file=args.license_file,
             license_name=args.license_name,
         )
+        return 0
+
+    if args.command == "verify-yunet":
+        result = verify_yunet(
+            redacted_video=args.redacted_video.resolve(),
+            blur_manifest=args.blur_manifest.resolve(),
+            checkpoint_dir=args.checkpoint_dir.resolve(),
+            yunet_model=args.yunet_model.resolve(),
+            job_script=args.job_script.resolve(),
+            ffmpeg=args.ffmpeg,
+            report=args.report.resolve(),
+            preview_video=args.preview_video.resolve() if args.preview_video else None,
+            pose_prior_path=args.pose_prior.resolve() if args.pose_prior else None,
+            candidate_contact_sheet_dir=(
+                args.candidate_contact_sheet_dir.resolve()
+                if args.candidate_contact_sheet_dir else None
+            ),
+        )
+        print(f"{result['review_status']}: {args.report}")
+        return 0
+
+    if args.command == "pose-prior":
+        video_id = _validate_video_id(args.video_id)
+        artifact = pose_prior_layer.build_pose_prior(
+            original_video=args.original_video,
+            video_id=video_id,
+            output=args.output,
+            models_dir=args.models_dir,
+            detect_hz=args.detect_hz,
+            num_poses=args.num_poses,
+            confidence=args.confidence,
+            preview_video=args.preview_video,
+        )
+        print(f"complete: {artifact['source']['video_id']} -> {args.output}")
+        return 0
+
+    if args.command == "init-yunet-decisions":
+        template = create_decision_template(args.report.resolve(), args.output.resolve())
+        print(f"review template: {len(template['decisions'])} candidate(s) -> {args.output}")
+        return 0
+
+    if args.command == "decisions-to-forced-boxes":
+        result = decisions_to_forced_boxes(
+            args.report.resolve(), args.decisions.resolve(), args.output.resolve()
+        )
+        print(f"forced boxes: {result['n_forced_boxes']} -> {args.output}")
         return 0
 
     archive_run(

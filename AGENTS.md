@@ -163,7 +163,7 @@ and pinned with a regression test:
 
 | Stage | Status |
 |---|---|
-| EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
+| EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. A private pre-redaction PoseLandmarker shadow prior now records likely *wearer*-limb overlap without changing any detector, fill box, output pixels, or audit state. One known, lower-urgency gap remains (resumed-batch config drift, see "Known open work") before an unattended 16-clip run. |
 | MediaPipe hands | Code complete and unit-tested. A first real-redacted pilot on 2026-08-24 was correctly rejected: `GX010057.blurred.mp4` has a 99.5% decode-error rate, yielding only 14 of 4,067 expected samples. The pipeline now fails partial decodes and refuses to resume a truncated hand Parquet. Regenerate a verified redacted artifact from the original and use a fresh run directory. |
 | VLM captioning | Code complete and unit-tested, but not run for real: the only candidate redacted artifact is corrupt. `models.toml` still has placeholder model IDs / $0.00 prices; configure two real models from different labs, provider pins, verified prices, and `OPENROUTER_API_KEY` before the five-window pilot. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
@@ -274,19 +274,16 @@ durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
      doesn't). A real behavioral fix to the matching logic, not a
      visibility fix — bigger, separate work. Don't enable
      `--continue-threshold` for a real batch until this is addressed.
-3. **No independent second-opinion face detector is actually running.**
-   `--yunet-model` was designed for this but real weights were never
-   sourced. MediaPipe Face Landmarker was investigated as an
-   alternative and found genuinely non-viable as a naive whole-frame
-   check — it's structurally blind to faces at the size they appear in
-   this footage (a face EgoBlur scored at 1.00 confidence, real and
-   frontal and well-lit, produced zero MediaPipe detections at any
-   threshold on the full frame, but was found instantly once cropped —
-   a known BlazeFace-family scale limitation, not a config problem). The
-   low-confidence sweep on EgoBlur's *own* detections is currently the
-   only signal against a genuinely missed face. State this honestly if
-   it makes it into a dataset card; don't silently claim independent
-   verification that isn't happening.
+3. **YuNet is now an independent, post-redaction review signal, not an
+   approval mechanism.** The standalone `egoannote-run verify-yunet`
+   command validates the redacted-video hash and full detector checkpoint,
+   rebuilds EgoBlur's fill map, then runs YuNet only on the redacted video.
+   It emits private temporal candidates and never changes the redaction.
+   The Pose prior may make likely wearer-limb candidates lower review
+   priority, but it may never discard them or make YuNet scan an ROI. A human
+   marks each candidate; only `confirmed_face` tracks become `--forced-boxes`
+   for a corrective re-run. MediaPipe Face Landmarker remains non-viable as a
+   naive whole-frame independent detector at this footage's face scales.
 
 ## Operational notes for RunPod
 

@@ -64,6 +64,114 @@ never included. Later WiLoR/SAM2/DepthV3 numeric outputs can be added to
 `publish/` only after a verification pass confirms that no original RGB crops or
 debug renderings are embedded.
 
+## Pre-redaction pose-prior shadow pilot
+
+Before a new EgoBlur run, a private MediaPipe Pose pass can label likely
+**wearer** hand/arm/leg overlap. It never defines a face-search ROI, changes an
+EgoBlur threshold, changes a fill box, or approves a redaction. The role of the
+pilot is to measure which detector/YuNet candidates are likely the camera
+wearer's limbs, since preserving those hands matters for later hand tracking;
+blur on other people is not down-ranked merely because their pose was found.
+
+Run it only against the original and keep both model and artifact private:
+
+```bash
+uv run egoannote-run pose-prior \
+  --original-video /private/GX010057.MP4 \
+  --video-id GX010057 \
+  --output private/pose-prior/GX010057.pose_prior.json \
+  --models-dir private/models \
+  --preview-video private/pose-preview/GX010057.pose.mp4
+```
+
+The first call downloads the versioned MediaPipe **Pose Landmarker Full** task
+model. The artifact records the original hash, resolution, source timing, model
+hash, every sampled frame (including frames with no pose), and limb-only 2D
+landmarks/masks. Face and torso landmarks are not retained. The heuristic
+labels a pose only as a `wearer_candidate` when reliable limb landmarks are
+camera-near; this is a review hint, not an identity claim.
+
+`--preview-video` is an original-only private diagnostic: limb masks for a
+camera-near wearer candidate are amber; other detected poses are blue. The
+latest 10 Hz pose is held between samples so tracking errors are easy to see.
+It is for improving the pilot only and must never be uploaded or published.
+
+Pass that artifact to the pod alongside a private report destination:
+
+```bash
+... jobs/10_blur_egoblur.py ... \
+  --checkpoint-dir /workspace/private/checkpoints/GX010057-shadow \
+  --pose-prior /workspace/private/pose-prior/GX010057.pose_prior.json \
+  --pose-shadow-report /workspace/private/pose-shadow/GX010057.pose_shadow.json
+```
+
+The GPU job rejects a stale, incomplete, geometry-mismatched, or non-private
+artifact before it spends GPU time. In this shadow pilot, the output video and
+normal EgoBlur manifest must match the same command run without pose input;
+only the private overlap report is new.
+
+## Independent YuNet verification
+
+YuNet runs **after** redaction. It is a CPU-only, independent detector over the
+redacted video: any face it finds outside EgoBlur's reconstructed fill map is
+reported for review. It never opens the original video and does not alter the
+redacted artifact.
+
+Download the matching redacted video, EgoBlur manifest, and private
+`checkpoints/` directory. Obtain a YuNet ONNX model separately, then run:
+
+```bash
+uv run egoannote-run verify-yunet \
+  --redacted-video /private/GX010057.blurred.mp4 \
+  --blur-manifest /private/GX010057.manifest.json \
+  --checkpoint-dir /private/checkpoints \
+  --yunet-model /private/face_detection_yunet.onnx \
+  --job-script jobs/10_blur_egoblur.py \
+  --ffmpeg ffmpeg \
+  --report /private/GX010057.yunet_review.json \
+  --preview-video /private/GX010057.yunet_full_debug.mp4 \
+  --pose-prior private/pose-prior/GX010057.pose_prior.json \
+  --candidate-contact-sheet-dir private/GX010057.yunet_candidates
+```
+
+The command verifies the video hash, checkpoint fingerprint and sampled-frame
+coverage before it starts. `PASS_NO_UNCOVERED_YUNET` validates this one
+independent check only; it does **not** override other EgoBlur audit reasons,
+approve publication, or make the private review report uploadable.
+
+`--preview-video` is optional full diagnostics: it creates a 10-FPS, real-time
+review copy from the **redacted video only**, without audio. Green boxes are
+YuNet faces already covered by EgoBlur and red boxes are uncovered hits.
+
+The candidate contact-sheet directory is the normal review aid. It groups all
+uncovered YuNet hits into short temporal candidates. Normal candidates are red;
+only candidates that repeatedly overlap a likely **wearer** limb are amber and
+lower priority. They are still present, counted, and keep the run in
+`NEEDS_REVIEW`. An overlap with another person's hand/leg remains normal
+priority. The report, preview, contact sheets, and pose input must all be in a
+`private` or `DO-NOT-SHIP` directory; none may enter `publish/` or Hugging
+Face.
+
+Create a review template, change each value to `confirmed_face`,
+`false_positive`, or `uncertain`, then produce only confirmed remediation boxes:
+
+```bash
+uv run egoannote-run init-yunet-decisions \
+  --report private/GX010057.yunet_review.json \
+  --output private/GX010057.yunet_decisions.json
+
+uv run egoannote-run decisions-to-forced-boxes \
+  --report private/GX010057.yunet_review.json \
+  --decisions private/GX010057.yunet_decisions.json \
+  --output private/GX010057.forced_boxes.json
+```
+
+The decision file is bound to the exact report hash and must contain a decision
+for every candidate. The generated JSON is directly compatible with EgoBlur's
+`--forced-boxes`; rerun with `--force-reprocess`, then inspect the corrected
+video and rerun YuNet. Uncertain candidates are never turned into a claim that
+the video is ready to publish.
+
 ## Runtime
 
 The locked local runtime is Python 3.12 with MediaPipe 0.10.35. MediaPipe needs

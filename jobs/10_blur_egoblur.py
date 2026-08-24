@@ -135,6 +135,14 @@ NMS_IOU_DEFAULT = 0.30
 YUNET_SCORE_COL = 14
 YUNET_SCORE_MIN = 0.5
 
+# Pre-redaction pose is deliberately a SHADOW-ONLY negative prior. It may
+# identify that a detector box is likely on a hand/arm/leg, but it is never a
+# permission to skip a region: partial, distant and face-only people commonly
+# have no usable body pose at all.
+POSE_PRIOR_SCHEMA_VERSION = 1
+POSE_PRIOR_ARTIFACT_TYPE = "pre_redaction_pose_prior"
+POSE_OVERLAP_GRID = 24
+
 # How many DETECTION-STRIDE intervals a track may be carried on
 # LOW-confidence evidence alone, measured in real VIDEO FRAMES since its
 # last confident detection (the actual budget is max_low_run * stride —
@@ -238,6 +246,7 @@ FILL_VALUE = 128  # mid-gray. Exact value matters: check_fill_integrity()
 class Config:
     input_dir: Path
     output_dir: Path
+    checkpoint_dir: Path
     run_id: str
     gen: str  # "1" | "2" | "auto"
     device: str
@@ -276,12 +285,261 @@ class Config:
     gen2_resize_px: int | None
     detect_batch: int
     min_track_confirmations: int
+    pose_prior: Path | None
+    pose_shadow_report: Path | None
+
+
+def _require_private_artifact_path(path: Path, option: str) -> None:
+    """Keep original-derived pose material outside a publishable tree."""
+    parts = path.resolve().parts
+    # /private is a macOS filesystem root, not necessarily a caller-selected
+    # privacy boundary. Look below the root component for a real directory.
+    has_private_dir = any(part == "private" for part in parts[2:])
+    if not has_private_dir and "DO-NOT-SHIP" not in parts:
+        raise argparse.ArgumentTypeError(
+            f"{option} must be inside a directory named private or DO-NOT-SHIP; "
+            "pose data is derived from the original video and must never be published"
+        )
+
+
+def _pose_prior_path_for_clip(cfg: Config, clip_id: str) -> Path:
+    assert cfg.pose_prior is not None
+    path = cfg.pose_prior
+    return path / f"{clip_id}.pose_prior.json" if path.is_dir() else path
+
+
+def _pose_shadow_path_for_clip(cfg: Config, clip_id: str) -> Path:
+    assert cfg.pose_shadow_report is not None
+    path = cfg.pose_shadow_report
+    return path / f"{clip_id}.pose_shadow.json" if not path.suffix else path
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
+def _validate_pose_region(region: Any) -> None:
+    if not isinstance(region, dict) or region.get("shape") not in {"circle", "capsule"}:
+        raise ValueError(f"invalid pose-prior limb region: {region!r}")
+    try:
+        radius = float(region["radius"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid pose-prior limb radius: {region!r}") from exc
+    if not math.isfinite(radius) or radius <= 0:
+        raise ValueError(f"invalid pose-prior limb radius: {region!r}")
+    names = ("center",) if region["shape"] == "circle" else ("a", "b")
+    for name in names:
+        point = region.get(name)
+        if not isinstance(point, list) or len(point) != 2:
+            raise ValueError(f"invalid pose-prior limb point {name}: {region!r}")
+        try:
+            if not all(math.isfinite(float(value)) for value in point):
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid pose-prior limb point {name}: {region!r}") from exc
+
+
+def _point_in_pose_region(x: float, y: float, region: dict) -> bool:
+    radius = float(region["radius"])
+    if region["shape"] == "circle":
+        cx, cy = (float(value) for value in region["center"])
+        return (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2
+    ax, ay = (float(value) for value in region["a"])
+    bx, by = (float(value) for value in region["b"])
+    dx, dy = bx - ax, by - ay
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 1e-9:
+        return (x - ax) ** 2 + (y - ay) ** 2 <= radius ** 2
+    fraction = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / length_squared))
+    px, py = ax + fraction * dx, ay + fraction * dy
+    return (x - px) ** 2 + (y - py) ** 2 <= radius ** 2
+
+
+def pose_overlap_fraction(box: tuple, regions: list[dict]) -> float | None:
+    """Sample a candidate box against private limb capsules/circles.
+
+    Empty regions mean there was no reliable *wearer* pose at this frame.
+    That is unknown rather than a zero-overlap proof, so callers retain None
+    instead of inventing a negative privacy claim.
+    """
+    if not regions:
+        return None
+    x1, y1, x2, y2 = box
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inside = 0
+    for xi in range(POSE_OVERLAP_GRID):
+        x = x1 + (xi + 0.5) / POSE_OVERLAP_GRID * (x2 - x1)
+        for yi in range(POSE_OVERLAP_GRID):
+            y = y1 + (yi + 0.5) / POSE_OVERLAP_GRID * (y2 - y1)
+            if any(_point_in_pose_region(x, y, region) for region in regions):
+                inside += 1
+    return inside / (POSE_OVERLAP_GRID * POSE_OVERLAP_GRID)
+
+
+def load_pose_prior_for_clip(cfg: Config, clip: ClipInfo) -> tuple[Path, str, dict[int, dict]] | None:
+    """Fail closed on a stale, incomplete or non-private pose artifact.
+
+    The job deliberately vendors this reader instead of importing ``src/``:
+    the PEP-723 GPU script must remain independently runnable on a fresh pod.
+    """
+    if cfg.pose_prior is None:
+        return None
+    path = _pose_prior_path_for_clip(cfg, clip.clip_id)
+    _require_private_artifact_path(path, "--pose-prior")
+    if not path.is_file():
+        raise FileNotFoundError(f"pose prior not found for {clip.clip_id}: {path}")
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid pose-prior JSON {path}: {exc}") from exc
+    if not isinstance(artifact, dict) or artifact.get("schema_version") != POSE_PRIOR_SCHEMA_VERSION \
+            or artifact.get("artifact_type") != POSE_PRIOR_ARTIFACT_TYPE:
+        raise ValueError(f"{path} is not a supported pre-redaction pose-prior artifact")
+    source = artifact.get("source")
+    sampling = artifact.get("sampling")
+    model = artifact.get("model")
+    if not isinstance(source, dict) or not isinstance(sampling, dict) or not isinstance(model, dict):
+        raise ValueError(f"{path} lacks pose-prior source/sampling/model provenance")
+    expected_source = {
+        "sha256": clip.sha256,
+        "width": clip.width,
+        "height": clip.height,
+        "fps": clip.fps,
+        "n_frames": clip.n_frames,
+    }
+    mismatches = {
+        name: {"clip": expected, "artifact": source.get(name)}
+        for name, expected in expected_source.items()
+        if source.get(name) != expected
+    }
+    if sampling.get("detect_hz") != cfg.detect_hz:
+        mismatches["detect_hz"] = {"clip": cfg.detect_hz, "artifact": sampling.get("detect_hz")}
+    model_sha = model.get("sha256")
+    if not _is_sha256(model_sha):
+        mismatches["model.sha256"] = {"clip": "64 hex characters", "artifact": model_sha}
+    if mismatches:
+        raise ValueError(f"pose-prior provenance does not match {clip.clip_id}: {mismatches}")
+
+    stride = max(1, round(clip.fps / cfg.detect_hz))
+    expected_frames = set(range(0, clip.n_frames, stride))
+    rows = artifact.get("frames")
+    if not isinstance(rows, list):
+        raise ValueError(f"pose prior {path} frames must be a list")
+    by_frame: dict[int, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"pose prior {path} has a non-object frame entry")
+        try:
+            frame_idx = int(row["frame_idx"])
+            all_regions = row["limb_regions"]
+            wearer_regions = row["wearer_limb_regions"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"pose prior {path} has an invalid frame entry") from exc
+        if frame_idx not in expected_frames or frame_idx in by_frame:
+            raise ValueError(f"pose prior {path} has unexpected or duplicate frame {frame_idx}")
+        if not isinstance(all_regions, list) or not isinstance(wearer_regions, list):
+            raise ValueError(f"pose prior {path} frame {frame_idx} limb regions must be lists")
+        for region in [*all_regions, *wearer_regions]:
+            _validate_pose_region(region)
+        by_frame[frame_idx] = {"all": all_regions, "wearer": wearer_regions}
+    if set(by_frame) != expected_frames:
+        raise ValueError(
+            f"pose prior {path} is incomplete: sampled_frames={len(by_frame)}/{len(expected_frames)}, "
+            f"missing={sorted(expected_frames - set(by_frame))[:8]}"
+        )
+    return path, sha256_file(path), by_frame
+
+
+def build_pose_shadow_report(clip: ClipInfo, cfg: Config, prior_path: Path, prior_sha256: str,
+                             regions_by_frame: dict[int, dict], detections: list[Detection],
+                             tracks: list[Track]) -> dict:
+    """Summarise soft wearer-limb overlap without changing redaction input."""
+    face_detections = [d for d in detections if d.cls == "face"]
+    samples = []
+    for det in face_detections:
+        frame_regions = regions_by_frame[det.frame_idx]
+        samples.append({
+            "frame_idx": det.frame_idx,
+            "box": list(det.box),
+            "score": det.score,
+            "all_limb_overlap": pose_overlap_fraction(det.box, frame_regions["all"]),
+            "wearer_limb_overlap": pose_overlap_fraction(det.box, frame_regions["wearer"]),
+        })
+
+    track_rows = []
+    for track in tracks:
+        if track.cls != "face":
+            continue
+        raw = [
+            (frame_idx, box)
+            for frame_idx, (box, source) in track.frames.items()
+            if source in {"det", "det_low"}
+        ]
+        overlaps = [
+            pose_overlap_fraction(box, regions_by_frame[frame_idx]["wearer"])
+            for frame_idx, box in raw
+        ]
+        observed = [value for value in overlaps if value is not None]
+        track_rows.append({
+            "track_id": track.track_id,
+            "first_detection_frame": min(frame for frame, _box in raw),
+            "last_detection_frame": max(frame for frame, _box in raw),
+            "n_raw_detections": len(raw),
+            "wearer_limb_overlap_max": max(observed) if observed else None,
+            "wearer_limb_overlap_mean": sum(observed) / len(observed) if observed else None,
+            "wearer_limb_overlap_unknown_frames": len(overlaps) - len(observed),
+        })
+    return {
+        "schema_version": 1,
+        "review_type": "egoblur_pose_shadow",
+        "privacy": "private_original_derived_do_not_ship",
+        "shadow_only": True,
+        "input": {
+            "clip_id": clip.clip_id,
+            "source_sha256": clip.sha256,
+            "pose_prior": prior_path.name,
+            "pose_prior_sha256": prior_sha256,
+        },
+        "configuration": {
+            "detect_hz": cfg.detect_hz,
+            "face_threshold": cfg.face_threshold,
+            "min_track_confirmations": cfg.min_track_confirmations,
+            "overlap_grid": POSE_OVERLAP_GRID,
+            "wearer_only_priority": True,
+        },
+        "summary": {
+            "n_face_detections": len(face_detections),
+            "n_face_tracks": len(track_rows),
+            "n_wearer_overlap_samples": sum(
+                sample["wearer_limb_overlap"] is not None for sample in samples
+            ),
+        },
+        "detection_samples": samples,
+        "tracks": track_rows,
+    }
+
+
+def write_pose_shadow_report(path: Path, report: dict) -> None:
+    _require_private_artifact_path(path, "--pose-shadow-report")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".partial")
+    temporary.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--input-dir", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--checkpoint-dir", type=Path,
+                   help="private directory for original-derived detector checkpoints; "
+                        "must include private or DO-NOT-SHIP. Defaults to a private "
+                        "sibling of --output-dir.")
     p.add_argument("--run-id", required=True)
     p.add_argument("--gen", choices=["1", "2", "auto"], default="auto")
     p.add_argument("--device", default="cuda")
@@ -340,6 +598,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--probe-frames", type=int, default=600)
     p.add_argument("--yunet-model", type=Path, help="cv2 FaceDetectorYN onnx path; omit to skip")
     p.add_argument("--forced-boxes", type=Path, help='JSON mapping clip_id -> [{"frame_idx": int, "box": [x1,y1,x2,y2]}], listing faces a human confirmed were missed. Requires --force-reprocess to re-run an already-manifested clip.')
+    p.add_argument("--pose-prior", type=Path,
+                   help="private pre-redaction PoseLandmarker artifact (or directory of "
+                        "<clip_id>.pose_prior.json files). SHADOW ONLY: cannot change fill.")
+    p.add_argument("--pose-shadow-report", type=Path,
+                   help="private JSON report (or directory) for pose overlap scores; required "
+                        "with --pose-prior and never written into --output-dir.")
     p.add_argument("--watchdog-hours", type=float, default=8.0)
     p.add_argument("--no-watchdog", action="store_true")
     p.add_argument("--skip-shutdown", action="store_true", help="for local/laptop testing")
@@ -424,7 +688,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
             f"otherwise the audit's low-confidence band is empty and the "
             f"candidate-miss check can never fire."
         )
+    if (a.pose_prior is None) != (a.pose_shadow_report is None):
+        p.error("--pose-prior and --pose-shadow-report must be supplied together")
     od = a.output_dir.expanduser().resolve()
+    checkpoint_dir = (
+        a.checkpoint_dir.expanduser().resolve()
+        if a.checkpoint_dir is not None
+        else od.parent / "private" / f"{od.name}-checkpoints"
+    )
+    try:
+        _require_private_artifact_path(checkpoint_dir, "--checkpoint-dir")
+    except argparse.ArgumentTypeError as exc:
+        p.error(str(exc))
+    if checkpoint_dir == od or od in checkpoint_dir.parents:
+        p.error("--checkpoint-dir must not be inside --output-dir; checkpoints derive from originals")
     if a.probe_frames_dir is None:
         # resolve() first: with --output-dir "." or ".." the unresolved name
         # is empty, and the "sibling" landed INSIDE the publish tree —
@@ -438,10 +715,21 @@ def parse_args(argv: list[str] | None = None) -> Config:
             f" synced off the pod and published."
         )
     a.probe_frames_dir = pfd
+    if a.pose_prior is not None:
+        a.pose_prior = a.pose_prior.expanduser().resolve()
+        a.pose_shadow_report = a.pose_shadow_report.expanduser().resolve()
+        try:
+            _require_private_artifact_path(a.pose_prior, "--pose-prior")
+            _require_private_artifact_path(a.pose_shadow_report, "--pose-shadow-report")
+        except argparse.ArgumentTypeError as exc:
+            p.error(str(exc))
+        if a.pose_shadow_report == od or od in a.pose_shadow_report.parents:
+            p.error("--pose-shadow-report must not be inside --output-dir; it derives from originals")
 
     return Config(
         input_dir=a.input_dir,
         output_dir=a.output_dir,
+        checkpoint_dir=checkpoint_dir,
         run_id=a.run_id,
         gen=a.gen,
         device=a.device,
@@ -480,6 +768,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         detect_batch=a.detect_batch,
         continue_threshold=a.continue_threshold,
         min_track_confirmations=a.min_track_confirmations,
+        pose_prior=a.pose_prior,
+        pose_shadow_report=a.pose_shadow_report,
     )
 
 
@@ -2422,7 +2712,7 @@ def check_low_threshold_sweep(detections: list[Detection], fill_map: dict,
 
 def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
                  fill_map: dict, detect_hz: float, fps: float, n_frames: int,
-                 full_range: bool = False) -> dict:
+                 full_range: bool = False, record_detections: bool = False) -> dict:
     """Second, independent detector — different training distribution
     (WIDER FACE, not egocentric) and inductive biases from EgoBlur, so it
     catches a different slice of misses. MIT-licensed, ships inside
@@ -2457,6 +2747,10 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
     stderr_log = cfg.output_dir / "logs" / f"{out_path.stem}.yunet_decode.stderr.log"
     proc = open_decoder(ffmpeg, out_path, stderr_log)
     uncovered = []
+    # The normal audit persists only uncovered faces.  The standalone local
+    # reviewer can opt in to this in-memory list to render a private overlay;
+    # it is never written to the regular EgoBlur manifest.
+    detected = [] if record_detections else None
     frames_seen = 0
     for idx, (y, u, v) in enumerate(read_frames(proc, w, h)):
         frames_seen = idx + 1
@@ -2478,8 +2772,12 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
             if score < YUNET_SCORE_MIN:
                 continue
             box = (float(f[0]), float(f[1]), float(f[0] + f[2]), float(f[1] + f[3]))
-            if not _box_is_covered(box, boxes_here):
-                uncovered.append({"frame_idx": idx, "box": box, "score": score})
+            covered = _box_is_covered(box, boxes_here)
+            row = {"frame_idx": idx, "box": box, "score": score}
+            if detected is not None:
+                detected.append({**row, "covered": covered})
+            if not covered:
+                uncovered.append(row)
     proc.wait()
     # Fail closed, same reasoning as check_fill_integrity: a dead decode
     # produces zero uncovered faces, which is indistinguishable from a
@@ -2494,12 +2792,15 @@ def check_yunet(cfg: Config, ffmpeg: str, out_path: Path, w: int, h: int,
             f"YuNet decode of {out_path} yielded {frames_seen} frames, "
             f"expected {n_frames} — a short decode reads as zero findings."
         )
-    return {
+    result = {
         "n_yunet_uncovered": len(uncovered),
         "yunet_uncovered": uncovered[:AUDIT_MAX_ITEMS],
         "yunet_truncated": max(0, len(uncovered) - AUDIT_MAX_ITEMS),
         "yunet_frames": frames_seen,
     }
+    if detected is not None:
+        result["yunet_detections"] = detected
+    return result
 
 
 def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
@@ -2860,6 +3161,11 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     t0 = time.monotonic()
     log.info("=== %s ===", clip.clip_id)
 
+    # Validate before burning GPU time. The prior is read-only shadow input:
+    # this branch deliberately runs before detection but never changes a
+    # detector call, threshold, track, fill box or audit result below.
+    pose_prior = load_pose_prior_for_clip(cfg, clip)
+
     detections = detection_pass(cfg, clip, face_det, lp_det, ffmpeg,
                                  checkpoint_dir, gen)
     t_detect = time.monotonic()
@@ -2896,6 +3202,12 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
         log.info("%s: hysteresis absorbed %d low-confidence detection(s) into "
                   "existing tracks (continue>%.2f, start>%.2f)", clip.clip_id,
                   len(low_absorbed), cfg.continue_threshold, cfg.face_threshold)
+    pose_shadow = None
+    if pose_prior is not None:
+        prior_path, prior_sha256, regions_by_frame = pose_prior
+        pose_shadow = build_pose_shadow_report(
+            clip, cfg, prior_path, prior_sha256, regions_by_frame, detections, tracks
+        )
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
     # Count FACE-covered frames separately before the tracks go away.
@@ -2961,6 +3273,11 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     write_manifest(clip, gen, cfg, out_path, audit,
                     timing, cfg.output_dir / f"{clip.clip_id}.manifest.json",
                     hold_frames=hold_frames, back_hold_frames=back_hold)
+    if pose_shadow is not None:
+        shadow_path = _pose_shadow_path_for_clip(cfg, clip.clip_id)
+        write_pose_shadow_report(shadow_path, pose_shadow)
+        log.info("%s: wrote shadow-only wearer-limb overlap report to %s",
+                 clip.clip_id, shadow_path)
 
     log.info("%s: %s (%.1fs)", clip.clip_id, audit["status"], timing["total_s"])
     return audit
@@ -2977,6 +3294,11 @@ def main(argv: list[str] | None = None) -> int:
         preflight(cfg)
         ffmpeg, ffprobe = _bin("ffmpeg"), _bin("ffprobe")
         clips = discover_clips(cfg.input_dir, ffprobe)
+        if cfg.pose_shadow_report is not None and cfg.pose_shadow_report.suffix and len(clips) > 1:
+            raise RuntimeError(
+                "--pose-shadow-report must be a directory for a multi-clip run; a single JSON "
+                "path would overwrite one clip's private original-derived report with another's"
+            )
         gen, face_det, lp_det = build_detectors(cfg)
 
         budget = probe_and_budget(cfg, clips, face_det, lp_det, ffmpeg)
@@ -2985,8 +3307,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_dir = cfg.output_dir / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
+        checkpoint_dir = cfg.checkpoint_dir
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # One bad clip (corrupt file, a transient CUDA error) must not
         # abort clips that haven't been attempted yet — that would leave
