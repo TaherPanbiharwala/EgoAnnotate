@@ -36,6 +36,11 @@ HAND_MODEL_FILENAME = "hand_landmarker.task"
 HAND_MODEL_MIN_BYTES = 5_000_000
 HAND_MODEL_SHA256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
 HAND_NUM_HANDS = 2
+# A separate private review pass may request more than the two hands used by
+# the active policy.  Seeing three or four hands at once is valuable evidence
+# for a person reviewing the original-only preview, but it must not silently
+# change the pinned active-suppression detector configuration.
+HAND_REVIEW_NUM_HANDS = 4
 HAND_MIN_CONFIDENCE = 0.5
 HAND_DETECT_HZ = 10.0
 
@@ -66,6 +71,13 @@ ACTIVE_SUPPRESSION_CONFIGURATION = {
 HAND_PREVIEW_STABLE_BGR = (0, 191, 255)  # amber
 HAND_PREVIEW_PROVISIONAL_BGR = (255, 0, 255)  # magenta
 HAND_PREVIEW_OTHER_BGR = (255, 180, 0)  # blue
+
+# These zones are visual anchors, not anatomical identity claims.  They give
+# a reviewer a compact answer to “where did this short continuity track enter
+# the frame?” while deliberately leaving long-gap re-identification unknown.
+SCREEN_SIDE_LEFT_FRAC = 1 / 3
+SCREEN_SIDE_RIGHT_FRAC = 2 / 3
+ENTRY_EDGE_MARGIN = 0.20
 
 
 def sha256_file(path: Path) -> str:
@@ -165,6 +177,33 @@ def _center(points: Iterable[tuple[float, float]]) -> tuple[float, float]:
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _screen_side(center: Iterable[float], width: int) -> str:
+    """Return the current image-side label for private visual review."""
+    x, _y = (float(value) for value in center)
+    if x <= width * SCREEN_SIDE_LEFT_FRAC:
+        return "left"
+    if x >= width * SCREEN_SIDE_RIGHT_FRAC:
+        return "right"
+    return "centre"
+
+
+def _entry_zone(center: Iterable[float], width: int, height: int) -> str:
+    """Return the closest edge at a track's first observed sample.
+
+    The label is a review anchor only.  In particular, a new track entering
+    on the opposite side after an occlusion is not declared to be a different
+    person: long-gap identity is intentionally left unknown.
+    """
+    x, y = (float(value) for value in center)
+    distances = {
+        "left": x / width,
+        "right": (width - x) / width,
+        "bottom": (height - y) / height,
+    }
+    zone, distance = min(distances.items(), key=lambda item: item[1])
+    return zone if distance <= ENTRY_EDGE_MARGIN else "interior"
 
 
 def hand_region(
@@ -298,6 +337,56 @@ def _track_hands(
             ) in stable
 
 
+def _annotate_review_anchors(
+    frames: list[dict[str, Any]], *, width: int, height: int
+) -> dict[str, int]:
+    """Attach short-lived visual anchors and multi-hand diagnostics.
+
+    ``track_id`` already encodes only close-range continuity.  This layer
+    exposes that limitation rather than pretending it is person
+    re-identification: a reappearing hand after a gap starts a new anchor and
+    is explicitly unknown.  Model handedness is copied into the display
+    fields, but it is never used to merge/split anchors or change redaction.
+    """
+    anchors: dict[int, dict[str, Any]] = {}
+    max_simultaneous_hands = 0
+    n_frames_with_three_or_more_hands = 0
+    for row in frames:
+        hands = row["hands"]
+        n_hands = len(hands)
+        max_simultaneous_hands = max(max_simultaneous_hands, n_hands)
+        if n_hands >= 3:
+            n_frames_with_three_or_more_hands += 1
+        for hand in hands:
+            track_id = int(hand["track_id"])
+            center = hand["center"]
+            anchor = anchors.get(track_id)
+            if anchor is None:
+                anchor = {
+                    "id": f"H{track_id}",
+                    "entry_zone": _entry_zone(center, width, height),
+                    "first_frame_idx": int(row["frame_idx"]),
+                }
+                anchors[track_id] = anchor
+            # The score comes from MediaPipe's handedness category.  Retain a
+            # named copy so a reviewer cannot mistake it for wearer identity.
+            hand["model_handedness"] = hand.get("handedness")
+            hand["model_handedness_score"] = float(hand["score"])
+            hand["screen_side"] = _screen_side(center, width)
+            hand["review_anchor"] = {
+                **anchor,
+                "status": "short_continuity_only",
+                "long_gap_reidentification": "unknown",
+            }
+            hand["simultaneous_hand_count"] = n_hands
+            hand["additional_hand_observed"] = n_hands >= 3
+    return {
+        "max_simultaneous_hands": max_simultaneous_hands,
+        "n_frames_with_three_or_more_hands": n_frames_with_three_or_more_hands,
+        "n_short_continuity_anchors": len(anchors),
+    }
+
+
 def _draw_hand(frame_bgr: Any, hand: dict[str, Any]) -> None:
     stable = bool(hand.get("stable_wearer_candidate"))
     candidate = bool(hand.get("wearer_candidate"))
@@ -338,13 +427,32 @@ def _draw_hand(frame_bgr: Any, hand: dict[str, Any]) -> None:
         cv2.line(frame_bgr, points[first], points[second], color, 2, cv2.LINE_AA)
     center = tuple(round(float(value)) for value in hand["center"])
     cv2.circle(frame_bgr, center, max(1, round(float(hand["radius"]))), color, 2, cv2.LINE_AA)
-    label = f"hand {hand['track_id']} {'stable wearer' if stable else 'candidate' if candidate else 'other'}"
+    role = "stable wearer" if stable else "candidate" if candidate else "other"
+    anchor = hand.get("review_anchor", {})
+    model_label = hand.get("model_handedness") or hand.get("handedness") or "unknown"
+    model_score = float(hand.get("model_handedness_score", hand.get("score", 0.0)))
+    anchor_id = anchor.get("id") or f"H{hand['track_id']}"
+    label = f"{anchor_id} {role}"
+    detail = (
+        f"MP:{model_label} {model_score:.2f} | entry:{anchor.get('entry_zone', '?')} "
+        f"| now:{hand.get('screen_side', '?')}"
+    )
     cv2.putText(
         frame_bgr,
         label,
         (center[0] + 4, max(16, center[1] - 4)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.42,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame_bgr,
+        detail,
+        (center[0] + 4, min(frame_bgr.shape[0] - 4, center[1] + 14)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
         color,
         1,
         cv2.LINE_AA,
@@ -384,14 +492,27 @@ def _write_preview(
             for hand in latest_hands:
                 _draw_hand(preview_frame, hand)
             sampled = "sample" if source_idx in by_frame else "held"
-            label = f"Hand {sampled} | amber: stable wearer | magenta: provisional | blue: other"
-            cv2.rectangle(preview_frame, (0, 0), (min(info.width, 790), 32), (0, 0, 0), -1)
+            label = (
+                f"Hand {sampled} | amber: stable wearer | magenta: provisional | blue: other"
+            )
+            extra = " | 3+ hands: review only" if len(latest_hands) >= 3 else ""
+            cv2.rectangle(preview_frame, (0, 0), (min(info.width, 990), 50), (0, 0, 0), -1)
             cv2.putText(
                 preview_frame,
-                label,
+                label + extra,
                 (8, 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                preview_frame,
+                "H#: short continuity anchor | MP Left/Right is a hint, not identity | entry/now are image zones",
+                (8, 42),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
                 (255, 255, 255),
                 1,
                 cv2.LINE_AA,
@@ -499,6 +620,9 @@ def build_hand_prior(
         )
     stride = max(1, round(info.fps / detect_hz))
     _track_hands(frames, stride=stride, width=info.width, height=info.height)
+    review_anchor_summary = _annotate_review_anchors(
+        frames, width=info.width, height=info.height
+    )
     if preview_video is not None:
         _write_preview(original_video, preview_video, info, frames)
 
@@ -524,6 +648,13 @@ def build_hand_prior(
             **ACTIVE_SUPPRESSION_CONFIGURATION,
             "num_hands": num_hands,
             "min_confidence": confidence,
+        },
+        "review_anchors": {
+            **review_anchor_summary,
+            "policy": (
+                "short_continuity_only; model_handedness_and_image_zone_are_review_hints; "
+                "long_gap_reidentification_is_unknown"
+            ),
         },
         "frames": frames,
     }
@@ -669,6 +800,11 @@ def load_hand_prior(
         by_frame[frame_idx] = {
             "all": hands,
             "wearer": [hand for hand in hands if hand["wearer_candidate"]],
+            "provisional_wearer": [
+                hand
+                for hand in hands
+                if hand["wearer_candidate"] and not hand["stable_wearer_candidate"]
+            ],
             "stable_wearer": [hand for hand in hands if hand["stable_wearer_candidate"]],
         }
     if set(by_frame) != expected_indices:

@@ -585,7 +585,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="optional private original-only hand overlay (amber stable wearer; magenta provisional; blue other)",
     )
     hand_prior.add_argument("--detect-hz", type=float, default=hand_prior_layer.HAND_DETECT_HZ)
-    hand_prior.add_argument("--num-hands", type=int, default=hand_prior_layer.HAND_NUM_HANDS)
+    hand_prior.add_argument(
+        "--num-hands",
+        type=int,
+        default=hand_prior_layer.HAND_NUM_HANDS,
+        help=(
+            "maximum hands to detect (default: 2 for the pinned active policy; "
+            f"use {hand_prior_layer.HAND_REVIEW_NUM_HANDS} for private multi-hand review)"
+        ),
+    )
     hand_prior.add_argument("--confidence", type=float, default=hand_prior_layer.HAND_MIN_CONFIDENCE)
 
     decisions = sub.add_parser(

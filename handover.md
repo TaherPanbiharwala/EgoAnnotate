@@ -1,5 +1,48 @@
 # egoannote — session handover
 
+## Current checkpoint and next-chat focus (2026-08-25)
+
+`master` is at `6a8828d` (`fix: harden active wearer hand suppression`), and
+the working tree was clean when this note was updated. The current pod has
+successfully completed the private Hand Landmarker pre-pass for `GX010057`:
+
+- artifact: `/workspace/private/hand-prior/GX010057.hand_prior.json`;
+- private original-only preview:
+  `/workspace/private/hand-preview/GX010057.hands.mp4`.
+
+The preview has **not** yet been visually reviewed. Before running active
+hand suppression, make a fresh **four-hand diagnostic** prior/preview (the
+existing artifact requested only two hands, so it cannot show a third hand).
+The new preview labels `H#` short-continuity anchors, MediaPipe's `MP:
+Left/Right` hint and score, plus `entry` and `now` image zones; a `3+ hands`
+badge is review evidence only. A long-gap re-entry deliberately receives a
+new `H#` and is `unknown`, never automatically classified as wearer or
+outsider. This four-hand artifact is diagnostic-only and must not be passed
+to active suppression, which remains pinned to a separately generated,
+reviewed two-hand artifact. Inspect amber/magenta/blue labels before that
+second pass; if amber follows another person, do not run active suppression.
+If it is reliable, run the documented `gx010057-active-hand-v1` pilot,
+inspect the separate private suppression report, and manually review its
+redacted output. No private artifact, preview, checkpoint, or report may be
+uploaded to Hugging Face.
+
+The user's requested focus for the next chat is to **review and edit the
+dense VLM captioning design/code**, rather than run a paid caption batch.
+Start with `docs/MEDIAPIPE_VLM_PIPELINE.md`, `prompts/caption_v4.txt`,
+`src/egoannote/layers/caption.py`, `src/egoannote/parse.py`, and
+`src/egoannote/schema.py`. Preserve these non-negotiable output tracks for
+every six-second redacted-video window:
+
+1. one holistic `activity.caption` describing the full activity as it unfolds;
+2. temporally bounded atomic `actions[]`; and
+3. one dense caption plus structured state for each visible anatomical hand
+   (`left_hand` and `right_hand`).
+
+Captioning must remain redacted-video-only. It has not yet been run against
+real verified footage: `models.toml` still needs two real, cross-lab provider
+entries, pinned providers/prices, and `OPENROUTER_API_KEY`. Do not change
+Stage 2, WiLoR, SAM2, or DepthV3 in that captioning-focused chat.
+
 ## Current redaction-review work (2026-08-25)
 
 Stage 2 and YuNet are paused for the current run. The active protocol is
@@ -30,6 +73,11 @@ but must not be run for this pilot.
   forces `NEEDS_REVIEW` and must be reviewed in the private hand report. For
   batches, use a private `--hand-suppression-report` directory so every clip
   retains its own suppression evidence.
+  Magenta/provisional overlap now also produces a **private report-only**
+  `pink_amplification_candidate` when one same provisional hand accounts for
+  every raw face hit in a track that later receives interpolation/hold fills.
+  This is evidence for review, not permission to change blur pixels or leave
+  any face unredacted.
 - EgoBlur's raw detector checkpoints are original-derived and now require a
   private `--checkpoint-dir`; never keep them beside a publishable redacted
   output directory.
@@ -51,11 +99,9 @@ run retained for comparison. The nonzero-suppression result must remain
 Written 2026-08-11, substantially rewritten in a later session once the
 "do this first" item below was actually resolved (with evidence, not a
 visual spot-check) and two of the three remaining hysteresis blockers got
-fixed. Repo HEAD at time of writing: **`5cca081`** — but the working tree
-has real, tested, uncommitted changes on top of that (see "What's
-uncommitted right now" below); this is **not** a clean-tree handoff.
-316 tests passing (`uv run --extra test pytest tests/ -q`), including the
-uncommitted work.
+fixed. This historical section predates the checkpoint above. The current
+repository state is `master` at **`6a8828d`** with the active-hand hardening
+committed; the latest local validation was **342 passing tests**.
 
 ## Latest pipeline attempt — blocked on a corrupt redacted artifact (2026-08-24)
 

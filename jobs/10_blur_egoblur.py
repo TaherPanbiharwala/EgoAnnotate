@@ -441,34 +441,10 @@ def suppress_stable_wearer_hand_tracks(
         if track.cls != "face":
             kept.append(track)
             continue
-        raw = [
-            (frame_idx, box)
-            for frame_idx, (box, source) in track.frames.items()
-            if source in {"det", "det_low"}
-        ]
-        candidate_ids = [
-            {
-                int(region["track_id"])
-                for region in stable_regions_by_frame.get(frame_idx, [])
-                if pose_overlap_fraction(box, [region]) is not None
-                and pose_overlap_fraction(box, [region]) >= HAND_ACTIVE_MIN_OVERLAP
-            }
-            for frame_idx, box in raw
-        ]
-        common_ids = set.intersection(*candidate_ids) if candidate_ids else set()
-        if len(raw) >= HAND_ACTIVE_MIN_TRACK_HITS and common_ids:
-            hand_track_id = min(common_ids)
-            overlaps = [
-                pose_overlap_fraction(
-                    box,
-                    [
-                        region
-                        for region in stable_regions_by_frame.get(frame_idx, [])
-                        if int(region["track_id"]) == hand_track_id
-                    ],
-                )
-                for frame_idx, box in raw
-            ]
+        raw = raw_face_track_detections(track)
+        evidence = same_hand_overlap_evidence(raw, stable_regions_by_frame)
+        if len(raw) >= HAND_ACTIVE_MIN_TRACK_HITS and evidence is not None:
+            hand_track_id, overlaps = evidence
             suppressed.append({
                 "track_id": track.track_id,
                 "hand_track_id": hand_track_id,
@@ -481,6 +457,51 @@ def suppress_stable_wearer_hand_tracks(
             continue
         kept.append(track)
     return kept, suppressed
+
+
+def raw_face_track_detections(track: Track) -> list[tuple[int, tuple]]:
+    """Return a face track's detector-backed boxes, excluding generated fills."""
+    return [
+        (frame_idx, box)
+        for frame_idx, (box, source) in sorted(track.frames.items())
+        if source in {"det", "det_low"}
+    ]
+
+
+def same_hand_overlap_evidence(
+    raw: list[tuple[int, tuple]], regions_by_frame: dict[int, list[dict]],
+) -> tuple[int, list[float]] | None:
+    """Prove every raw face hit overlaps one same private hand track.
+
+    This helper is deliberately equally strict for stable (active) and
+    provisional (pink, review-only) hand evidence.  ``None`` means no such
+    proof; it must never be read as permission to leave a face unredacted.
+    """
+    candidate_ids = []
+    for frame_idx, box in raw:
+        ids = {
+            int(region["track_id"])
+            for region in regions_by_frame.get(frame_idx, [])
+            if (overlap := pose_overlap_fraction(box, [region])) is not None
+            and overlap >= HAND_ACTIVE_MIN_OVERLAP
+        }
+        candidate_ids.append(ids)
+    common_ids = set.intersection(*candidate_ids) if candidate_ids else set()
+    if not common_ids:
+        return None
+    hand_track_id = min(common_ids)
+    overlaps = [
+        pose_overlap_fraction(
+            box,
+            [
+                region
+                for region in regions_by_frame.get(frame_idx, [])
+                if int(region["track_id"]) == hand_track_id
+            ],
+        )
+        for frame_idx, box in raw
+    ]
+    return hand_track_id, overlaps
 
 
 def load_pose_prior_for_clip(cfg: Config, clip: ClipInfo) -> tuple[Path, str, dict[int, dict]] | None:
@@ -742,6 +763,11 @@ def load_hand_prior_for_clip(
         by_frame[frame_idx] = {
             "all": hands,
             "wearer": [hand for hand in hands if hand["wearer_candidate"]],
+            "provisional_wearer": [
+                hand
+                for hand in hands
+                if hand["wearer_candidate"] and not hand["stable_wearer_candidate"]
+            ],
             "stable_wearer": [hand for hand in hands if hand["stable_wearer_candidate"]],
         }
     if set(by_frame) != expected_frames:
@@ -757,7 +783,12 @@ def build_hand_suppression_report(
     regions_by_frame: dict[int, dict], detections: list[Detection], tracks: list[Track],
     suppressed_tracks: list[dict],
 ) -> dict:
-    """Write private evidence for a hand-prior active suppression decision."""
+    """Write private evidence for active and provisional hand-prior decisions.
+
+    Provisional (pink) hand evidence is a review signal only.  It is never
+    passed to active suppression and cannot change a detector input, track,
+    fill map, encoded video, or status.
+    """
     face_detections = [detection for detection in detections if detection.cls == "face"]
     samples = [
         {
@@ -770,12 +801,58 @@ def build_hand_suppression_report(
             "wearer_hand_overlap": pose_overlap_fraction(
                 detection.box, regions_by_frame[detection.frame_idx]["wearer"]
             ),
+            "provisional_wearer_hand_overlap": pose_overlap_fraction(
+                detection.box, regions_by_frame[detection.frame_idx]["provisional_wearer"]
+            ),
             "stable_wearer_hand_overlap": pose_overlap_fraction(
                 detection.box, regions_by_frame[detection.frame_idx]["stable_wearer"]
             ),
         }
         for detection in face_detections
     ]
+    pink_amplification_candidates: list[dict] = []
+    for track in tracks:
+        if track.cls != "face":
+            continue
+        raw = raw_face_track_detections(track)
+        evidence = same_hand_overlap_evidence(
+            raw,
+            {
+                frame_idx: frame_regions["provisional_wearer"]
+                for frame_idx, frame_regions in regions_by_frame.items()
+                if frame_regions["provisional_wearer"]
+            },
+        )
+        if evidence is None:
+            continue
+        hand_track_id, overlaps = evidence
+        extended = [
+            (frame_idx, source)
+            for frame_idx, (_box, source) in sorted(track.frames.items())
+            if source in {"interp", "hold"}
+        ]
+        # A pink hand matters here only when a detector-backed false positive
+        # plausibly expanded into generated fills.  Raw-only tracks remain in
+        # detection_samples but need no special amplification review.
+        if not extended:
+            continue
+        pink_amplification_candidates.append({
+            "track_id": track.track_id,
+            "provisional_hand_track_id": hand_track_id,
+            "n_raw_detections": len(raw),
+            "n_extended_fill_frames": len(extended),
+            "n_interpolated_fill_frames": sum(source == "interp" for _, source in extended),
+            "n_hold_fill_frames": sum(source == "hold" for _, source in extended),
+            "raw_detections": [
+                {
+                    "frame_idx": frame_idx,
+                    "box": list(box),
+                    "provisional_hand_overlap": overlap,
+                }
+                for (frame_idx, box), overlap in zip(raw, overlaps, strict=True)
+            ],
+            "suggested_action": "review_only_no_pixel_change",
+        })
     return {
         "schema_version": 1,
         "review_type": "egoblur_hand_suppression",
@@ -801,13 +878,24 @@ def build_hand_suppression_report(
                 bool(frame_regions["stable_wearer"])
                 for frame_regions in regions_by_frame.values()
             ),
+            "n_provisional_wearer_hand_frames": sum(
+                bool(frame_regions["provisional_wearer"])
+                for frame_regions in regions_by_frame.values()
+            ),
             "n_suppressed_tracks": len(suppressed_tracks),
+            "n_pink_amplification_candidates": len(pink_amplification_candidates),
+            "n_pink_amplification_extended_fill_frames": sum(
+                row["n_extended_fill_frames"] for row in pink_amplification_candidates
+            ),
         },
         "detection_samples": samples,
         "suppressed_tracks": suppressed_tracks,
+        "pink_amplification_candidates": pink_amplification_candidates,
         "warning": (
             "Active wearer-hand suppression is experimental. Any nonzero suppression "
-            "count keeps this run in NEEDS_REVIEW and requires private human review."
+            "count keeps this run in NEEDS_REVIEW and requires private human review. "
+            "Pink provisional-hand overlap is private review evidence only and does not "
+            "change detection, tracks, fills, encoded pixels, or status."
         ),
     }
 

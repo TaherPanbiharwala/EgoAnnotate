@@ -124,13 +124,21 @@ either command's `--detect-hz` value. Its preview makes the evidence reviewable:
 candidate, magenta is a provisional candidate that cannot suppress anything,
 and blue is another hand.
 
+For the first human review, request four hands. This enables the preview to
+show a potential third/fourth hand rather than silently dropping it at the
+detector limit. This four-hand artifact is **diagnostic only** and must not be
+passed to `--hand-suppress-wearer-hands`: active suppression remains pinned to
+the reviewed two-hand configuration. If active suppression is approved after
+review, make a separate, fresh two-hand artifact.
+
 ```bash
 uv run egoannote-run hand-prior \
   --original-video /workspace/in/GX010057.MP4 \
   --video-id GX010057 \
-  --output /workspace/private/hand-prior/GX010057.hand_prior.json \
+  --num-hands 4 \
+  --output /workspace/private/hand-prior/GX010057.review4.hand_prior.json \
   --models-dir /workspace/private/models \
-  --preview-video /workspace/private/hand-preview/GX010057.hands.mp4
+  --preview-video /workspace/private/hand-preview/GX010057.review4.mp4
 ```
 
 The first call downloads the versioned official Hand Landmarker model to the
@@ -138,6 +146,22 @@ private model cache. The artifact stores source/model hashes, every 10 Hz
 sample (including no-hand frames), 21 two-dimensional hand landmarks, its
 short temporal hand-track identifier, and the wearer-candidate/stable state.
 It is original-derived and must never be published.
+
+Each preview label additionally exposes review-only identity evidence:
+
+- `H23` is a **short-continuity anchor**, not a person ID. A hand that is
+  absent longer than the small tracking grace period gets a new anchor; the
+  system records its identity as unknown rather than pretending it has
+  re-identified the hand.
+- `MP: Left 0.94` or `MP: Right 0.94` is MediaPipe's anatomical-handedness
+  hint and its confidence. It is displayed, but never used to merge anchors,
+  decide wearer identity, or change blur.
+- `entry: left | now: right` is the image-side/edge evidence for that short
+  anchor. It helps a human inspect a suspicious re-entry, but a change of side
+  is not proof of a different person in a moving egocentric camera.
+- `3+ hands: review only` means three or more hands were detected in that
+  sample. It is strong evidence to inspect an extra hand, not an automatic
+  outsider or redaction decision.
 
 Only a stable candidate can affect the fill map. The active gate additionally
 requires all of the following:
@@ -155,6 +179,15 @@ thresholds, tracking association, or the treatment of other people. It only
 filters an already-built, exceptionally well-supported false-positive track.
 A nonzero suppression count always yields `NEEDS_REVIEW`; it is never a
 publication approval.
+
+Magenta evidence has a separate, private reporting role. If every raw
+EgoBlur face box in a track overlaps the same provisional wearer-hand track,
+and that face track then gains generated interpolation or hold fills, the
+private hand-suppression report records it as a
+`pink_amplification_candidate`. This lets review target brief hand detections
+that may have produced a visibly long false-positive fill. It is strictly
+shadow-only: magenta never suppresses a track or changes detection, fill-map,
+encoded pixels, or run status.
 
 Use fresh output/checkpoint/report destinations, preserving the ordinary run
 for byte/hash comparison:

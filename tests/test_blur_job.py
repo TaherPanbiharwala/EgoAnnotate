@@ -175,6 +175,52 @@ def test_pose_shadow_reports_wearer_overlap_without_mutating_detection_or_tracks
     assert report["detection_samples"][0]["wearer_limb_overlap"] is None
 
 
+def test_pink_hand_overlap_reports_fill_amplification_without_changing_tracks(blur_job, tmp_path):
+    """Brief wearer-hand evidence is useful review data, never an active gate."""
+    clip = _clip(blur_job, sha256="a" * 64)
+    hand = {
+        "shape": "circle", "kind": "hand", "center": [5.0, 50.0], "radius": 20.0,
+        "track_id": 12,
+    }
+    detections = [
+        blur_job.Detection(frame_idx, "face", (0.0, 45.0, 10.0, 55.0), 0.9)
+        for frame_idx in (0, 3)
+    ]
+    track = blur_job.Track(track_id=7, cls="face", last_frame=5)
+    for detection in detections:
+        track.frames[detection.frame_idx] = (detection.box, "det")
+    track.frames[4] = (detections[0].box, "interp")
+    track.frames[5] = (detections[0].box, "hold")
+    regions = {
+        frame_idx: {
+            "all": [hand], "wearer": [hand], "provisional_wearer": [hand],
+            "stable_wearer": [],
+        }
+        for frame_idx in (0, 3)
+    }
+    cfg = SimpleNamespace(detect_hz=10.0, face_threshold=0.3, min_track_confirmations=2)
+    prior_path = tmp_path / "private" / "clip.hand_prior.json"
+    prior_path.parent.mkdir()
+    prior_path.write_text("{}", encoding="utf-8")
+    before_detections = copy.deepcopy(detections)
+    before_frames = copy.deepcopy(track.frames)
+
+    report = blur_job.build_hand_suppression_report(
+        clip, cfg, prior_path, "b" * 64, regions, detections, [track], []
+    )
+
+    assert detections == before_detections
+    assert track.frames == before_frames
+    assert report["summary"]["n_pink_amplification_candidates"] == 1
+    assert report["summary"]["n_pink_amplification_extended_fill_frames"] == 2
+    candidate = report["pink_amplification_candidates"][0]
+    assert candidate["provisional_hand_track_id"] == 12
+    assert candidate["n_interpolated_fill_frames"] == 1
+    assert candidate["n_hold_fill_frames"] == 1
+    assert candidate["suggested_action"] == "review_only_no_pixel_change"
+    assert report["detection_samples"][0]["provisional_wearer_hand_overlap"] == 1.0
+
+
 def test_prior_flags_must_be_private_and_paired(blur_job, capsys):
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--pose-prior", "/tmp/private/prior.json"])

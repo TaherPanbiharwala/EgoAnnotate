@@ -72,6 +72,55 @@ def test_stable_wearer_status_requires_temporal_hand_continuity() -> None:
     assert not any(row["hands"][0]["stable_wearer_candidate"] for row in interrupted)
 
 
+def test_review_anchors_show_handedness_and_three_hand_evidence_without_identity_claims() -> None:
+    frames = [
+        {
+            "frame_idx": 0,
+            "hands": [
+                {**_hand(0.10, 0.88), "handedness": "Left"},
+                {**_hand(0.90, 0.88), "handedness": "Right"},
+                {**_hand(0.50, 0.88), "handedness": "Right"},
+            ],
+        }
+    ]
+    hand_prior._track_hands(frames, stride=2, width=100, height=100)
+    summary = hand_prior._annotate_review_anchors(frames, width=100, height=100)
+
+    left, right, middle = frames[0]["hands"]
+    assert summary == {
+        "max_simultaneous_hands": 3,
+        "n_frames_with_three_or_more_hands": 1,
+        "n_short_continuity_anchors": 3,
+    }
+    assert left["review_anchor"]["id"] == "H0"
+    assert left["review_anchor"]["entry_zone"] == "left"
+    assert left["screen_side"] == "left"
+    assert right["review_anchor"]["entry_zone"] == "right"
+    assert right["screen_side"] == "right"
+    assert middle["model_handedness"] == "Right"
+    assert middle["model_handedness_score"] == pytest.approx(0.9)
+    assert middle["additional_hand_observed"] is True
+    assert middle["review_anchor"]["long_gap_reidentification"] == "unknown"
+
+
+def test_review_anchors_do_not_reidentify_a_hand_after_a_long_gap() -> None:
+    frames = [
+        {"frame_idx": 0, "hands": [_hand(0.10, 0.88)]},
+        {"frame_idx": 2, "hands": []},
+        {"frame_idx": 4, "hands": []},
+        {"frame_idx": 6, "hands": [_hand(0.90, 0.88)]},
+    ]
+    hand_prior._track_hands(frames, stride=2, width=100, height=100)
+    hand_prior._annotate_review_anchors(frames, width=100, height=100)
+
+    first = frames[0]["hands"][0]
+    reappeared = frames[3]["hands"][0]
+    assert first["review_anchor"]["id"] != reappeared["review_anchor"]["id"]
+    assert first["review_anchor"]["entry_zone"] == "left"
+    assert reappeared["review_anchor"]["entry_zone"] == "right"
+    assert reappeared["review_anchor"]["long_gap_reidentification"] == "unknown"
+
+
 def _artifact(path: Path, *, source_sha256: str = "a" * 64, complete: bool = True) -> None:
     rows = [
         {"frame_idx": 0, "hands": [_hand()]},
@@ -121,6 +170,7 @@ def test_hand_prior_loader_rejects_stale_or_incomplete_private_artifacts(tmp_pat
     )
     assert set(loaded) == {0, 2}
     assert loaded[0]["stable_wearer"] == []  # two samples are not enough to act.
+    assert len(loaded[0]["provisional_wearer"]) == 1
 
     with pytest.raises(ValueError, match="provenance does not match"):
         hand_prior.load_hand_prior(
