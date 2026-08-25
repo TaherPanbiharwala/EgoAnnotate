@@ -221,6 +221,38 @@ def test_pink_hand_overlap_reports_fill_amplification_without_changing_tracks(bl
     assert report["detection_samples"][0]["provisional_wearer_hand_overlap"] == 1.0
 
 
+def test_pink_generated_fill_demotion_retains_raw_detections(blur_job):
+    """Pink evidence may trim amplification, never a detector-backed face hit."""
+    hand = {
+        "shape": "circle", "kind": "hand", "center": [5.0, 50.0], "radius": 20.0,
+        "track_id": 12,
+    }
+    track = blur_job.Track(track_id=7, cls="face", last_frame=8)
+    box = (0.0, 45.0, 10.0, 55.0)
+    track.frames = {
+        0: (box, "det"),
+        1: (box, "interp"),
+        4: (box, "interp"),
+        8: (box, "det"),
+        9: (box, "hold"),
+        12: (box, "hold"),
+    }
+
+    demoted = blur_job.demote_provisional_hand_generated_fills(
+        [track], {0: [hand], 8: [hand]}, context_frames=1
+    )
+
+    assert set(track.frames) == {0, 1, 8, 9}
+    assert track.frames[0][1] == "det"
+    assert track.frames[8][1] == "det"
+    assert len(demoted) == 1
+    assert demoted[0]["provisional_hand_track_id"] == 12
+    assert demoted[0]["n_generated_fill_frames_removed"] == 2
+    assert demoted[0]["n_interpolated_fill_frames_removed"] == 1
+    assert demoted[0]["n_hold_fill_frames_removed"] == 1
+    assert demoted[0]["policy"] == "raw_detections_retained_generated_fills_capped"
+
+
 def test_prior_flags_must_be_private_and_paired(blur_job, capsys):
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--pose-prior", "/tmp/private/prior.json"])
@@ -244,6 +276,8 @@ def test_prior_flags_must_be_private_and_paired(blur_job, capsys):
         )
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--hand-suppress-wearer-hands"])
+    with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--pink-demote-generated-fills"])
     with pytest.raises(SystemExit):
         blur_job.parse_args(
             [
@@ -418,7 +452,7 @@ def test_checkpoint_dir_must_be_private_and_outside_publishable_output(blur_job)
 
 
 def _audit(blur_job, *, fill=None, integrity=None, sweep=None, yunet=None,
-           hand_suppressed=0):
+           hand_suppressed=0, pink_demoted=0):
     return blur_job.build_audit(
         _clip(blur_job),
         fill if fill is not None else {"n_frames_with_fill": 10},
@@ -428,6 +462,8 @@ def _audit(blur_job, *, fill=None, integrity=None, sweep=None, yunet=None,
         yunet if yunet is not None else {"n_yunet_uncovered": 0},
         "2",
         n_hand_suppressed_tracks=hand_suppressed,
+        n_pink_demoted_tracks=pink_demoted,
+        n_pink_generated_fill_frames_removed=pink_demoted * 2,
     )
 
 
@@ -445,6 +481,12 @@ def test_active_hand_suppression_always_requires_review(blur_job):
     audit = _audit(blur_job, hand_suppressed=1)
     assert audit["status"] == "NEEDS_REVIEW"
     assert "Hand Landmarker wearer-hand suppression" in " ".join(audit["status_reasons"])
+
+
+def test_pink_generated_fill_demotion_always_requires_review(blur_job):
+    audit = _audit(blur_job, pink_demoted=1)
+    assert audit["status"] == "NEEDS_REVIEW"
+    assert "pink Hand Landmarker evidence" in " ".join(audit["status_reasons"])
 
 
 def test_zero_redacted_frames_never_passes(blur_job):

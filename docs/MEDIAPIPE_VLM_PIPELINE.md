@@ -180,14 +180,22 @@ filters an already-built, exceptionally well-supported false-positive track.
 A nonzero suppression count always yields `NEEDS_REVIEW`; it is never a
 publication approval.
 
-Magenta evidence has a separate, private reporting role. If every raw
+Magenta evidence always creates private reporting evidence. If every raw
 EgoBlur face box in a track overlaps the same provisional wearer-hand track,
 and that face track then gains generated interpolation or hold fills, the
 private hand-suppression report records it as a
 `pink_amplification_candidate`. This lets review target brief hand detections
-that may have produced a visibly long false-positive fill. It is strictly
-shadow-only: magenta never suppresses a track or changes detection, fill-map,
-encoded pixels, or run status.
+that may have produced a visibly long false-positive fill.
+
+The default is report-only. An explicit experimental option,
+`--pink-demote-generated-fills`, may lower pink's fill priority slightly: it
+requires at least two raw face hits, each >=98% inside the same provisional
+hand, keeps every raw detector box, and retains only the configured generated
+context around those boxes (12 frames by default, rather than the normal
+45-frame hold). It can remove only `interp`/`hold` entries, never a raw
+`det`/`det_low` entry, and any nonzero change forces `NEEDS_REVIEW`. The
+private report records every removed generated fill. It accepts only the
+pinned two-hand artifact, never the four-hand diagnostic artifact.
 
 Use fresh output/checkpoint/report destinations, preserving the ordinary run
 for byte/hash comparison:
@@ -200,6 +208,8 @@ for byte/hash comparison:
   --pose-shadow-report /workspace/private/pose-shadow/GX010057.hand_pose_shadow.json \
   --hand-prior /workspace/private/hand-prior/GX010057.hand_prior.json \
   --hand-suppression-report /workspace/private/hand-suppression/GX010057.json \
+  --pink-demote-generated-fills \
+  --pink-generated-context-frames 12 \
   --hand-suppress-wearer-hands
 ```
 

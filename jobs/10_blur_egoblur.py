@@ -160,6 +160,11 @@ HAND_PRIOR_MODEL_SHA256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8
 HAND_ACTIVE_MIN_STABLE_SAMPLES = 5
 HAND_ACTIVE_MIN_TRACK_HITS = 4
 HAND_ACTIVE_MIN_OVERLAP = 0.98
+# Pink evidence remains too weak to suppress a detector-backed face hit.  It
+# can only shorten surrounding generated coverage, after at least two raw
+# hits agree with one same provisional hand at the same near-total overlap.
+PINK_DEMOTE_MIN_TRACK_HITS = 2
+PINK_GENERATED_CONTEXT_FRAMES_DEFAULT = 12
 HAND_ACTIVE_CONFIGURATION = {
     "num_hands": 2,
     "min_confidence": 0.5,
@@ -318,6 +323,8 @@ class Config:
     hand_prior: Path | None
     hand_suppression_report: Path | None
     hand_suppress_wearer_hands: bool
+    pink_demote_generated_fills: bool
+    pink_generated_context_frames: int
 
 
 def _require_private_artifact_path(path: Path, option: str) -> None:
@@ -502,6 +509,68 @@ def same_hand_overlap_evidence(
         for frame_idx, box in raw
     ]
     return hand_track_id, overlaps
+
+
+def demote_provisional_hand_generated_fills(
+    tracks: list[Track], provisional_regions_by_frame: dict[int, list[dict]], *,
+    context_frames: int,
+) -> list[dict]:
+    """Shorten only generated coverage around a strongly pink face track.
+
+    A raw detector-backed face box is never removed.  The gate is deliberately
+    strict: at least two raw hits must each have >=98% overlap with one same
+    *provisional* hand track.  Generated interpolation/hold fills farther
+    than ``context_frames`` from every raw hit are then removed.  This is an
+    experimental quality trade-off, not a claim that pink evidence proves a
+    face is absent, and callers must keep the result in private review.
+    """
+    demoted: list[dict] = []
+    for track in tracks:
+        if track.cls != "face":
+            continue
+        raw = raw_face_track_detections(track)
+        if len(raw) < PINK_DEMOTE_MIN_TRACK_HITS:
+            continue
+        evidence = same_hand_overlap_evidence(raw, provisional_regions_by_frame)
+        if evidence is None:
+            continue
+        hand_track_id, overlaps = evidence
+        raw_frames = {frame_idx for frame_idx, _box in raw}
+        generated = [
+            (frame_idx, source)
+            for frame_idx, (_box, source) in track.frames.items()
+            if source in {"interp", "hold"}
+        ]
+        removed = [
+            (frame_idx, source)
+            for frame_idx, source in generated
+            if min(abs(frame_idx - raw_frame) for raw_frame in raw_frames) > context_frames
+        ]
+        if not removed:
+            continue
+        for frame_idx, _source in removed:
+            del track.frames[frame_idx]
+        demoted.append({
+            "track_id": track.track_id,
+            "provisional_hand_track_id": hand_track_id,
+            "n_raw_detections": len(raw),
+            "context_frames": context_frames,
+            "n_generated_fill_frames_before": len(generated),
+            "n_generated_fill_frames_removed": len(removed),
+            "n_generated_fill_frames_kept": len(generated) - len(removed),
+            "n_interpolated_fill_frames_removed": sum(source == "interp" for _, source in removed),
+            "n_hold_fill_frames_removed": sum(source == "hold" for _, source in removed),
+            "raw_detections": [
+                {
+                    "frame_idx": frame_idx,
+                    "box": list(box),
+                    "provisional_hand_overlap": overlap,
+                }
+                for (frame_idx, box), overlap in zip(raw, overlaps, strict=True)
+            ],
+            "policy": "raw_detections_retained_generated_fills_capped",
+        })
+    return demoted
 
 
 def load_pose_prior_for_clip(cfg: Config, clip: ClipInfo) -> tuple[Path, str, dict[int, dict]] | None:
@@ -736,7 +805,8 @@ def load_hand_prior_for_clip(
     }
     if model != expected_model:
         mismatches["model"] = {"clip": expected_model, "artifact": model}
-    if cfg.hand_suppress_wearer_hands and configuration != HAND_ACTIVE_CONFIGURATION:
+    if (cfg.hand_suppress_wearer_hands or cfg.pink_demote_generated_fills) \
+            and configuration != HAND_ACTIVE_CONFIGURATION:
         mismatches["configuration"] = {
             "clip": HAND_ACTIVE_CONFIGURATION,
             "artifact": configuration,
@@ -781,7 +851,7 @@ def load_hand_prior_for_clip(
 def build_hand_suppression_report(
     clip: ClipInfo, cfg: Config, prior_path: Path, prior_sha256: str,
     regions_by_frame: dict[int, dict], detections: list[Detection], tracks: list[Track],
-    suppressed_tracks: list[dict],
+    suppressed_tracks: list[dict], pink_demoted_tracks: list[dict] | None = None,
 ) -> dict:
     """Write private evidence for active and provisional hand-prior decisions.
 
@@ -789,6 +859,8 @@ def build_hand_suppression_report(
     passed to active suppression and cannot change a detector input, track,
     fill map, encoded video, or status.
     """
+    pink_demoted_tracks = pink_demoted_tracks or []
+    demotion_by_track = {int(row["track_id"]): row for row in pink_demoted_tracks}
     face_detections = [detection for detection in detections if detection.cls == "face"]
     samples = [
         {
@@ -831,12 +903,15 @@ def build_hand_suppression_report(
             for frame_idx, (_box, source) in sorted(track.frames.items())
             if source in {"interp", "hold"}
         ]
+        demotion = demotion_by_track.get(track.track_id)
         # A pink hand matters here only when a detector-backed false positive
-        # plausibly expanded into generated fills.  Raw-only tracks remain in
-        # detection_samples but need no special amplification review.
-        if not extended:
+        # plausibly expanded into generated fills. Raw-only tracks remain in
+        # detection_samples but need no special amplification review. A
+        # demotion remains reviewable even when a zero-frame context removed
+        # every generated fill.
+        if not extended and demotion is None:
             continue
-        pink_amplification_candidates.append({
+        candidate = {
             "track_id": track.track_id,
             "provisional_hand_track_id": hand_track_id,
             "n_raw_detections": len(raw),
@@ -852,7 +927,11 @@ def build_hand_suppression_report(
                 for (frame_idx, box), overlap in zip(raw, overlaps, strict=True)
             ],
             "suggested_action": "review_only_no_pixel_change",
-        })
+        }
+        if demotion is not None:
+            candidate["generated_fill_demotion"] = demotion
+            candidate["suggested_action"] = "review_demoted_generated_fills"
+        pink_amplification_candidates.append(candidate)
     return {
         "schema_version": 1,
         "review_type": "egoblur_hand_suppression",
@@ -883,6 +962,10 @@ def build_hand_suppression_report(
                 for frame_regions in regions_by_frame.values()
             ),
             "n_suppressed_tracks": len(suppressed_tracks),
+            "n_pink_demoted_tracks": len(pink_demoted_tracks),
+            "n_pink_generated_fill_frames_removed": sum(
+                row["n_generated_fill_frames_removed"] for row in pink_demoted_tracks
+            ),
             "n_pink_amplification_candidates": len(pink_amplification_candidates),
             "n_pink_amplification_extended_fill_frames": sum(
                 row["n_extended_fill_frames"] for row in pink_amplification_candidates
@@ -890,12 +973,14 @@ def build_hand_suppression_report(
         },
         "detection_samples": samples,
         "suppressed_tracks": suppressed_tracks,
+        "pink_generated_fill_demotions": pink_demoted_tracks,
         "pink_amplification_candidates": pink_amplification_candidates,
         "warning": (
             "Active wearer-hand suppression is experimental. Any nonzero suppression "
             "count keeps this run in NEEDS_REVIEW and requires private human review. "
-            "Pink provisional-hand overlap is private review evidence only and does not "
-            "change detection, tracks, fills, encoded pixels, or status."
+            "Without --pink-demote-generated-fills, pink provisional-hand overlap is "
+            "private review evidence only. With it, raw detections remain intact while "
+            "only generated fills are capped; any nonzero demotion requires review."
         ),
     }
 
@@ -991,6 +1076,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
                         "inside the same temporally-stable, camera-near Hand Landmarker region. "
                         "Requires --hand-prior and --hand-suppression-report; any suppression "
                         "keeps the audit in NEEDS_REVIEW.")
+    p.add_argument("--pink-demote-generated-fills", action="store_true",
+                   help="EXPERIMENTAL: retain every raw face detection, but cap generated "
+                        "interpolation/hold fills around a face track whose every raw hit overlaps "
+                        "one same provisional Hand Landmarker region. Requires --hand-prior and "
+                        "--hand-suppression-report; any demotion keeps NEEDS_REVIEW.")
+    p.add_argument("--pink-generated-context-frames", type=int,
+                   default=PINK_GENERATED_CONTEXT_FRAMES_DEFAULT,
+                   help="generated frames to retain on either side of each raw detection when "
+                        "--pink-demote-generated-fills is set (default: "
+                        f"{PINK_GENERATED_CONTEXT_FRAMES_DEFAULT}; raw detections are never removed).")
     p.add_argument("--watchdog-hours", type=float, default=8.0)
     p.add_argument("--no-watchdog", action="store_true")
     p.add_argument("--skip-shutdown", action="store_true", help="for local/laptop testing")
@@ -1059,6 +1154,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error(f"--min-track-confirmations {a.min_track_confirmations} must be >= 1 "
                  f"— every track has at least one confident hit by construction, so "
                  f"anything below 1 cannot mean anything stricter than 'off'.")
+    if a.pink_generated_context_frames < 0:
+        p.error("--pink-generated-context-frames must be >= 0.")
     for name, val in (("--face-threshold", a.face_threshold),
                        ("--lp-threshold", a.lp_threshold),
                        ("--sweep-threshold", a.sweep_threshold)):
@@ -1081,10 +1178,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error("--hand-prior and --hand-suppression-report must be supplied together")
     if a.hand_suppress_wearer_hands and a.hand_prior is None:
         p.error("--hand-suppress-wearer-hands requires --hand-prior and --hand-suppression-report")
-    if a.hand_suppress_wearer_hands and a.detect_hz != DETECT_HZ_DEFAULT:
+    if a.pink_demote_generated_fills and a.hand_prior is None:
+        p.error("--pink-demote-generated-fills requires --hand-prior and --hand-suppression-report")
+    if (a.hand_suppress_wearer_hands or a.pink_demote_generated_fills) \
+            and a.detect_hz != DETECT_HZ_DEFAULT:
         p.error(
-            "--hand-suppress-wearer-hands requires --detect-hz "
-            f"{DETECT_HZ_DEFAULT}; its five-sample temporal gate is calibrated only at 10 Hz"
+            "active Hand Landmarker suppression or pink fill demotion requires --detect-hz "
+            f"{DETECT_HZ_DEFAULT}; its temporal gates are calibrated only at 10 Hz"
         )
     od = a.output_dir.expanduser().resolve()
     checkpoint_dir = (
@@ -1179,6 +1279,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         hand_prior=a.hand_prior,
         hand_suppression_report=a.hand_suppression_report,
         hand_suppress_wearer_hands=a.hand_suppress_wearer_hands,
+        pink_demote_generated_fills=a.pink_demote_generated_fills,
+        pink_generated_context_frames=a.pink_generated_context_frames,
     )
 
 
@@ -3218,7 +3320,9 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
                  n_low_absorbed: int = 0,
                  det_low_frames: list[int] | None = None,
                  n_unconfirmed_tracks: int = 0,
-                 n_hand_suppressed_tracks: int = 0) -> dict:
+                 n_hand_suppressed_tracks: int = 0,
+                 n_pink_demoted_tracks: int = 0,
+                 n_pink_generated_fill_frames_removed: int = 0) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
     missed face, not just fill_integrity. fill_integrity only proves boxes
     that already exist are correctly gray — it is structurally incapable
@@ -3299,6 +3403,10 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         reasons.append(
             f"{n_hand_suppressed_tracks} face track(s) withheld by experimental "
             "Hand Landmarker wearer-hand suppression — review the private hand report before shipping")
+    if n_pink_demoted_tracks > 0:
+        reasons.append(
+            f"{n_pink_demoted_tracks} face track(s) had generated fills capped by experimental "
+            "pink Hand Landmarker evidence — review the private hand report before shipping")
 
     status = "NEEDS_REVIEW" if reasons else "PASS_AUTOMATED"
     if status == "PASS_AUTOMATED" and not yunet_ran:
@@ -3343,6 +3451,8 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # count is never invisible, not so it's alarming.
         "n_unconfirmed_tracks": n_unconfirmed_tracks,
         "n_hand_suppressed_tracks": n_hand_suppressed_tracks,
+        "n_pink_demoted_tracks": n_pink_demoted_tracks,
+        "n_pink_generated_fill_frames_removed": n_pink_generated_fill_frames_removed,
         # False means no plate detector ran at all. Recorded so a face-only
         # run is never later read as "this clip has no license plates".
         "lp_checked": lp_checked,
@@ -3420,6 +3530,10 @@ def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
         f"n_hand_suppressed_tracks: {audit.get('n_hand_suppressed_tracks', 0)}  "
             f"(experimental active Hand Landmarker suppression; any nonzero count requires "
             f"private review before shipping)",
+        f"n_pink_demoted_tracks: {audit.get('n_pink_demoted_tracks', 0)}; "
+            f"generated_fill_frames_removed: {audit.get('n_pink_generated_fill_frames_removed', 0)}  "
+            f"(experimental pink generated-fill cap; raw detections are retained and any "
+            f"nonzero count requires private review before shipping)",
         "",
         audit["note"],
     ]
@@ -3474,6 +3588,8 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             # so it belongs here for the same reason hold_frames does.
             "min_track_confirmations": cfg.min_track_confirmations,
             "hand_suppress_wearer_hands": cfg.hand_suppress_wearer_hands,
+            "pink_demote_generated_fills": cfg.pink_demote_generated_fills,
+            "pink_generated_context_frames": cfg.pink_generated_context_frames,
             # None = native resolution. Recorded because it changes the scale
             # the model runs at, and therefore what a score MEANS — two runs
             # at different values are not comparable.
@@ -3625,6 +3741,7 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
     pose_shadow = None
     hand_suppression_report = None
     hand_suppressed_tracks: list[dict] = []
+    pink_demoted_tracks: list[dict] = []
     all_tracks = tracks
     if pose_prior is not None:
         prior_path, prior_sha256, regions_by_frame = pose_prior
@@ -3638,6 +3755,33 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
             for frame_idx, frame_regions in regions_by_frame.items()
             if frame_regions["stable_wearer"]
         }
+        provisional_hand_regions = {
+            frame_idx: frame_regions["provisional_wearer"]
+            for frame_idx, frame_regions in regions_by_frame.items()
+            if frame_regions["provisional_wearer"]
+        }
+        if cfg.pink_demote_generated_fills:
+            pink_demoted_tracks = demote_provisional_hand_generated_fills(
+                tracks,
+                provisional_hand_regions,
+                context_frames=cfg.pink_generated_context_frames,
+            )
+            n_pink_removed = sum(
+                row["n_generated_fill_frames_removed"] for row in pink_demoted_tracks
+            )
+            if pink_demoted_tracks:
+                log.warning(
+                    "%s: EXPERIMENTAL pink evidence capped %d generated fill frame(s) across "
+                    "%d face track(s); raw detector hits were retained and private human review "
+                    "is mandatory before shipping",
+                    clip.clip_id, n_pink_removed, len(pink_demoted_tracks),
+                )
+            else:
+                log.info(
+                    "%s: pink generated-fill cap found 0 eligible provisional-hand tracks; "
+                    "the normal EgoBlur fill map is unchanged",
+                    clip.clip_id,
+                )
         if cfg.hand_suppress_wearer_hands:
             tracks, hand_suppressed_tracks = suppress_stable_wearer_hand_tracks(
                 tracks, stable_hand_regions
@@ -3656,7 +3800,7 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                 )
         hand_suppression_report = build_hand_suppression_report(
             clip, cfg, prior_path, prior_sha256, regions_by_frame, detections, all_tracks,
-            hand_suppressed_tracks,
+            hand_suppressed_tracks, pink_demoted_tracks,
         )
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
@@ -3712,7 +3856,12 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                          n_low_absorbed=len(low_absorbed),
                          det_low_frames=det_low_frames,
                          n_unconfirmed_tracks=len(unconfirmed),
-                         n_hand_suppressed_tracks=len(hand_suppressed_tracks))
+                         n_hand_suppressed_tracks=len(hand_suppressed_tracks),
+                         n_pink_demoted_tracks=len(pink_demoted_tracks),
+                         n_pink_generated_fill_frames_removed=sum(
+                             row["n_generated_fill_frames_removed"]
+                             for row in pink_demoted_tracks
+                         ))
     write_audit_summary(audit, clip, cfg.output_dir / f"{clip.clip_id}.audit_summary.md")
 
     timing = {

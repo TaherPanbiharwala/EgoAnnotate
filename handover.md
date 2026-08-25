@@ -73,11 +73,14 @@ but must not be run for this pilot.
   forces `NEEDS_REVIEW` and must be reviewed in the private hand report. For
   batches, use a private `--hand-suppression-report` directory so every clip
   retains its own suppression evidence.
-  Magenta/provisional overlap now also produces a **private report-only**
+  Magenta/provisional overlap always produces a private
   `pink_amplification_candidate` when one same provisional hand accounts for
   every raw face hit in a track that later receives interpolation/hold fills.
-  This is evidence for review, not permission to change blur pixels or leave
-  any face unredacted.
+  The opt-in `--pink-demote-generated-fills` is a narrowly bounded active
+  exception: after two raw hits with >=98% overlap to the same pink hand, it
+  keeps all raw detections but caps only generated interpolation/hold context
+  (12 frames by default). It requires the pinned two-hand artifact, reports
+  every removal privately, and any nonzero demotion forces `NEEDS_REVIEW`.
 - EgoBlur's raw detector checkpoints are original-derived and now require a
   private `--checkpoint-dir`; never keep them beside a publishable redacted
   output directory.
