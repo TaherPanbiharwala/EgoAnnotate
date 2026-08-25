@@ -22,6 +22,7 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from . import config
+from . import hand_prior as hand_prior_layer
 from . import pose_prior as pose_prior_layer
 from .archive import archive_files
 from .backends.registry import build_backend
@@ -570,6 +571,23 @@ def _build_parser() -> argparse.ArgumentParser:
     pose.add_argument("--num-poses", type=int, default=pose_prior_layer.POSE_NUM_POSES)
     pose.add_argument("--confidence", type=float, default=pose_prior_layer.POSE_MIN_CONFIDENCE)
 
+    hand_prior = sub.add_parser(
+        "hand-prior",
+        help="private pre-redaction MediaPipe Hand Landmarker pass for wearer-hand review",
+    )
+    hand_prior.add_argument("--original-video", type=Path, required=True)
+    hand_prior.add_argument("--video-id", required=True)
+    hand_prior.add_argument("--output", type=Path, required=True)
+    hand_prior.add_argument("--models-dir", type=Path, default=Path("private/models"))
+    hand_prior.add_argument(
+        "--preview-video",
+        type=Path,
+        help="optional private original-only hand overlay (amber stable wearer; magenta provisional; blue other)",
+    )
+    hand_prior.add_argument("--detect-hz", type=float, default=hand_prior_layer.HAND_DETECT_HZ)
+    hand_prior.add_argument("--num-hands", type=int, default=hand_prior_layer.HAND_NUM_HANDS)
+    hand_prior.add_argument("--confidence", type=float, default=hand_prior_layer.HAND_MIN_CONFIDENCE)
+
     decisions = sub.add_parser(
         "init-yunet-decisions",
         help="create a private all-uncertain review-decision template from a YuNet report",
@@ -664,6 +682,21 @@ def main(argv: list[str] | None = None) -> int:
             models_dir=args.models_dir,
             detect_hz=args.detect_hz,
             num_poses=args.num_poses,
+            confidence=args.confidence,
+            preview_video=args.preview_video,
+        )
+        print(f"complete: {artifact['source']['video_id']} -> {args.output}")
+        return 0
+
+    if args.command == "hand-prior":
+        video_id = _validate_video_id(args.video_id)
+        artifact = hand_prior_layer.build_hand_prior(
+            original_video=args.original_video,
+            video_id=video_id,
+            output=args.output,
+            models_dir=args.models_dir,
+            detect_hz=args.detect_hz,
+            num_hands=args.num_hands,
             confidence=args.confidence,
             preview_video=args.preview_video,
         )

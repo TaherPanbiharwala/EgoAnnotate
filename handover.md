@@ -1,10 +1,10 @@
 # egoannote — session handover
 
-## Current redaction-review work (2026-08-24)
+## Current redaction-review work (2026-08-25)
 
-The local working tree contains the uncommitted YuNet review implementation
-plus the new private Pose-prior/EgoBlur pilot. Stage 2 and YuNet are paused for
-the current run; the active protocol is Pose plus EgoBlur only.
+Stage 2 and YuNet are paused for the current run. The active protocol is
+EgoBlur plus private MediaPipe diagnostics; YuNet is preserved in the source
+but must not be run for this pilot.
 
 - `egoannote-run pose-prior` reads an original video only, downloads the
   versioned MediaPipe Pose Landmarker Full task if needed, and writes a private
@@ -14,12 +14,22 @@ the current run; the active protocol is Pose plus EgoBlur only.
   for a wearer candidate and blue for other detected poses, held between the
   10 Hz samples.
 - The pose artifact identifies **camera-near wearer candidates**, not people
-  with certainty. Default `--pose-prior` and `--pose-shadow-report` are
-  shadow-only. The explicit experimental `--pose-suppress-wearer-hands` is the
-  only behavior-changing mode: it requires a stable (12 samples), camera-edge
-  hand, four raw track detections, and >=98% overlap on every raw box. It never
-  suppresses arms/legs or uncertain poses, and a nonzero suppression count
-  forces `NEEDS_REVIEW`; consult the private report before any delivery.
+  with certainty. `--pose-prior` and `--pose-shadow-report` are permanently
+  shadow-only. Do not use Pose amber/blue assignment to suppress redaction:
+  on `GX010057` it generated candidate hands but zero stable active evidence,
+  and visually swapped between the wearer and another person.
+- `egoannote-run hand-prior` is the behavior-changing prior. It reads the
+  original privately at 10 Hz using MediaPipe Hand Landmarker, stores all 21
+  2D landmarks plus a short continuity track, and makes an original-only
+  preview: amber = stable wearer candidate, magenta = provisional, blue =
+  other hand. `--hand-suppress-wearer-hands` is pinned to 10 Hz and can
+  withhold only a face track
+  whose four or more raw boxes are each >=98% inside the *same*, stable,
+  large/lower-or-side wearer hand region. It never changes full-frame
+  detection, thresholding, or treatment of other people. Any nonzero count
+  forces `NEEDS_REVIEW` and must be reviewed in the private hand report. For
+  batches, use a private `--hand-suppression-report` directory so every clip
+  retains its own suppression evidence.
 - EgoBlur's raw detector checkpoints are original-derived and now require a
   private `--checkpoint-dir`; never keep them beside a publishable redacted
   output directory.
@@ -33,9 +43,10 @@ the current run; the active protocol is Pose plus EgoBlur only.
   the existing EgoBlur `--forced-boxes` JSON. `uncertain` is not a privacy
   clearance.
 
-Focused tests, the complete suite (334 tests), Ruff, CLI help, and diff checks
-pass at this point. Do not run a batch until the shadow pilot is visually
-reviewed on the corrected `GX010057` artifact.
+Do not run a batch until the Hand Landmarker preview and the first active-hand
+pilot are visually reviewed on `GX010057`, with its ordinary `min_track_confirmations=2`
+run retained for comparison. The nonzero-suppression result must remain
+`NEEDS_REVIEW` until a person checks the private report/video.
 
 Written 2026-08-11, substantially rewritten in a later session once the
 "do this first" item below was actually resolved (with evidence, not a

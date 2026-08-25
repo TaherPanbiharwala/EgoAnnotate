@@ -86,8 +86,25 @@ def _ensure_model(models_dir: Path) -> Path:
     (atomic on the same filesystem). A partial download leaves the cache
     untouched.
     """
+    def verify(path: Path) -> None:
+        size = path.stat().st_size
+        if size < config.MP_MODEL_MIN_BYTES:
+            raise RuntimeError(
+                f"HandLandmarker model {path} is {size} bytes, below the "
+                f"{config.MP_MODEL_MIN_BYTES} byte floor. Remove it and retry."
+            )
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != config.MP_MODEL_SHA256:
+            raise RuntimeError(
+                f"Model checksum mismatch.\n"
+                f"  expected {config.MP_MODEL_SHA256}\n"
+                f"  got      {digest}\n"
+                f"Remove {path} and retry. Unexpected model bytes must not be used."
+            )
+
     target = models_dir / config.MP_MODEL_FILENAME
     if target.exists() and target.stat().st_size > 0:
+        verify(target)
         return target
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -101,25 +118,7 @@ def _ensure_model(models_dir: Path) -> Path:
         ) as resp:
             shutil.copyfileobj(resp, f)
 
-        size = tmp.stat().st_size
-        if size < config.MP_MODEL_MIN_BYTES:
-            raise RuntimeError(
-                f"Downloaded model is {size} bytes, below the {config.MP_MODEL_MIN_BYTES} "
-                f"byte floor — the transfer was truncated. Nothing was cached; retry."
-            )
-        # Integrity: pin the digest once you have verified a known-good copy.
-        # Until then, size is a weak-but-real check against truncation. See
-        # config.MP_MODEL_SHA256.
-        if config.MP_MODEL_SHA256:
-            digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
-            if digest != config.MP_MODEL_SHA256:
-                raise RuntimeError(
-                    f"Model checksum mismatch.\n"
-                    f"  expected {config.MP_MODEL_SHA256}\n"
-                    f"  got      {digest}\n"
-                    f"Nothing was cached. The upstream artifact changed, or the "
-                    f"download was tampered with."
-                )
+        verify(tmp)
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)

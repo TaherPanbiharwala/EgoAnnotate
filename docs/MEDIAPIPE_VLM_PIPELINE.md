@@ -112,36 +112,67 @@ input; only the private overlap report is new.
 
 ### Experimental active wearer-hand suppression
 
-The current redaction pilot uses **EgoBlur plus Pose only**. YuNet is not part
-of this protocol. After visually reviewing the pose preview, the explicit
-`--pose-suppress-wearer-hands` opt-in can withhold a persistent hand false
-positive from EgoBlur's fill map. It is deliberately much stricter than an
-amber pose-preview label:
+Pose remains a useful private diagnostic, but it does **not** make the active
+decision: its camera-near amber label occasionally changed between the wearer
+and a nearby person, and the conservative Pose-only gate consequently withheld
+zero tracks. The active gate instead uses a separate MediaPipe **Hand
+Landmarker** prior. YuNet is paused and is not part of this protocol.
 
-- only a `hand` mask is eligible—never arms, legs, feet, or another person's
-  generic limb;
-- its centre must be at a lower or side frame edge;
-- eligible hand evidence must persist for at least 12 adjacent 10 Hz samples
-  (1.2 seconds);
-- a face track needs at least four raw detections, and every one must be at
-  least 98% inside that stable hand region.
+Build the private hand prior from the original at exactly EgoBlur's 10 Hz
+cadence. Active suppression rejects any other cadence, so do not override
+either command's `--detect-hz` value. Its preview makes the evidence reviewable: amber is a stable wearer
+candidate, magenta is a provisional candidate that cannot suppress anything,
+and blue is another hand.
 
-Any uncertain, intermittent, blue wearer pose, or momentary amber assignment
-remains a normal face detection. A run with one or more withheld tracks is
-always `NEEDS_REVIEW`; it is not automatically publishable. Its private pose
-report records every withheld track and overlap score for visual review.
+```bash
+uv run egoannote-run hand-prior \
+  --original-video /workspace/in/GX010057.MP4 \
+  --video-id GX010057 \
+  --output /workspace/private/hand-prior/GX010057.hand_prior.json \
+  --models-dir /workspace/private/models \
+  --preview-video /workspace/private/hand-preview/GX010057.hands.mp4
+```
 
-Use a new output/checkpoint/report destination so the original shadow result
-remains available for comparison:
+The first call downloads the versioned official Hand Landmarker model to the
+private model cache. The artifact stores source/model hashes, every 10 Hz
+sample (including no-hand frames), 21 two-dimensional hand landmarks, its
+short temporal hand-track identifier, and the wearer-candidate/stable state.
+It is original-derived and must never be published.
+
+Only a stable candidate can affect the fill map. The active gate additionally
+requires all of the following:
+
+- a close, lower-frame or side-edge hand candidate observed for at least five
+  temporally continuous 10 Hz samples (a single missed sample may bridge the
+  same hand track);
+- at least four raw EgoBlur face detections in the proposed face track; and
+- at least 98% overlap between **every** raw face box and one same stable hand
+  track's circle. A track with even one uncertain/non-hand hit is retained and
+  blurred.
+
+EgoBlur still runs full-frame; the hand prior cannot change detector inputs,
+thresholds, tracking association, or the treatment of other people. It only
+filters an already-built, exceptionally well-supported false-positive track.
+A nonzero suppression count always yields `NEEDS_REVIEW`; it is never a
+publication approval.
+
+Use fresh output/checkpoint/report destinations, preserving the ordinary run
+for byte/hash comparison:
 
 ```bash
 ... jobs/10_blur_egoblur.py ... \
-  --output-dir /workspace/out-gx010057-active-pose \
-  --checkpoint-dir /workspace/private/checkpoints/GX010057-active-pose \
+  --output-dir /workspace/out-gx010057-active-hand \
+  --checkpoint-dir /workspace/private/checkpoints/GX010057-active-hand \
   --pose-prior /workspace/private/pose-prior/GX010057.pose_prior.json \
-  --pose-shadow-report /workspace/private/pose-shadow/GX010057.active_pose.json \
-  --pose-suppress-wearer-hands
+  --pose-shadow-report /workspace/private/pose-shadow/GX010057.hand_pose_shadow.json \
+  --hand-prior /workspace/private/hand-prior/GX010057.hand_prior.json \
+  --hand-suppression-report /workspace/private/hand-suppression/GX010057.json \
+  --hand-suppress-wearer-hands
 ```
+
+For a batch, pass `--hand-suppression-report` a private **directory**, not a
+single `.json` file. The job writes one review report per clip and rejects a
+single report path that would overwrite earlier evidence.
 
 ## Independent YuNet verification
 

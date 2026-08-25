@@ -66,12 +66,11 @@ MP_MODEL_URL: Final[str] = (
 )
 MP_MODEL_FILENAME: Final[str] = "hand_landmarker.task"
 # Integrity checks for the downloaded model. The size floor catches a
-# truncated transfer (the observed good file is ~7.8 MB). MP_MODEL_SHA256 is
-# empty until a known-good copy is verified and its digest pinned here —
-# once set, a mismatch hard-fails instead of feeding unexpected bytes to
-# MediaPipe's native TFLite parser.
+# truncated transfer (the observed good file is ~7.8 MB); the approved digest
+# hard-fails a changed or tampered model before MediaPipe's native TFLite
+# parser can consume it.
 MP_MODEL_MIN_BYTES: Final[int] = 5_000_000
-MP_MODEL_SHA256: Final[str] = ""
+MP_MODEL_SHA256: Final[str] = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
 
 # S6/S7: assignment-swap guard. A frame-to-frame wrist jump larger than this
 # (in normalized image units, i.e. fraction of frame width/height) is treated
