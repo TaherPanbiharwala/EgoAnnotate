@@ -2,10 +2,10 @@
 
 ## Current implementation checkpoint (2026-08-26)
 
-`master` is at `e6cf552`; the working tree now contains the uncommitted
-implementation of the finalized hand-prior policy and must be tested, then
-committed deliberately. Do not assume the historical notes below describe the
-current policy.
+`master` is at `4c91e8f`; the finalized 30-fps hand-prior policy is committed.
+The subsequent current change adds a private human redaction-approval record;
+check `git status` and this section before relying on the historical notes
+below.
 
 - The private, pre-redaction Hand Landmarker prior defaults to **30 fps**.
   It tracks two hands for active behavior and needs 0.5 seconds of continuous
@@ -33,9 +33,16 @@ current policy.
 - After the final redacted video is accepted, run the ordinary public-safe
   MediaPipe hands layer at 30 fps and dense VLM captioning on the redacted
   video only. Stage 2, WiLoR, SAM2, and DepthV3 remain paused.
+- A hand-suppression run intentionally retains `NEEDS_REVIEW` even after the
+  owner accepts the video. Do not edit the EgoBlur manifest. Record the named
+  human decision using `egoannote-run approve-redaction`; it privately binds
+  the final redacted video, EgoBlur manifest, hand-suppression report, and
+  YuNet report by SHA-256. Pass its output to annotation with
+  `--redaction-review`. It is revalidated before both annotation and upload,
+  and is never published.
 
-Current validation before commit: focused hand/EgoBlur/YuNet tests pass
-(`200 passed`). Run the full suite and inspect the diff before committing.
+Current validation of the uncommitted approval-record change: full suite passes
+(`355 passed`). Inspect the diff before committing.
 
 ## Current checkpoint and next-chat focus (2026-08-25)
 

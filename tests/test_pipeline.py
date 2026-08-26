@@ -60,6 +60,131 @@ def test_batch_paths_are_relative_to_the_manifest_not_the_shell(tmp_path: Path) 
     assert loaded[0].redacted_video == manifest_dir / "videos" / "clip.blurred.mp4"
 
 
+def _write_reviewable_redaction(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    video = tmp_path / "GX010057.blurred.mp4"
+    video.write_bytes(b"reviewed redacted video")
+    manifest = tmp_path / "GX010057.manifest.json"
+    source_sha256 = "a" * 64
+    manifest.write_text(
+        json.dumps(
+            {
+                "clip_id": "GX010057",
+                "status": "NEEDS_REVIEW",
+                "source": {"sha256": source_sha256},
+                "output": {"sha256": pipeline._sha256_file(video)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    hand = tmp_path / "private" / "GX010057.hand_suppression.json"
+    hand.parent.mkdir()
+    hand.write_text(
+        json.dumps(
+            {
+                "review_type": "egoblur_hand_suppression",
+                "input": {"clip_id": "GX010057", "source_sha256": source_sha256},
+            }
+        ),
+        encoding="utf-8",
+    )
+    yunet = tmp_path / "private" / "GX010057.yunet.json"
+    yunet.write_text(
+        json.dumps(
+            {
+                "review_type": "post_redaction_yunet",
+                "input": {
+                    "clip_id": "GX010057",
+                    "redacted_sha256": pipeline._sha256_file(video),
+                    "egoblur_manifest_sha256": pipeline._sha256_file(manifest),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return video, manifest, hand, yunet
+
+
+def test_hash_bound_human_review_allows_annotation_from_needs_review_manifest(
+    tmp_path: Path,
+) -> None:
+    video, manifest, hand, yunet = _write_reviewable_redaction(tmp_path)
+    run_dir = tmp_path / "runs" / "gx010057"
+    approval = pipeline.create_redaction_review(
+        run_dir=run_dir,
+        video_id="GX010057",
+        redacted_video=video,
+        blur_manifest=manifest,
+        hand_suppression_report=hand,
+        yunet_report=yunet,
+        reviewer="Dataset owner",
+    )
+
+    item = VideoInput(
+        redacted_video=video,
+        blur_manifest=manifest,
+        redaction_review=approval,
+        video_id="GX010057",
+    )
+    video_id, blur, basis = _resolve_identity(item)
+    row = pipeline._register_video(run_dir, item, video_id, blur, basis)
+
+    assert approval == run_dir / "private" / "redaction_reviews" / "GX010057.json"
+    assert row["blur_status"] == "NEEDS_REVIEW"
+    assert row["redaction_review"]["status"] == "human_approved"
+    assert row["redaction_review"]["reviewer"] == "Dataset owner"
+
+
+def test_hash_bound_human_review_rejects_changed_private_evidence(tmp_path: Path) -> None:
+    video, manifest, hand, yunet = _write_reviewable_redaction(tmp_path)
+    run_dir = tmp_path / "runs" / "gx010057"
+    approval = pipeline.create_redaction_review(
+        run_dir=run_dir,
+        video_id="GX010057",
+        redacted_video=video,
+        blur_manifest=manifest,
+        hand_suppression_report=hand,
+        yunet_report=yunet,
+        reviewer="Dataset owner",
+    )
+    hand.write_text("changed", encoding="utf-8")
+    item = VideoInput(
+        redacted_video=video,
+        blur_manifest=manifest,
+        redaction_review=approval,
+        video_id="GX010057",
+    )
+    video_id, blur, basis = _resolve_identity(item)
+
+    with pytest.raises(ValueError, match="hand-suppression report no longer matches"):
+        pipeline._register_video(run_dir, item, video_id, blur, basis)
+
+
+def test_publish_revalidates_human_approval_before_bypassing_needs_review(tmp_path: Path) -> None:
+    video, manifest, hand, yunet = _write_reviewable_redaction(tmp_path)
+    run_dir = tmp_path / "runs" / "gx010057"
+    approval = pipeline.create_redaction_review(
+        run_dir=run_dir,
+        video_id="GX010057",
+        redacted_video=video,
+        blur_manifest=manifest,
+        hand_suppression_report=hand,
+        yunet_report=yunet,
+        reviewer="Dataset owner",
+    )
+    item = VideoInput(
+        redacted_video=video,
+        blur_manifest=manifest,
+        redaction_review=approval,
+        video_id="GX010057",
+    )
+    video_id, blur, basis = _resolve_identity(item)
+    pipeline._register_video(run_dir, item, video_id, blur, basis)
+    yunet.write_text("changed", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="human redaction review no longer validates"):
+        pipeline.publish_run(run_dir, repo_id="owner/dataset", private=True)
+
+
 def _write_run_manifest(run_dir: Path, captions: dict) -> None:
     pipeline._atomic_json(
         run_dir / "private" / "run_manifest.json",

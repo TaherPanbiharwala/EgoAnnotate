@@ -4,10 +4,9 @@ This file exists so any coding agent (Codex, Claude, etc.) can pick up this
 repo cold. Written 2026-08-11, substantially updated in a later session
 after the EgoBlur fill-integrity question got resolved with real evidence
 and two more hysteresis visibility bugs got fixed. Repo HEAD at time of this
-update: **`e6cf552`**. The working tree has real, tested, **uncommitted**
-30-fps Hand Landmarker / amber-pink suppression / YuNet hand-noise changes on
-top; run `git status` before trusting this describes `HEAD` exactly. 352 tests
-pass (`uv run --extra test pytest tests/ -q`), including the uncommitted work.
+update: **`4c91e8f`**. The 30-fps Hand Landmarker / amber-pink suppression /
+YuNet hand-noise changes are committed. Run `git status` before trusting this
+describes `HEAD` exactly.
 
 If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
@@ -167,6 +166,18 @@ and pinned with a regression test:
 | VLM captioning | The next-chat focus is to review and edit this code/prompt, not execute a paid batch. The intended dense representation is a six-second holistic `activity.caption`, bounded atomic `actions[]`, and a caption plus structured state for each visible anatomical left/right hand. Review `prompts/caption_v4.txt`, `layers/caption.py`, parsing, and schema together; captions must use redacted video only. Real execution remains blocked until `models.toml` has two real cross-lab models with provider/price pins and `OPENROUTER_API_KEY`, plus a verified redacted pilot input. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
 | verify/pack (dataset assembly) | Not started. Empty files. |
+
+### Human review acceptance for an active hand-suppression derivative
+
+An active hand suppression deliberately leaves EgoBlur at `NEEDS_REVIEW`.
+Never edit that manifest status after watching a video. Use
+`egoannote-run approve-redaction` to create a private hash-bound decision that
+names the reviewer and binds the final redacted video, EgoBlur manifest,
+hand-suppression report, and YuNet report. Annotation accepts a non-PASS
+manifest only when passed that exact `--redaction-review`; publishing rechecks
+the same bindings. The approval is local/private evidence and must never enter
+`publish/` or Hugging Face. See `docs/MEDIAPIPE_VLM_PIPELINE.md` for the exact
+command.
 
 ## Immediate priority — the EgoBlur redaction work
 

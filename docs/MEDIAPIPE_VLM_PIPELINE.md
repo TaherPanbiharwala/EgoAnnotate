@@ -46,6 +46,7 @@ private/
   caption_frames/            extracted from redacted video; never publish
   models/                    MediaPipe model cache
   run_manifest.json          local and Drive paths; never publish
+  redaction_reviews/         hash-bound named human approvals; never publish
   drive_receipts/            verified archive receipts
 
 work/<video_id>/
@@ -232,6 +233,32 @@ for every candidate. The generated JSON is directly compatible with EgoBlur's
 video and rerun YuNet. Uncertain candidates are never turned into a claim that
 the video is ready to publish.
 
+## Record the final human redaction decision
+
+An active amber/pink suppression run deliberately remains `NEEDS_REVIEW` even
+after the owner has watched and accepted the final redacted video. Do **not**
+edit that EgoBlur manifest. Instead, retain the final redacted video, its
+EgoBlur manifest, its private hand-suppression report, and its private YuNet
+report locally, then record the named decision once:
+
+```bash
+uv run egoannote-run approve-redaction \
+  --run-dir runs/gx010057-final \
+  --video-id GX010057 \
+  --redacted-video /private-input/GX010057.blurred.mp4 \
+  --blur-manifest /private-input/GX010057.manifest.json \
+  --hand-suppression-report /private-input/GX010057.hand_suppression.json \
+  --yunet-report /private-input/GX010057.yunet_review.json \
+  --reviewer "Dataset owner"
+```
+
+This writes `runs/gx010057-final/private/redaction_reviews/GX010057.json`.
+It stores the reviewer and SHA-256/size binding of all four inputs. Annotation
+and upload re-hash those files every time, so changing, removing, or replacing
+any input invalidates the approval and requires a fresh human decision. The
+approval file and the two review reports are private evidence only; none are
+included in `publish/` or uploaded to Hugging Face.
+
 ## Runtime
 
 The locked local runtime is Python 3.12 with MediaPipe 0.10.35. MediaPipe needs
@@ -252,6 +279,8 @@ windows, so the proposed sample is `0,11,23,34,45`.
 uv run egoannote-run annotate \
   --run-dir runs/mediapipe-vlm-pilot \
   --redacted-video GX010057.blurred.mp4 \
+  --blur-manifest GX010057.manifest.json \
+  --redaction-review runs/gx010057-final/private/redaction_reviews/GX010057.json \
   --video-id GX010057 \
   --model MODEL_A \
   --model MODEL_B \
@@ -283,6 +312,8 @@ Parquet output.
 uv run egoannote-run annotate \
   --run-dir runs/mediapipe-vlm-pilot \
   --redacted-video GX010057.blurred.mp4 \
+  --blur-manifest GX010057.manifest.json \
+  --redaction-review runs/gx010057-final/private/redaction_reviews/GX010057.json \
   --video-id GX010057 \
   --model MODEL_A \
   --model MODEL_B \
@@ -298,7 +329,7 @@ reproducible JPEG cache after Parquet export, not the database or annotations.
 For multiple clips, create JSONL with one object per line:
 
 ```json
-{"video_id":"GX010057","redacted_video":"/data/GX010057.blurred.mp4","original_video":"/data/GX010057.MP4","blur_manifest":"/data/GX010057.manifest.json"}
+{"video_id":"GX010057","redacted_video":"/data/GX010057.blurred.mp4","blur_manifest":"/data/GX010057.manifest.json","redaction_review":"private/redaction_reviews/GX010057.json"}
 ```
 
 Then replace the single-video inputs with:
@@ -313,8 +344,10 @@ uv run egoannote-run annotate \
 ```
 
 When an EgoBlur manifest is supplied, anything other than a `PASS...` status
-blocks annotation. Supplying a manifest also derives a collision-resistant ID
-from its clip ID and original SHA-256.
+blocks annotation unless the same command supplies a valid private,
+hash-bound `redaction_review`. This is for recorded owner review of an exact
+`NEEDS_REVIEW` derivative, not an automatic override. Supplying a manifest
+also derives a collision-resistant ID from its clip ID and original SHA-256.
 
 ## Hugging Face upload
 
@@ -328,9 +361,10 @@ uv run egoannote-run publish-hf \
   --repo-id OWNER/DATASET
 ```
 
-Publishing is blocked when the run has no passing EgoBlur manifest. The explicit
-`--allow-unverified-redaction` override exists for already-reviewed legacy clips,
-but the safer batch path is to preserve and supply every EgoBlur manifest.
+Publishing is blocked when the run has no passing EgoBlur manifest or a valid
+human redaction approval. The explicit `--allow-unverified-redaction` override
+exists only for already-reviewed legacy clips with unavailable evidence; the
+normal path is to preserve the manifest and private review record.
 
 The private bundle is marked `license: other` and includes private prerelease
 terms. Public release requires terms approved by the rights holder; pass them

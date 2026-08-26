@@ -43,6 +43,7 @@ class VideoInput:
     redacted_video: Path
     original_video: Path | None = None
     blur_manifest: Path | None = None
+    redaction_review: Path | None = None
     video_id: str | None = None
 
 
@@ -89,6 +90,7 @@ def _load_batch(path: Path) -> list[VideoInput]:
                     redacted_video=resolve_from_manifest(row["redacted_video"]),
                     original_video=resolve_from_manifest(row.get("original_video")),
                     blur_manifest=resolve_from_manifest(row.get("blur_manifest")),
+                    redaction_review=resolve_from_manifest(row.get("redaction_review")),
                     video_id=row.get("video_id"),
                 )
             )
@@ -159,6 +161,180 @@ def _save_private_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
     _atomic_json(run_dir / "private" / "run_manifest.json", manifest)
 
 
+def _is_private_path(path: Path) -> bool:
+    """Keep human-review evidence out of a public bundle by construction."""
+    return any(part.lower() in {"private", "do-not-ship"} for part in path.parts)
+
+
+def _file_binding(path: Path, *, label: str) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return {
+        "path": str(path),
+        "sha256": _sha256_file(path),
+        "bytes": path.stat().st_size,
+    }
+
+
+def _verify_file_binding(value: Any, *, label: str) -> Path:
+    if not isinstance(value, dict):
+        raise ValueError(f"redaction approval {label} binding is missing or invalid")
+    raw_path = value.get("path")
+    expected_sha256 = value.get("sha256")
+    expected_bytes = value.get("bytes")
+    if not isinstance(raw_path, str) or not isinstance(expected_sha256, str) or not isinstance(
+        expected_bytes, int
+    ):
+        raise ValueError(f"redaction approval {label} binding is missing or invalid")
+    path = Path(raw_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"approved {label} is no longer available: {path}")
+    if path.stat().st_size != expected_bytes or _sha256_file(path) != expected_sha256:
+        raise ValueError(
+            f"approved {label} no longer matches its recorded SHA-256; create a new human review "
+            "approval for the changed artifact"
+        )
+    return path
+
+
+def _validated_redaction_review(
+    review_path: Path | None,
+    *,
+    video_id: str,
+    redacted_video: Path,
+    blur_manifest: Path,
+    blur: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate a private human decision bound to all reviewed artifacts.
+
+    A `NEEDS_REVIEW` status never becomes a pass automatically.  This record
+    merely preserves the owner's explicit visual decision and makes it stale
+    whenever the video, EgoBlur manifest, or either private review report is
+    changed or removed.
+    """
+    if review_path is None:
+        return None
+    review_path = review_path.expanduser().resolve()
+    if not _is_private_path(review_path):
+        raise ValueError("--redaction-review must be stored under private or DO-NOT-SHIP")
+    if not review_path.is_file():
+        raise FileNotFoundError(f"redaction review approval not found: {review_path}")
+    approval = _load_json(review_path)
+    if approval.get("schema_version") != 1 or approval.get("review_type") != "human_redaction_approval":
+        raise ValueError(f"invalid redaction review approval: {review_path}")
+    if approval.get("decision") != "approved":
+        raise ValueError("redaction review decision is not approved")
+    reviewer = approval.get("reviewer")
+    reviewed_at = approval.get("reviewed_at")
+    if (
+        not isinstance(reviewer, str)
+        or not reviewer.strip()
+        or "\n" in reviewer
+        or "\r" in reviewer
+        or not isinstance(reviewed_at, str)
+        or not reviewed_at
+    ):
+        raise ValueError("redaction review approval lacks a valid reviewer or timestamp")
+    if approval.get("video_id") != video_id:
+        raise ValueError(
+            f"redaction review video_id={approval.get('video_id')!r} does not match {video_id!r}"
+        )
+
+    approved_video = _verify_file_binding(approval.get("redacted_video"), label="redacted video")
+    approved_manifest = _verify_file_binding(approval.get("blur_manifest"), label="EgoBlur manifest")
+    _verify_file_binding(approval.get("hand_suppression_report"), label="hand-suppression report")
+    _verify_file_binding(approval.get("yunet_report"), label="YuNet report")
+    if approved_video != redacted_video.resolve() or approved_manifest != blur_manifest.resolve():
+        raise ValueError(
+            "redaction review approval is bound to different video or EgoBlur manifest paths; "
+            "create a new approval for these inputs"
+        )
+    if _sha256_file(redacted_video) != str((blur.get("output") or {}).get("sha256") or ""):
+        raise ValueError("redacted video does not match manifest.output.sha256")
+
+    return {
+        "status": "human_approved",
+        "approval_path": str(review_path),
+        "approval_sha256": _sha256_file(review_path),
+        "reviewer": reviewer.strip(),
+        "reviewed_at": reviewed_at,
+    }
+
+
+def create_redaction_review(
+    *,
+    run_dir: Path,
+    video_id: str,
+    redacted_video: Path,
+    blur_manifest: Path,
+    hand_suppression_report: Path,
+    yunet_report: Path,
+    reviewer: str,
+) -> Path:
+    """Record a private, owner-made visual approval for one exact redaction."""
+    video_id = _validate_video_id(video_id)
+    reviewer = reviewer.strip()
+    if not reviewer or "\n" in reviewer or "\r" in reviewer:
+        raise ValueError("--reviewer must be a non-empty single line")
+    redacted_video = redacted_video.expanduser().resolve()
+    blur_manifest = blur_manifest.expanduser().resolve()
+    hand_suppression_report = hand_suppression_report.expanduser().resolve()
+    yunet_report = yunet_report.expanduser().resolve()
+    blur = _load_json(blur_manifest)
+    if str(blur.get("clip_id") or "") != video_id:
+        raise ValueError(
+            f"EgoBlur manifest clip_id={blur.get('clip_id')!r} does not match video_id={video_id!r}"
+        )
+    if _sha256_file(redacted_video) != str((blur.get("output") or {}).get("sha256") or ""):
+        raise ValueError("redacted video SHA-256 does not match manifest.output.sha256")
+
+    hand = _load_json(hand_suppression_report)
+    if hand.get("review_type") != "egoblur_hand_suppression":
+        raise ValueError("hand-suppression report has an unexpected review_type")
+    if (hand.get("input") or {}).get("clip_id") != video_id:
+        raise ValueError("hand-suppression report belongs to a different clip")
+    if (hand.get("input") or {}).get("source_sha256") != (blur.get("source") or {}).get("sha256"):
+        raise ValueError("hand-suppression report is not bound to this EgoBlur source")
+
+    yunet = _load_json(yunet_report)
+    if yunet.get("review_type") != "post_redaction_yunet":
+        raise ValueError("YuNet report has an unexpected review_type")
+    if (yunet.get("input") or {}).get("clip_id") != video_id:
+        raise ValueError("YuNet report belongs to a different clip")
+    if (yunet.get("input") or {}).get("redacted_sha256") != _sha256_file(redacted_video):
+        raise ValueError("YuNet report is not bound to this redacted video")
+    if (yunet.get("input") or {}).get("egoblur_manifest_sha256") != _sha256_file(blur_manifest):
+        raise ValueError("YuNet report is not bound to this EgoBlur manifest")
+
+    output = run_dir.resolve() / "private" / "redaction_reviews" / f"{video_id}.json"
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite existing redaction review approval: {output}")
+    _atomic_json(
+        output,
+        {
+            "schema_version": 1,
+            "review_type": "human_redaction_approval",
+            "privacy": "private_do_not_ship",
+            "decision": "approved",
+            "reviewer": reviewer,
+            "reviewed_at": _utc_now(),
+            "video_id": video_id,
+            "redacted_video": _file_binding(redacted_video, label="redacted video"),
+            "blur_manifest": _file_binding(blur_manifest, label="EgoBlur manifest"),
+            "hand_suppression_report": _file_binding(
+                hand_suppression_report, label="hand-suppression report"
+            ),
+            "yunet_report": _file_binding(yunet_report, label="YuNet report"),
+            "approval_scope": (
+                "Named human visual approval of this exact redacted video and its linked private "
+                "EgoBlur, hand-suppression, and YuNet evidence. It is not an automatic detector pass."
+            ),
+        },
+    )
+    return output
+
+
 def _register_video(
     run_dir: Path, item: VideoInput, video_id: str, blur: dict[str, Any] | None, basis: str
 ) -> dict[str, Any]:
@@ -166,10 +342,23 @@ def _register_video(
     redacted = item.redacted_video.resolve()
     original = item.original_video.resolve() if item.original_video else None
     blur_status = (blur or {}).get("status", "UNKNOWN_NO_MANIFEST")
-    if blur and not str(blur_status).startswith("PASS"):
+    if item.redaction_review and not blur:
+        raise ValueError("--redaction-review requires --blur-manifest")
+    review = (
+        _validated_redaction_review(
+            item.redaction_review,
+            video_id=video_id,
+            redacted_video=redacted,
+            blur_manifest=item.blur_manifest.resolve(),
+            blur=blur,
+        )
+        if blur and item.redaction_review
+        else None
+    )
+    if blur and not str(blur_status).startswith("PASS") and review is None:
         raise ValueError(
             f"EgoBlur manifest status for {video_id} is {blur_status!r}; annotation may "
-            "run only from a reviewed PASS redaction"
+            "run only from a reviewed PASS redaction or a valid private --redaction-review"
         )
 
     row = manifest["videos"].setdefault(video_id, {})
@@ -187,6 +376,7 @@ def _register_video(
             ),
             "blur_manifest": str(item.blur_manifest.resolve()) if item.blur_manifest else None,
             "blur_status": blur_status,
+            "redaction_review": review,
             "annotation_input": "redacted_only",
             "future_original_stages": ["wilor", "sam2", "depth_v3"],
             "stages": row.get("stages", {}),
@@ -410,11 +600,34 @@ def publish_run(
     manifest = _read_private_manifest(run_dir)
     video_manifests: list[dict[str, Any]] = []
     for video_id, row in manifest["videos"].items():
+        review = row.get("redaction_review")
+        review_is_approved = False
+        if isinstance(review, dict) and review.get("status") == "human_approved":
+            review_path = review.get("approval_path")
+            manifest_path = row.get("blur_manifest")
+            redacted_path = row.get("redacted_video")
+            if not isinstance(review_path, str) or not isinstance(manifest_path, str) or not isinstance(
+                redacted_path, str
+            ):
+                raise RuntimeError(f"{video_id} has an incomplete recorded human redaction review")
+            try:
+                _validated_redaction_review(
+                    Path(review_path),
+                    video_id=video_id,
+                    redacted_video=Path(redacted_path),
+                    blur_manifest=Path(manifest_path),
+                    blur=_load_json(Path(manifest_path)),
+                )
+            except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"{video_id} human redaction review no longer validates: {exc}"
+                ) from exc
+            review_is_approved = True
         if not str(row.get("blur_status", "")).startswith("PASS") \
-                and not allow_unverified_redaction:
+                and not review_is_approved and not allow_unverified_redaction:
             raise RuntimeError(
                 f"{video_id} has blur_status={row.get('blur_status')!r}; refusing to publish "
-                "without --allow-unverified-redaction"
+                "without a valid human redaction review or --allow-unverified-redaction"
             )
         _assert_captions_publishable(run_dir, video_id, row)
         public_manifest = _load_json(run_dir / "publish" / "manifests" / f"{video_id}.json")
@@ -504,6 +717,11 @@ def _build_parser() -> argparse.ArgumentParser:
     annotate.add_argument("--redacted-video", type=Path)
     annotate.add_argument("--original-video", type=Path)
     annotate.add_argument("--blur-manifest", type=Path)
+    annotate.add_argument(
+        "--redaction-review",
+        type=Path,
+        help="private hash-bound human approval required for a non-PASS EgoBlur manifest",
+    )
     annotate.add_argument("--video-id")
     annotate.add_argument("--model", action="append", default=[])
     annotate.add_argument("--models-toml", type=Path)
@@ -605,6 +823,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     hand_prior.add_argument("--confidence", type=float, default=hand_prior_layer.HAND_MIN_CONFIDENCE)
 
+    approve = sub.add_parser(
+        "approve-redaction",
+        help="record named private human approval of one reviewed redacted video",
+    )
+    approve.add_argument("--run-dir", type=Path, required=True)
+    approve.add_argument("--video-id", required=True)
+    approve.add_argument("--redacted-video", type=Path, required=True)
+    approve.add_argument("--blur-manifest", type=Path, required=True)
+    approve.add_argument("--hand-suppression-report", type=Path, required=True)
+    approve.add_argument("--yunet-report", type=Path, required=True)
+    approve.add_argument("--reviewer", required=True)
+
     decisions = sub.add_parser(
         "init-yunet-decisions",
         help="create a private all-uncertain review-decision template from a YuNet report",
@@ -640,6 +870,7 @@ def main(argv: list[str] | None = None) -> int:
                     redacted_video=args.redacted_video,
                     original_video=args.original_video,
                     blur_manifest=args.blur_manifest,
+                    redaction_review=args.redaction_review,
                     video_id=args.video_id,
                 )
             ]
@@ -658,6 +889,19 @@ def main(argv: list[str] | None = None) -> int:
                 prune_caption_frames=args.prune_caption_frames,
             )
             print(f"complete: {video_id}")
+        return 0
+
+    if args.command == "approve-redaction":
+        output = create_redaction_review(
+            run_dir=args.run_dir,
+            video_id=args.video_id,
+            redacted_video=args.redacted_video,
+            blur_manifest=args.blur_manifest,
+            hand_suppression_report=args.hand_suppression_report,
+            yunet_report=args.yunet_report,
+            reviewer=args.reviewer,
+        )
+        print(f"approved: {args.video_id} -> {output}")
         return 0
 
     if args.command == "publish-hf":
