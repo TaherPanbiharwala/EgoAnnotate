@@ -159,7 +159,11 @@ HAND_PRIOR_MODEL_URL = (
 HAND_PRIOR_MODEL_SHA256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
 HAND_ACTIVE_MIN_STABLE_SAMPLES = 5
 HAND_ACTIVE_MIN_TRACK_HITS = 4
-HAND_ACTIVE_MIN_OVERLAP = 0.98
+# Amber still withholds raw face tracks, so it remains deliberately strict.
+# Pink retains raw hits and only caps generated coverage, allowing a slightly
+# lower overlap gate without treating provisional evidence as face absence.
+HAND_AMBER_MIN_OVERLAP = 0.95
+HAND_PINK_MIN_OVERLAP = 0.90
 # Pink evidence remains too weak to suppress a detector-backed face hit.  It
 # can only shorten surrounding generated coverage, after at least two raw
 # hits agree with one same provisional hand at the same near-total overlap.
@@ -449,7 +453,9 @@ def suppress_stable_wearer_hand_tracks(
             kept.append(track)
             continue
         raw = raw_face_track_detections(track)
-        evidence = same_hand_overlap_evidence(raw, stable_regions_by_frame)
+        evidence = same_hand_overlap_evidence(
+            raw, stable_regions_by_frame, min_overlap=HAND_AMBER_MIN_OVERLAP
+        )
         if len(raw) >= HAND_ACTIVE_MIN_TRACK_HITS and evidence is not None:
             hand_track_id, overlaps = evidence
             suppressed.append({
@@ -476,7 +482,7 @@ def raw_face_track_detections(track: Track) -> list[tuple[int, tuple]]:
 
 
 def same_hand_overlap_evidence(
-    raw: list[tuple[int, tuple]], regions_by_frame: dict[int, list[dict]],
+    raw: list[tuple[int, tuple]], regions_by_frame: dict[int, list[dict]], *, min_overlap: float,
 ) -> tuple[int, list[float]] | None:
     """Prove every raw face hit overlaps one same private hand track.
 
@@ -490,7 +496,7 @@ def same_hand_overlap_evidence(
             int(region["track_id"])
             for region in regions_by_frame.get(frame_idx, [])
             if (overlap := pose_overlap_fraction(box, [region])) is not None
-            and overlap >= HAND_ACTIVE_MIN_OVERLAP
+            and overlap >= min_overlap
         }
         candidate_ids.append(ids)
     common_ids = set.intersection(*candidate_ids) if candidate_ids else set()
@@ -518,7 +524,7 @@ def demote_provisional_hand_generated_fills(
     """Shorten only generated coverage around a strongly pink face track.
 
     A raw detector-backed face box is never removed.  The gate is deliberately
-    strict: at least two raw hits must each have >=98% overlap with one same
+    strict: at least two raw hits must each have >=90% overlap with one same
     *provisional* hand track.  Generated interpolation/hold fills farther
     than ``context_frames`` from every raw hit are then removed.  This is an
     experimental quality trade-off, not a claim that pink evidence proves a
@@ -531,7 +537,9 @@ def demote_provisional_hand_generated_fills(
         raw = raw_face_track_detections(track)
         if len(raw) < PINK_DEMOTE_MIN_TRACK_HITS:
             continue
-        evidence = same_hand_overlap_evidence(raw, provisional_regions_by_frame)
+        evidence = same_hand_overlap_evidence(
+            raw, provisional_regions_by_frame, min_overlap=HAND_PINK_MIN_OVERLAP
+        )
         if evidence is None:
             continue
         hand_track_id, overlaps = evidence
@@ -894,6 +902,7 @@ def build_hand_suppression_report(
                 for frame_idx, frame_regions in regions_by_frame.items()
                 if frame_regions["provisional_wearer"]
             },
+            min_overlap=HAND_PINK_MIN_OVERLAP,
         )
         if evidence is None:
             continue
@@ -949,7 +958,8 @@ def build_hand_suppression_report(
             "overlap_grid": POSE_OVERLAP_GRID,
             "min_stable_hand_samples": HAND_ACTIVE_MIN_STABLE_SAMPLES,
             "min_track_hits": HAND_ACTIVE_MIN_TRACK_HITS,
-            "min_overlap": HAND_ACTIVE_MIN_OVERLAP,
+            "amber_min_overlap": HAND_AMBER_MIN_OVERLAP,
+            "pink_min_overlap": HAND_PINK_MIN_OVERLAP,
         },
         "summary": {
             "n_face_detections": len(face_detections),

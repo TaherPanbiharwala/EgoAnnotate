@@ -77,7 +77,7 @@ but must not be run for this pilot.
   `pink_amplification_candidate` when one same provisional hand accounts for
   every raw face hit in a track that later receives interpolation/hold fills.
   The opt-in `--pink-demote-generated-fills` is a narrowly bounded active
-  exception: after two raw hits with >=98% overlap to the same pink hand, it
+  exception: after two raw hits with >=90% overlap to the same pink hand, it
   keeps all raw detections but caps only generated interpolation/hold context
   (12 frames by default). It requires the pinned two-hand artifact, reports
   every removal privately, and any nonzero demotion forces `NEEDS_REVIEW`.

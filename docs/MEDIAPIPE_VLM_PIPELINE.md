@@ -170,7 +170,7 @@ requires all of the following:
   temporally continuous 10 Hz samples (a single missed sample may bridge the
   same hand track);
 - at least four raw EgoBlur face detections in the proposed face track; and
-- at least 98% overlap between **every** raw face box and one same stable hand
+- at least 95% overlap between **every** raw face box and one same stable hand
   track's circle. A track with even one uncertain/non-hand hit is retained and
   blurred.
 
@@ -189,7 +189,7 @@ that may have produced a visibly long false-positive fill.
 
 The default is report-only. An explicit experimental option,
 `--pink-demote-generated-fills`, may lower pink's fill priority slightly: it
-requires at least two raw face hits, each >=98% inside the same provisional
+requires at least two raw face hits, each >=90% inside the same provisional
 hand, keeps every raw detector box, and retains only the configured generated
 context around those boxes (12 frames by default, rather than the normal
 45-frame hold). It can remove only `interp`/`hold` entries, never a raw

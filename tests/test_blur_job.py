@@ -253,6 +253,33 @@ def test_pink_generated_fill_demotion_retains_raw_detections(blur_job):
     assert demoted[0]["policy"] == "raw_detections_retained_generated_fills_capped"
 
 
+def test_amber_and_pink_have_intentionally_different_overlap_gates(blur_job, monkeypatch):
+    """Amber withholds raw hits; pink only trims generated context, so pink may be looser."""
+    hand = {
+        "shape": "circle", "kind": "hand", "center": [5.0, 50.0], "radius": 20.0,
+        "track_id": 12,
+    }
+    monkeypatch.setattr(blur_job, "pose_overlap_fraction", lambda *_args: 0.93)
+    box = (0.0, 45.0, 10.0, 55.0)
+
+    amber = blur_job.Track(track_id=1, cls="face", last_frame=9)
+    for frame_idx in (0, 3, 6, 9):
+        amber.frames[frame_idx] = (box, "det")
+    kept, suppressed = blur_job.suppress_stable_wearer_hand_tracks(
+        [amber], {frame_idx: [hand] for frame_idx in (0, 3, 6, 9)}
+    )
+    assert kept == [amber]
+    assert suppressed == []
+
+    pink = blur_job.Track(track_id=2, cls="face", last_frame=3)
+    pink.frames = {0: (box, "det"), 3: (box, "det"), 20: (box, "hold")}
+    demoted = blur_job.demote_provisional_hand_generated_fills(
+        [pink], {0: [hand], 3: [hand]}, context_frames=1
+    )
+    assert len(demoted) == 1
+    assert 20 not in pink.frames
+
+
 def test_prior_flags_must_be_private_and_paired(blur_job, capsys):
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--pose-prior", "/tmp/private/prior.json"])
