@@ -72,6 +72,22 @@ def test_stable_wearer_status_requires_temporal_hand_continuity() -> None:
     assert not any(row["hands"][0]["stable_wearer_candidate"] for row in interrupted)
 
 
+def test_stability_is_half_a_second_at_the_30_fps_prior_cadence() -> None:
+    stable = [
+        {"frame_idx": frame_idx, "hands": [_hand(0.10 + frame_idx / 10_000, 0.88)]}
+        for frame_idx in range(15)
+    ]
+    hand_prior._track_hands(stable, stride=1, width=100, height=100, source_fps=30.0)
+    assert all(row["hands"][0]["stable_wearer_candidate"] for row in stable)
+
+    too_brief = [
+        {"frame_idx": frame_idx, "hands": [_hand(0.10 + frame_idx / 10_000, 0.88)]}
+        for frame_idx in range(14)
+    ]
+    hand_prior._track_hands(too_brief, stride=1, width=100, height=100, source_fps=30.0)
+    assert not any(row["hands"][0]["stable_wearer_candidate"] for row in too_brief)
+
+
 def test_review_anchors_show_handedness_and_three_hand_evidence_without_identity_claims() -> None:
     frames = [
         {
@@ -193,6 +209,50 @@ def test_hand_prior_loader_rejects_stale_or_incomplete_private_artifacts(tmp_pat
             n_frames=4,
             detect_hz=10.0,
         )
+
+
+def test_30fps_hand_prior_is_complete_then_downsampled_for_a_10fps_consumer(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "private" / "clip.hand_prior.json"
+    rows = [{"frame_idx": frame_idx, "hands": [_hand()]} for frame_idx in range(10)]
+    hand_prior._track_hands(rows, stride=1, width=100, height=100, source_fps=30.0)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": hand_prior.SCHEMA_VERSION,
+                "artifact_type": hand_prior.ARTIFACT_TYPE,
+                "source": {
+                    "sha256": "a" * 64,
+                    "width": 100,
+                    "height": 100,
+                    "fps": 30.0,
+                    "n_frames": 10,
+                },
+                "sampling": {"detect_hz": 30.0},
+                "model": {
+                    "name": "mediapipe_hand_landmarker",
+                    "url": hand_prior.HAND_MODEL_URL,
+                    "sha256": hand_prior.HAND_MODEL_SHA256,
+                },
+                "configuration": dict(hand_prior.ACTIVE_SUPPRESSION_CONFIGURATION),
+                "frames": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = hand_prior.load_hand_prior(
+        path,
+        source_sha256="a" * 64,
+        width=100,
+        height=100,
+        fps=30.0,
+        n_frames=10,
+        detect_hz=10.0,
+    )
+    assert set(loaded) == {0, 3, 6, 9}
 
 
 def test_hand_prior_paths_must_have_a_deliberate_private_boundary(tmp_path: Path) -> None:

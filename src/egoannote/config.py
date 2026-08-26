@@ -55,7 +55,10 @@ VLM_STRIDE_SECONDS: Final[int] = VLM_WINDOW_SECONDS  # == window ⇒ no overlap
 # MediaPipe hand-tracking track — local CPU, free tier
 # ---------------------------------------------------------------------------
 
-MP_FPS: Final[int] = 15
+# Preserve the fast motion of egocentric hands.  The redacted video is
+# normally ~30 fps, so this requests one Hand Landmarker result per decoded
+# source frame rather than silently discarding every second frame.
+MP_FPS: Final[int] = 30
 MP_MIN_HAND_CONFIDENCE: Final[float] = 0.5
 MP_MIN_PRESENCE_CONFIDENCE: Final[float] = 0.5
 MP_MIN_TRACKING_CONFIDENCE: Final[float] = 0.5
@@ -78,7 +81,9 @@ MP_MODEL_SHA256: Final[str] = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322
 # 18.33 units/s at 15 fps ≈ 1.22 units/frame, i.e. "the wrist teleported
 # across the frame." 0.25/frame is a generous plausibility bound, not a tight
 # one; tune against the human-labeled sample in Phase 6.5.
-MAX_PLAUSIBLE_DELTA_PER_FRAME: Final[float] = 0.25
+# This is a per-sample bound.  It was 0.25 at the former 15-fps default; at
+# 30 fps the same physical motion must cover no more than half that distance.
+MAX_PLAUSIBLE_DELTA_PER_FRAME: Final[float] = 0.125
 
 # ---------------------------------------------------------------------------
 # Caption generation knobs

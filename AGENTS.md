@@ -3,12 +3,11 @@
 This file exists so any coding agent (Codex, Claude, etc.) can pick up this
 repo cold. Written 2026-08-11, substantially updated in a later session
 after the EgoBlur fill-integrity question got resolved with real evidence
-and two more hysteresis visibility bugs got fixed. Repo HEAD at time of
-writing: **`5cca081`** — but the working tree has real, tested,
-**uncommitted** changes on top (the `det_low`/`n_low_absorbed` fixes below,
-plus an SSH durability fix in `scripts/runpod_setup.sh`); run `git status`
-before trusting this describes `HEAD` exactly. 279 tests passing
-(`uv run --extra test pytest tests/ -q`), including the uncommitted work.
+and two more hysteresis visibility bugs got fixed. Repo HEAD at time of this
+update: **`e6cf552`**. The working tree has real, tested, **uncommitted**
+30-fps Hand Landmarker / amber-pink suppression / YuNet hand-noise changes on
+top; run `git status` before trusting this describes `HEAD` exactly. 352 tests
+pass (`uv run --extra test pytest tests/ -q`), including the uncommitted work.
 
 If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
@@ -163,8 +162,8 @@ and pinned with a regression test:
 
 | Stage | Status |
 |---|---|
-| EgoBlur redaction | Heavily built, heavily tested, heavily reviewed. One real clip (`GX010057`) has been run three times while tuning parameters. **The fill-integrity question that used to gate scaling is resolved** — see "Immediate priority" below. The pre-redaction PoseLandmarker prior is permanently shadow-only. The experimental `--hand-suppress-wearer-hands` option can withhold only a repeated face track whose every raw box is nearly fully inside the same stable, close camera-wearer hand. Active behavior is pinned to 10 Hz, two requested hands, and the approved Hand Landmarker SHA-256, and rejects stale policy settings. It never becomes a detector ROI, never reduces detection on other people, records private evidence, and a nonzero count forces `NEEDS_REVIEW`. Amber keeps its four-hit requirement but now accepts >=95% overlap with one stable hand; pink retains raw detector hits but caps only generated interpolation/hold context after two raw hits at >=90% overlap. A nonzero amber suppression or pink demotion forces `NEEDS_REVIEW`; both require the pinned two-hand artifact, never the diagnostic four-hand artifact. A distinct four-hand diagnostic prior/preview makes multi-person scenes reviewable: `H#` is only a short-continuity anchor, while MediaPipe Left/Right, entry edge, and current screen side are private hints—not identity or suppression evidence; `3+ hands` triggers review only. The existing two-hand private prior for `GX010057` was generated successfully on 2026-08-25; regenerate the new four-hand diagnostic preview before active review. A batch must use a private report directory so every clip retains its suppression evidence. |
-| MediaPipe hands | Code complete and unit-tested. A first real-redacted pilot on 2026-08-24 was correctly rejected: `GX010057.blurred.mp4` has a 99.5% decode-error rate, yielding only 14 of 4,067 expected samples. The pipeline now fails partial decodes and refuses to resume a truncated hand Parquet. Keep this redacted-video annotation stage distinct from the new private pre-redaction Hand Landmarker prior; it still needs a verified redacted input and a fresh run directory. |
+| EgoBlur redaction | Heavily built and tested. The pre-redaction PoseLandmarker prior remains shadow-only. The behavior-changing private Hand Landmarker prior now samples at **30 fps** (two hands, pinned model/hash); EgoBlur still detects at its calibrated 10 Hz and consumes exactly the aligned 10 Hz subset. It never becomes a detector ROI or changes detection of other people. `--hand-suppress-wearer-hands` (amber) withholds a raw face track only after >=3 raw hits, a same-hand two-thirds majority, and >=90% overlap with a temporally stable wearer hand. `--pink-suppress-wearer-hands` applies the same >=3/two-thirds evidence to a provisional likely-wearer hand with a deliberately nearby >=92% gate. Blue does nothing. Every active decision has a private report and forces `NEEDS_REVIEW`. Four-hand priors/previews remain diagnostic-only; the active artifact must use two hands. |
+| MediaPipe hands | Code complete and unit-tested. The public-safe annotation layer runs only after final redaction and should be run at **30 fps** for fast hand motion. It is distinct from the private pre-redaction Hand Landmarker prior. A first real-redacted pilot on 2026-08-24 was correctly rejected for incomplete decode; the pipeline now fails partial decodes and refuses to resume a truncated hand Parquet. |
 | VLM captioning | The next-chat focus is to review and edit this code/prompt, not execute a paid batch. The intended dense representation is a six-second holistic `activity.caption`, bounded atomic `actions[]`, and a caption plus structured state for each visible anatomical left/right hand. Review `prompts/caption_v4.txt`, `layers/caption.py`, parsing, and schema together; captions must use redacted video only. Real execution remains blocked until `models.toml` has two real cross-lab models with provider/price pins and `OPENROUTER_API_KEY`, plus a verified redacted pilot input. |
 | Segmentation | Not started. Deliberately — blocked on measurements from the two stages above. |
 | verify/pack (dataset assembly) | Not started. Empty files. |

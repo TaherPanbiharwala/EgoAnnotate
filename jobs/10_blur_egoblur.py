@@ -157,17 +157,21 @@ HAND_PRIOR_MODEL_URL = (
     "hand_landmarker/float16/1/hand_landmarker.task"
 )
 HAND_PRIOR_MODEL_SHA256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
-HAND_ACTIVE_MIN_STABLE_SAMPLES = 5
-HAND_ACTIVE_MIN_TRACK_HITS = 4
-# Amber still withholds raw face tracks, so it remains deliberately strict.
-# Pink retains raw hits and only caps generated coverage, allowing a slightly
-# lower overlap gate without treating provisional evidence as face absence.
-HAND_AMBER_MIN_OVERLAP = 0.95
-HAND_PINK_MIN_OVERLAP = 0.90
-# Pink evidence remains too weak to suppress a detector-backed face hit.  It
-# can only shorten surrounding generated coverage, after at least two raw
-# hits agree with one same provisional hand at the same near-total overlap.
-PINK_DEMOTE_MIN_TRACK_HITS = 2
+HAND_ACTIVE_MIN_STABLE_SECONDS = 0.5
+# Amber and pink both act on raw face tracks.  The gates are intentionally
+# close: pink is a weaker wearer classification, but treating it as so strict
+# that it never wins merely recreates the hand-blur problem.  They differ only
+# by a small overlap margin.
+HAND_AMBER_MIN_TRACK_HITS = 3
+HAND_AMBER_MATCH_FRACTION = 2 / 3
+HAND_AMBER_MIN_OVERLAP = 0.90
+HAND_PINK_MIN_TRACK_HITS = 3
+HAND_PINK_MATCH_FRACTION = 2 / 3
+HAND_PINK_MIN_OVERLAP = 0.92
+# Pink keeps the existing generated-fill cap as an additional, lower-impact
+# remedy.  Its raw-track suppression above is the decision that can remove
+# the actual detector boxes.
+PINK_DEMOTE_MIN_TRACK_HITS = HAND_PINK_MIN_TRACK_HITS
 PINK_GENERATED_CONTEXT_FRAMES_DEFAULT = 12
 HAND_ACTIVE_CONFIGURATION = {
     "num_hands": 2,
@@ -177,7 +181,7 @@ HAND_ACTIVE_CONFIGURATION = {
     "wearer_min_radius_frac": 0.025,
     "track_max_distance": 0.28,
     "track_max_gap_samples": 1,
-    "min_stable_samples": HAND_ACTIVE_MIN_STABLE_SAMPLES,
+    "min_stable_seconds": HAND_ACTIVE_MIN_STABLE_SECONDS,
 }
 
 # How many DETECTION-STRIDE intervals a track may be carried on
@@ -327,6 +331,7 @@ class Config:
     hand_prior: Path | None
     hand_suppression_report: Path | None
     hand_suppress_wearer_hands: bool
+    pink_suppress_wearer_hands: bool
     pink_demote_generated_fills: bool
     pink_generated_context_frames: int
 
@@ -435,17 +440,27 @@ def pose_overlap_fraction(box: tuple, regions: list[dict]) -> float | None:
     return inside / (POSE_OVERLAP_GRID * POSE_OVERLAP_GRID)
 
 
-def suppress_stable_wearer_hand_tracks(
-    tracks: list[Track], stable_regions_by_frame: dict[int, list[dict]]
+def suppress_wearer_hand_tracks(
+    tracks: list[Track],
+    regions_by_frame: dict[int, list[dict]],
+    *,
+    state: str,
+    min_track_hits: int,
+    match_fraction: float,
+    min_overlap: float,
 ) -> tuple[list[Track], list[dict]]:
-    """Withhold only all-hand face tracks; return private evidence for review.
+    """Withhold raw face tracks that mostly follow one wearer-hand track.
 
-    A real face track survives if *any* raw detection lacks near-total overlap,
-    if the Hand Landmarker evidence was not stable long enough, or if the
-    track has fewer than four repeated raw detections. Suppression is therefore
-    an explicit opt-in quality tradeoff, never a face-search ROI or
-    detector-input filter.
+    This deliberately applies after full-frame face detection and tracking.
+    A hand prior never changes detector input or defines a search ROI.  The
+    majority rule is intentional: demanding a perfect match on *every* raw
+    EgoBlur sample was too brittle for fast hands, brief MediaPipe gaps, and
+    moving detector boxes.  It still requires one same short-continuity hand
+    track, several raw hits, and near-total box overlap on the qualifying
+    observations.
     """
+    if state not in {"amber", "pink"}:
+        raise ValueError(f"unsupported wearer-hand suppression state: {state!r}")
     kept: list[Track] = []
     suppressed: list[dict] = []
     for track in tracks:
@@ -454,22 +469,63 @@ def suppress_stable_wearer_hand_tracks(
             continue
         raw = raw_face_track_detections(track)
         evidence = same_hand_overlap_evidence(
-            raw, stable_regions_by_frame, min_overlap=HAND_AMBER_MIN_OVERLAP
+            raw,
+            regions_by_frame,
+            min_overlap=min_overlap,
+            min_track_hits=min_track_hits,
+            match_fraction=match_fraction,
         )
-        if len(raw) >= HAND_ACTIVE_MIN_TRACK_HITS and evidence is not None:
-            hand_track_id, overlaps = evidence
+        if evidence is not None:
+            hand_track_id, overlaps, n_overlap_hits, required_overlap_hits = evidence
             suppressed.append({
                 "track_id": track.track_id,
+                "suppression_state": state,
                 "hand_track_id": hand_track_id,
                 "n_raw_detections": len(raw),
+                "n_overlap_hits": n_overlap_hits,
+                "required_overlap_hits": required_overlap_hits,
+                "min_overlap": min_overlap,
                 "raw_detections": [
-                    {"frame_idx": frame_idx, "box": list(box), "stable_hand_overlap": overlap}
+                    {
+                        "frame_idx": frame_idx,
+                        "box": list(box),
+                        "hand_overlap": overlap,
+                        "qualifies": overlap is not None and overlap >= min_overlap,
+                    }
                     for (frame_idx, box), overlap in zip(raw, overlaps, strict=True)
                 ],
             })
             continue
         kept.append(track)
     return kept, suppressed
+
+
+def suppress_stable_wearer_hand_tracks(
+    tracks: list[Track], stable_regions_by_frame: dict[int, list[dict]]
+) -> tuple[list[Track], list[dict]]:
+    """Amber: relaxed raw-track suppression for a stable wearer hand."""
+    return suppress_wearer_hand_tracks(
+        tracks,
+        stable_regions_by_frame,
+        state="amber",
+        min_track_hits=HAND_AMBER_MIN_TRACK_HITS,
+        match_fraction=HAND_AMBER_MATCH_FRACTION,
+        min_overlap=HAND_AMBER_MIN_OVERLAP,
+    )
+
+
+def suppress_provisional_wearer_hand_tracks(
+    tracks: list[Track], provisional_regions_by_frame: dict[int, list[dict]]
+) -> tuple[list[Track], list[dict]]:
+    """Pink: almost-as-relaxed raw-track suppression for a likely wearer hand."""
+    return suppress_wearer_hand_tracks(
+        tracks,
+        provisional_regions_by_frame,
+        state="pink",
+        min_track_hits=HAND_PINK_MIN_TRACK_HITS,
+        match_fraction=HAND_PINK_MATCH_FRACTION,
+        min_overlap=HAND_PINK_MIN_OVERLAP,
+    )
 
 
 def raw_face_track_detections(track: Track) -> list[tuple[int, tuple]]:
@@ -482,39 +538,50 @@ def raw_face_track_detections(track: Track) -> list[tuple[int, tuple]]:
 
 
 def same_hand_overlap_evidence(
-    raw: list[tuple[int, tuple]], regions_by_frame: dict[int, list[dict]], *, min_overlap: float,
-) -> tuple[int, list[float]] | None:
-    """Prove every raw face hit overlaps one same private hand track.
+    raw: list[tuple[int, tuple]],
+    regions_by_frame: dict[int, list[dict]],
+    *,
+    min_overlap: float,
+    min_track_hits: int,
+    match_fraction: float,
+) -> tuple[int, list[float | None], int, int] | None:
+    """Find one hand track explaining most raw face observations.
 
-    This helper is deliberately equally strict for stable (active) and
-    provisional (pink, review-only) hand evidence.  ``None`` means no such
-    proof; it must never be read as permission to leave a face unredacted.
+    ``None`` preserves the normal face-redaction result.  A returned tuple
+    contains the winning hand ID, per-observation overlap (``None`` when the
+    hand did not explain that observation), matching-hit count, and required
+    matching-hit count.
     """
-    candidate_ids = []
-    for frame_idx, box in raw:
-        ids = {
-            int(region["track_id"])
-            for region in regions_by_frame.get(frame_idx, [])
-            if (overlap := pose_overlap_fraction(box, [region])) is not None
-            and overlap >= min_overlap
-        }
-        candidate_ids.append(ids)
-    common_ids = set.intersection(*candidate_ids) if candidate_ids else set()
-    if not common_ids:
+    if min_track_hits < 1 or not 0.0 < match_fraction <= 1.0:
+        raise ValueError("invalid wearer-hand suppression evidence threshold")
+    if len(raw) < min_track_hits:
         return None
-    hand_track_id = min(common_ids)
-    overlaps = [
-        pose_overlap_fraction(
-            box,
-            [
-                region
-                for region in regions_by_frame.get(frame_idx, [])
-                if int(region["track_id"]) == hand_track_id
-            ],
-        )
-        for frame_idx, box in raw
+    overlaps_by_hand: dict[int, list[float | None]] = {}
+    for raw_index, (frame_idx, box) in enumerate(raw):
+        frame_overlaps: dict[int, float] = {}
+        for region in regions_by_frame.get(frame_idx, []):
+            overlap = pose_overlap_fraction(box, [region])
+            if overlap is None or overlap < min_overlap:
+                continue
+            hand_id = int(region["track_id"])
+            frame_overlaps[hand_id] = max(frame_overlaps.get(hand_id, 0.0), overlap)
+        for hand_id in frame_overlaps:
+            overlaps_by_hand.setdefault(hand_id, [None] * raw_index)
+        for hand_id, overlaps in overlaps_by_hand.items():
+            overlaps.append(frame_overlaps.get(hand_id))
+    required_hits = max(min_track_hits, math.ceil(len(raw) * match_fraction))
+    eligible = [
+        (sum(value is not None for value in overlaps), hand_id, overlaps)
+        for hand_id, overlaps in overlaps_by_hand.items()
     ]
-    return hand_track_id, overlaps
+    if not eligible:
+        return None
+    n_overlap_hits, hand_track_id, overlaps = min(
+        eligible, key=lambda item: (-item[0], item[1])
+    )
+    if n_overlap_hits < required_hits:
+        return None
+    return hand_track_id, overlaps, n_overlap_hits, required_hits
 
 
 def demote_provisional_hand_generated_fills(
@@ -523,12 +590,14 @@ def demote_provisional_hand_generated_fills(
 ) -> list[dict]:
     """Shorten only generated coverage around a strongly pink face track.
 
-    A raw detector-backed face box is never removed.  The gate is deliberately
-    strict: at least two raw hits must each have >=90% overlap with one same
-    *provisional* hand track.  Generated interpolation/hold fills farther
-    than ``context_frames`` from every raw hit are then removed.  This is an
-    experimental quality trade-off, not a claim that pink evidence proves a
-    face is absent, and callers must keep the result in private review.
+    A raw detector-backed face box is never removed by this *add-on*. The
+    gate uses the same near-amber pink evidence as raw-track suppression:
+    at least three raw hits, with one same provisional hand explaining a
+    two-thirds majority at >=92% overlap. Generated interpolation/hold fills
+    farther than ``context_frames`` from every raw hit are then removed. This
+    is an experimental quality trade-off, not a claim that pink evidence
+    proves a face is absent, and callers must keep the result in private
+    review.
     """
     demoted: list[dict] = []
     for track in tracks:
@@ -538,11 +607,15 @@ def demote_provisional_hand_generated_fills(
         if len(raw) < PINK_DEMOTE_MIN_TRACK_HITS:
             continue
         evidence = same_hand_overlap_evidence(
-            raw, provisional_regions_by_frame, min_overlap=HAND_PINK_MIN_OVERLAP
+            raw,
+            provisional_regions_by_frame,
+            min_overlap=HAND_PINK_MIN_OVERLAP,
+            min_track_hits=PINK_DEMOTE_MIN_TRACK_HITS,
+            match_fraction=HAND_PINK_MATCH_FRACTION,
         )
         if evidence is None:
             continue
-        hand_track_id, overlaps = evidence
+        hand_track_id, overlaps, n_overlap_hits, required_overlap_hits = evidence
         raw_frames = {frame_idx for frame_idx, _box in raw}
         generated = [
             (frame_idx, source)
@@ -562,6 +635,8 @@ def demote_provisional_hand_generated_fills(
             "track_id": track.track_id,
             "provisional_hand_track_id": hand_track_id,
             "n_raw_detections": len(raw),
+            "n_overlap_hits": n_overlap_hits,
+            "required_overlap_hits": required_overlap_hits,
             "context_frames": context_frames,
             "n_generated_fill_frames_before": len(generated),
             "n_generated_fill_frames_removed": len(removed),
@@ -804,8 +879,15 @@ def load_hand_prior_for_clip(
         for name, expected in expected_source.items()
         if source.get(name) != expected
     }
-    if sampling.get("detect_hz") != cfg.detect_hz:
-        mismatches["detect_hz"] = {"clip": cfg.detect_hz, "artifact": sampling.get("detect_hz")}
+    try:
+        sample_hz = float(sampling["detect_hz"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{path} lacks a usable hand-prior sampling rate") from exc
+    if sample_hz < cfg.detect_hz:
+        mismatches["detect_hz"] = {
+            "minimum_required": cfg.detect_hz,
+            "artifact": sample_hz,
+        }
     expected_model = {
         "name": HAND_PRIOR_MODEL_NAME,
         "url": HAND_PRIOR_MODEL_URL,
@@ -813,7 +895,8 @@ def load_hand_prior_for_clip(
     }
     if model != expected_model:
         mismatches["model"] = {"clip": expected_model, "artifact": model}
-    if (cfg.hand_suppress_wearer_hands or cfg.pink_demote_generated_fills) \
+    if (cfg.hand_suppress_wearer_hands or cfg.pink_suppress_wearer_hands
+            or cfg.pink_demote_generated_fills) \
             and configuration != HAND_ACTIVE_CONFIGURATION:
         mismatches["configuration"] = {
             "clip": HAND_ACTIVE_CONFIGURATION,
@@ -821,8 +904,10 @@ def load_hand_prior_for_clip(
         }
     if mismatches:
         raise ValueError(f"hand-prior provenance does not match {clip.clip_id}: {mismatches}")
-    stride = max(1, round(clip.fps / cfg.detect_hz))
-    expected_frames = set(range(0, clip.n_frames, stride))
+    sample_stride = max(1, round(clip.fps / sample_hz))
+    sampled_frames = set(range(0, clip.n_frames, sample_stride))
+    detect_stride = max(1, round(clip.fps / cfg.detect_hz))
+    expected_frames = set(range(0, clip.n_frames, detect_stride))
     rows = artifact.get("frames")
     if not isinstance(rows, list):
         raise ValueError(f"hand prior {path} frames must be a list")
@@ -834,7 +919,7 @@ def load_hand_prior_for_clip(
             frame_idx, hands = int(row["frame_idx"]), row["hands"]
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"hand prior {path} has an invalid frame entry") from exc
-        if frame_idx not in expected_frames or frame_idx in by_frame or not isinstance(hands, list):
+        if frame_idx not in sampled_frames or frame_idx in by_frame or not isinstance(hands, list):
             raise ValueError(f"hand prior {path} has unexpected, duplicate, or invalid frame {frame_idx}")
         for hand in hands:
             _validate_hand_prior_region(hand)
@@ -848,12 +933,19 @@ def load_hand_prior_for_clip(
             ],
             "stable_wearer": [hand for hand in hands if hand["stable_wearer_candidate"]],
         }
-    if set(by_frame) != expected_frames:
+    if set(by_frame) != sampled_frames:
         raise ValueError(
-            f"hand prior {path} is incomplete: sampled_frames={len(by_frame)}/{len(expected_frames)}, "
+            f"hand prior {path} is incomplete: sampled_frames={len(by_frame)}/{len(sampled_frames)}, "
+            f"missing={sorted(sampled_frames - set(by_frame))[:8]}"
+        )
+    if not expected_frames.issubset(by_frame):
+        raise ValueError(
+            f"hand prior {path} cannot align to the EgoBlur detector timeline: "
             f"missing={sorted(expected_frames - set(by_frame))[:8]}"
         )
-    return path, sha256_file(path), by_frame
+    return path, sha256_file(path), {
+        frame_idx: by_frame[frame_idx] for frame_idx in expected_frames
+    }
 
 
 def build_hand_suppression_report(
@@ -861,12 +953,7 @@ def build_hand_suppression_report(
     regions_by_frame: dict[int, dict], detections: list[Detection], tracks: list[Track],
     suppressed_tracks: list[dict], pink_demoted_tracks: list[dict] | None = None,
 ) -> dict:
-    """Write private evidence for active and provisional hand-prior decisions.
-
-    Provisional (pink) hand evidence is a review signal only.  It is never
-    passed to active suppression and cannot change a detector input, track,
-    fill map, encoded video, or status.
-    """
+    """Write private evidence for amber/pink raw-track decisions and fill caps."""
     pink_demoted_tracks = pink_demoted_tracks or []
     demotion_by_track = {int(row["track_id"]): row for row in pink_demoted_tracks}
     face_detections = [detection for detection in detections if detection.cls == "face"]
@@ -903,10 +990,12 @@ def build_hand_suppression_report(
                 if frame_regions["provisional_wearer"]
             },
             min_overlap=HAND_PINK_MIN_OVERLAP,
+            min_track_hits=HAND_PINK_MIN_TRACK_HITS,
+            match_fraction=HAND_PINK_MATCH_FRACTION,
         )
         if evidence is None:
             continue
-        hand_track_id, overlaps = evidence
+        hand_track_id, overlaps, n_overlap_hits, required_overlap_hits = evidence
         extended = [
             (frame_idx, source)
             for frame_idx, (_box, source) in sorted(track.frames.items())
@@ -924,6 +1013,8 @@ def build_hand_suppression_report(
             "track_id": track.track_id,
             "provisional_hand_track_id": hand_track_id,
             "n_raw_detections": len(raw),
+            "n_overlap_hits": n_overlap_hits,
+            "required_overlap_hits": required_overlap_hits,
             "n_extended_fill_frames": len(extended),
             "n_interpolated_fill_frames": sum(source == "interp" for _, source in extended),
             "n_hold_fill_frames": sum(source == "hold" for _, source in extended),
@@ -956,8 +1047,11 @@ def build_hand_suppression_report(
             "face_threshold": cfg.face_threshold,
             "min_track_confirmations": cfg.min_track_confirmations,
             "overlap_grid": POSE_OVERLAP_GRID,
-            "min_stable_hand_samples": HAND_ACTIVE_MIN_STABLE_SAMPLES,
-            "min_track_hits": HAND_ACTIVE_MIN_TRACK_HITS,
+            "min_stable_hand_seconds": HAND_ACTIVE_MIN_STABLE_SECONDS,
+            "amber_min_track_hits": HAND_AMBER_MIN_TRACK_HITS,
+            "amber_match_fraction": HAND_AMBER_MATCH_FRACTION,
+            "pink_min_track_hits": HAND_PINK_MIN_TRACK_HITS,
+            "pink_match_fraction": HAND_PINK_MATCH_FRACTION,
             "amber_min_overlap": HAND_AMBER_MIN_OVERLAP,
             "pink_min_overlap": HAND_PINK_MIN_OVERLAP,
         },
@@ -972,6 +1066,12 @@ def build_hand_suppression_report(
                 for frame_regions in regions_by_frame.values()
             ),
             "n_suppressed_tracks": len(suppressed_tracks),
+            "n_amber_suppressed_tracks": sum(
+                row["suppression_state"] == "amber" for row in suppressed_tracks
+            ),
+            "n_pink_suppressed_tracks": sum(
+                row["suppression_state"] == "pink" for row in suppressed_tracks
+            ),
             "n_pink_demoted_tracks": len(pink_demoted_tracks),
             "n_pink_generated_fill_frames_removed": sum(
                 row["n_generated_fill_frames_removed"] for row in pink_demoted_tracks
@@ -988,9 +1088,9 @@ def build_hand_suppression_report(
         "warning": (
             "Active wearer-hand suppression is experimental. Any nonzero suppression "
             "count keeps this run in NEEDS_REVIEW and requires private human review. "
-            "Without --pink-demote-generated-fills, pink provisional-hand overlap is "
-            "private review evidence only. With it, raw detections remain intact while "
-            "only generated fills are capped; any nonzero demotion requires review."
+            "Amber and pink policies can both withhold raw face tracks; pink has a "
+            "slightly tighter overlap gate. --pink-demote-generated-fills additionally "
+            "caps generated interpolation/hold coverage; any nonzero action requires review."
         ),
     }
 
@@ -1082,15 +1182,21 @@ def parse_args(argv: list[str] | None = None) -> Config:
                    help="private JSON report (or directory) for Hand Landmarker suppression "
                         "evidence; required with --hand-prior and never written into --output-dir.")
     p.add_argument("--hand-suppress-wearer-hands", action="store_true",
-                   help="EXPERIMENTAL: withhold only a face track whose every raw detection is "
-                        "inside the same temporally-stable, camera-near Hand Landmarker region. "
+                   help="EXPERIMENTAL amber policy: withhold a face track when most of its raw "
+                        "detections overlap one same temporally-stable, camera-near Hand "
+                        "Landmarker region. "
                         "Requires --hand-prior and --hand-suppression-report; any suppression "
                         "keeps the audit in NEEDS_REVIEW.")
+    p.add_argument("--pink-suppress-wearer-hands", action="store_true",
+                   help="EXPERIMENTAL pink policy: withhold a face track when most of its raw "
+                        "detections overlap one same likely wearer-hand region. Pink is only "
+                        "slightly stricter than amber; requires --hand-prior and "
+                        "--hand-suppression-report, and any suppression keeps NEEDS_REVIEW.")
     p.add_argument("--pink-demote-generated-fills", action="store_true",
-                   help="EXPERIMENTAL: retain every raw face detection, but cap generated "
-                        "interpolation/hold fills around a face track whose every raw hit overlaps "
-                        "one same provisional Hand Landmarker region. Requires --hand-prior and "
-                        "--hand-suppression-report; any demotion keeps NEEDS_REVIEW.")
+                   help="EXPERIMENTAL pink add-on: cap generated interpolation/hold fills around "
+                        "a face track substantially explained by one same provisional Hand "
+                        "Landmarker region. Requires --hand-prior and --hand-suppression-report; "
+                        "any demotion keeps NEEDS_REVIEW.")
     p.add_argument("--pink-generated-context-frames", type=int,
                    default=PINK_GENERATED_CONTEXT_FRAMES_DEFAULT,
                    help="generated frames to retain on either side of each raw detection when "
@@ -1188,9 +1294,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         p.error("--hand-prior and --hand-suppression-report must be supplied together")
     if a.hand_suppress_wearer_hands and a.hand_prior is None:
         p.error("--hand-suppress-wearer-hands requires --hand-prior and --hand-suppression-report")
+    if a.pink_suppress_wearer_hands and a.hand_prior is None:
+        p.error("--pink-suppress-wearer-hands requires --hand-prior and --hand-suppression-report")
     if a.pink_demote_generated_fills and a.hand_prior is None:
         p.error("--pink-demote-generated-fills requires --hand-prior and --hand-suppression-report")
-    if (a.hand_suppress_wearer_hands or a.pink_demote_generated_fills) \
+    if (a.hand_suppress_wearer_hands or a.pink_suppress_wearer_hands
+            or a.pink_demote_generated_fills) \
             and a.detect_hz != DETECT_HZ_DEFAULT:
         p.error(
             "active Hand Landmarker suppression or pink fill demotion requires --detect-hz "
@@ -1289,6 +1398,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         hand_prior=a.hand_prior,
         hand_suppression_report=a.hand_suppression_report,
         hand_suppress_wearer_hands=a.hand_suppress_wearer_hands,
+        pink_suppress_wearer_hands=a.pink_suppress_wearer_hands,
         pink_demote_generated_fills=a.pink_demote_generated_fills,
         pink_generated_context_frames=a.pink_generated_context_frames,
     )
@@ -3331,6 +3441,7 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
                  det_low_frames: list[int] | None = None,
                  n_unconfirmed_tracks: int = 0,
                  n_hand_suppressed_tracks: int = 0,
+                 n_pink_suppressed_tracks: int = 0,
                  n_pink_demoted_tracks: int = 0,
                  n_pink_generated_fill_frames_removed: int = 0) -> dict:
     """status/hard_fail gate on EVERY check with actual power against a
@@ -3411,8 +3522,12 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
             f"and never redacted or audited")
     if n_hand_suppressed_tracks > 0:
         reasons.append(
-            f"{n_hand_suppressed_tracks} face track(s) withheld by experimental "
-            "Hand Landmarker wearer-hand suppression — review the private hand report before shipping")
+            f"{n_hand_suppressed_tracks} face track(s) withheld by experimental amber "
+            "Hand Landmarker suppression — review the private hand report before shipping")
+    if n_pink_suppressed_tracks > 0:
+        reasons.append(
+            f"{n_pink_suppressed_tracks} face track(s) withheld by experimental pink "
+            "Hand Landmarker suppression — review the private hand report before shipping")
     if n_pink_demoted_tracks > 0:
         reasons.append(
             f"{n_pink_demoted_tracks} face track(s) had generated fills capped by experimental "
@@ -3461,6 +3576,7 @@ def build_audit(clip: ClipInfo, fill_stats: dict, integrity: dict, sweep: dict,
         # count is never invisible, not so it's alarming.
         "n_unconfirmed_tracks": n_unconfirmed_tracks,
         "n_hand_suppressed_tracks": n_hand_suppressed_tracks,
+        "n_pink_suppressed_tracks": n_pink_suppressed_tracks,
         "n_pink_demoted_tracks": n_pink_demoted_tracks,
         "n_pink_generated_fill_frames_removed": n_pink_generated_fill_frames_removed,
         # False means no plate detector ran at all. Recorded so a face-only
@@ -3538,11 +3654,14 @@ def write_audit_summary(audit: dict, clip: ClipInfo, path: Path) -> None:
             f"(isolated single-hit tracks suppressed by --min-track-confirmations; "
             f"0 when it's at its default of 1)",
         f"n_hand_suppressed_tracks: {audit.get('n_hand_suppressed_tracks', 0)}  "
-            f"(experimental active Hand Landmarker suppression; any nonzero count requires "
+            f"(experimental amber Hand Landmarker suppression; any nonzero count requires "
+            f"private review before shipping)",
+        f"n_pink_suppressed_tracks: {audit.get('n_pink_suppressed_tracks', 0)}  "
+            f"(experimental pink raw-track suppression; any nonzero count requires "
             f"private review before shipping)",
         f"n_pink_demoted_tracks: {audit.get('n_pink_demoted_tracks', 0)}; "
             f"generated_fill_frames_removed: {audit.get('n_pink_generated_fill_frames_removed', 0)}  "
-            f"(experimental pink generated-fill cap; raw detections are retained and any "
+            f"(experimental pink generated-fill cap; any "
             f"nonzero count requires private review before shipping)",
         "",
         audit["note"],
@@ -3598,6 +3717,7 @@ def write_manifest(clip: ClipInfo, gen: str, cfg: Config, out_path: Path,
             # so it belongs here for the same reason hold_frames does.
             "min_track_confirmations": cfg.min_track_confirmations,
             "hand_suppress_wearer_hands": cfg.hand_suppress_wearer_hands,
+            "pink_suppress_wearer_hands": cfg.pink_suppress_wearer_hands,
             "pink_demote_generated_fills": cfg.pink_demote_generated_fills,
             "pink_generated_context_frames": cfg.pink_generated_context_frames,
             # None = native resolution. Recorded because it changes the scale
@@ -3750,7 +3870,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                   len(low_absorbed), cfg.continue_threshold, cfg.face_threshold)
     pose_shadow = None
     hand_suppression_report = None
-    hand_suppressed_tracks: list[dict] = []
+    amber_suppressed_tracks: list[dict] = []
+    pink_suppressed_tracks: list[dict] = []
     pink_demoted_tracks: list[dict] = []
     all_tracks = tracks
     if pose_prior is not None:
@@ -3793,14 +3914,14 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                     clip.clip_id,
                 )
         if cfg.hand_suppress_wearer_hands:
-            tracks, hand_suppressed_tracks = suppress_stable_wearer_hand_tracks(
+            tracks, amber_suppressed_tracks = suppress_stable_wearer_hand_tracks(
                 tracks, stable_hand_regions
             )
-            if hand_suppressed_tracks:
+            if amber_suppressed_tracks:
                 log.warning(
-                    "%s: EXPERIMENTAL Hand Landmarker suppression withheld %d face track(s); "
+                    "%s: EXPERIMENTAL amber Hand Landmarker suppression withheld %d face track(s); "
                     "private human review is mandatory before shipping",
-                    clip.clip_id, len(hand_suppressed_tracks),
+                    clip.clip_id, len(amber_suppressed_tracks),
                 )
             else:
                 log.info(
@@ -3808,9 +3929,25 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                     "the normal EgoBlur fill map is unchanged",
                     clip.clip_id,
                 )
+        if cfg.pink_suppress_wearer_hands:
+            tracks, pink_suppressed_tracks = suppress_provisional_wearer_hand_tracks(
+                tracks, provisional_hand_regions
+            )
+            if pink_suppressed_tracks:
+                log.warning(
+                    "%s: EXPERIMENTAL pink Hand Landmarker suppression withheld %d face track(s); "
+                    "private human review is mandatory before shipping",
+                    clip.clip_id, len(pink_suppressed_tracks),
+                )
+            else:
+                log.info(
+                    "%s: pink raw-track suppression withheld 0 provisional wearer-hand tracks; "
+                    "the remaining EgoBlur fill map is unchanged",
+                    clip.clip_id,
+                )
         hand_suppression_report = build_hand_suppression_report(
             clip, cfg, prior_path, prior_sha256, regions_by_frame, detections, all_tracks,
-            hand_suppressed_tracks, pink_demoted_tracks,
+            [*amber_suppressed_tracks, *pink_suppressed_tracks], pink_demoted_tracks,
         )
     fill_map = tracks_to_fill_map(tracks, clip.width, clip.height,
                                    cfg.dilate_scale, cfg.motion_margin_px)
@@ -3866,7 +4003,8 @@ def process_clip(cfg: Config, clip: ClipInfo, gen: str, face_det, lp_det,
                          n_low_absorbed=len(low_absorbed),
                          det_low_frames=det_low_frames,
                          n_unconfirmed_tracks=len(unconfirmed),
-                         n_hand_suppressed_tracks=len(hand_suppressed_tracks),
+                         n_hand_suppressed_tracks=len(amber_suppressed_tracks),
+                         n_pink_suppressed_tracks=len(pink_suppressed_tracks),
                          n_pink_demoted_tracks=len(pink_demoted_tracks),
                          n_pink_generated_fill_frames_removed=sum(
                              row["n_generated_fill_frames_removed"]

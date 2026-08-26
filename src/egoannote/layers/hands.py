@@ -1,4 +1,4 @@
-"""MediaPipe HandLandmarker runner — local CPU, free tier, 15 fps default.
+"""MediaPipe HandLandmarker runner — local CPU, free tier, 30 fps default.
 
 FIX (plan S6/S7): v1's `_pick_hand` iterated detections and returned the
 FIRST one whose top handedness label matched what was asked for. In
@@ -209,7 +209,7 @@ class HandAssigner:
         # of the two pairings, but cheaper is not the same as plausible — if
         # both pairings require an impossible jump (one hand left frame and a
         # false positive appeared elsewhere), the winner is still wrong. A
-        # wrist cannot cross a quarter of the frame in one 67ms step, so a
+        # wrist cannot cross an eighth of the frame in one 33ms step, so a
         # slot whose displacement exceeds the bound is treated as a DIFFERENT
         # hand: it gets a fresh track_id. That makes the discontinuity visible
         # downstream instead of silently corrupting the velocity signal the

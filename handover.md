@@ -1,5 +1,42 @@
 # egoannote — session handover
 
+## Current implementation checkpoint (2026-08-26)
+
+`master` is at `e6cf552`; the working tree now contains the uncommitted
+implementation of the finalized hand-prior policy and must be tested, then
+committed deliberately. Do not assume the historical notes below describe the
+current policy.
+
+- The private, pre-redaction Hand Landmarker prior defaults to **30 fps**.
+  It tracks two hands for active behavior and needs 0.5 seconds of continuous
+  wearer-candidate evidence to mark amber/stable. The private review prior can
+  request four hands, but that diagnostic artifact must never drive
+  suppression. The original and all hand-prior artifacts/previews stay under
+  `private/` and are never uploaded.
+- EgoBlur itself remains at **10 Hz**. It validates the full 30-fps artifact,
+  then reads only the exact 10-Hz frames on its detector timeline. Full-frame
+  face detection, thresholding, association, and treatment of other people
+  remain unchanged before the final post-tracking decision.
+- Amber `--hand-suppress-wearer-hands`: remove a raw face track only if one
+  stable wearer hand explains at least three raw detections and a two-thirds
+  majority of the track at >=90% overlap. Pink
+  `--pink-suppress-wearer-hands`: same hit/majority condition for one
+  provisional likely-wearer hand, at >=92% overlap. This is intentionally
+  only slightly tighter than amber, so pink can still suppress genuine hand
+  false positives. Blue hands have no effect. Any nonzero amber or pink action
+  writes a private report and forces `NEEDS_REVIEW`.
+- YuNet remains post-redaction and private. With `--hand-prior`, it preserves
+  raw YuNet counts but filters likely wearer-hand review noise using a 1.5x
+  expanded circle and >=10% overlap for either amber or pink. This is much
+  looser than EgoBlur by design; non-hand residuals remain actionable review
+  candidates. YuNet cannot change an already redacted video.
+- After the final redacted video is accepted, run the ordinary public-safe
+  MediaPipe hands layer at 30 fps and dense VLM captioning on the redacted
+  video only. Stage 2, WiLoR, SAM2, and DepthV3 remain paused.
+
+Current validation before commit: focused hand/EgoBlur/YuNet tests pass
+(`200 passed`). Run the full suite and inspect the diff before committing.
+
 ## Current checkpoint and next-chat focus (2026-08-25)
 
 `master` is at `6a8828d` (`fix: harden active wearer hand suppression`), and

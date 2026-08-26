@@ -176,7 +176,7 @@ def test_pose_shadow_reports_wearer_overlap_without_mutating_detection_or_tracks
 
 
 def test_pink_hand_overlap_reports_fill_amplification_without_changing_tracks(blur_job, tmp_path):
-    """Brief wearer-hand evidence is useful review data, never an active gate."""
+    """The private report retains pink evidence independently of an active run."""
     clip = _clip(blur_job, sha256="a" * 64)
     hand = {
         "shape": "circle", "kind": "hand", "center": [5.0, 50.0], "radius": 20.0,
@@ -184,19 +184,19 @@ def test_pink_hand_overlap_reports_fill_amplification_without_changing_tracks(bl
     }
     detections = [
         blur_job.Detection(frame_idx, "face", (0.0, 45.0, 10.0, 55.0), 0.9)
-        for frame_idx in (0, 3)
+        for frame_idx in (0, 3, 6)
     ]
-    track = blur_job.Track(track_id=7, cls="face", last_frame=5)
+    track = blur_job.Track(track_id=7, cls="face", last_frame=8)
     for detection in detections:
         track.frames[detection.frame_idx] = (detection.box, "det")
     track.frames[4] = (detections[0].box, "interp")
-    track.frames[5] = (detections[0].box, "hold")
+    track.frames[8] = (detections[0].box, "hold")
     regions = {
         frame_idx: {
             "all": [hand], "wearer": [hand], "provisional_wearer": [hand],
             "stable_wearer": [],
         }
-        for frame_idx in (0, 3)
+        for frame_idx in (0, 3, 6)
     }
     cfg = SimpleNamespace(detect_hz=10.0, face_threshold=0.3, min_track_confirmations=2)
     prior_path = tmp_path / "private" / "clip.hand_prior.json"
@@ -235,14 +235,15 @@ def test_pink_generated_fill_demotion_retains_raw_detections(blur_job):
         4: (box, "interp"),
         8: (box, "det"),
         9: (box, "hold"),
+        10: (box, "det"),
         12: (box, "hold"),
     }
 
     demoted = blur_job.demote_provisional_hand_generated_fills(
-        [track], {0: [hand], 8: [hand]}, context_frames=1
+        [track], {0: [hand], 8: [hand], 10: [hand]}, context_frames=1
     )
 
-    assert set(track.frames) == {0, 1, 8, 9}
+    assert set(track.frames) == {0, 1, 8, 9, 10}
     assert track.frames[0][1] == "det"
     assert track.frames[8][1] == "det"
     assert len(demoted) == 1
@@ -253,13 +254,13 @@ def test_pink_generated_fill_demotion_retains_raw_detections(blur_job):
     assert demoted[0]["policy"] == "raw_detections_retained_generated_fills_capped"
 
 
-def test_amber_and_pink_have_intentionally_different_overlap_gates(blur_job, monkeypatch):
-    """Amber withholds raw hits; pink only trims generated context, so pink may be looser."""
+def test_amber_and_pink_have_intentionally_nearby_raw_suppression_gates(blur_job, monkeypatch):
+    """Pink can suppress raw tracks, but needs only slightly stronger overlap."""
     hand = {
         "shape": "circle", "kind": "hand", "center": [5.0, 50.0], "radius": 20.0,
         "track_id": 12,
     }
-    monkeypatch.setattr(blur_job, "pose_overlap_fraction", lambda *_args: 0.93)
+    monkeypatch.setattr(blur_job, "pose_overlap_fraction", lambda *_args: 0.91)
     box = (0.0, 45.0, 10.0, 55.0)
 
     amber = blur_job.Track(track_id=1, cls="face", last_frame=9)
@@ -268,16 +269,23 @@ def test_amber_and_pink_have_intentionally_different_overlap_gates(blur_job, mon
     kept, suppressed = blur_job.suppress_stable_wearer_hand_tracks(
         [amber], {frame_idx: [hand] for frame_idx in (0, 3, 6, 9)}
     )
-    assert kept == [amber]
-    assert suppressed == []
+    assert kept == []
+    assert suppressed[0]["suppression_state"] == "amber"
 
     pink = blur_job.Track(track_id=2, cls="face", last_frame=3)
-    pink.frames = {0: (box, "det"), 3: (box, "det"), 20: (box, "hold")}
-    demoted = blur_job.demote_provisional_hand_generated_fills(
-        [pink], {0: [hand], 3: [hand]}, context_frames=1
+    pink.frames = {0: (box, "det"), 3: (box, "det"), 6: (box, "det")}
+    kept, suppressed = blur_job.suppress_provisional_wearer_hand_tracks(
+        [pink], {0: [hand], 3: [hand], 6: [hand]}
     )
-    assert len(demoted) == 1
-    assert 20 not in pink.frames
+    assert kept == [pink]
+    assert suppressed == []
+
+    monkeypatch.setattr(blur_job, "pose_overlap_fraction", lambda *_args: 0.93)
+    kept, suppressed = blur_job.suppress_provisional_wearer_hand_tracks(
+        [pink], {0: [hand], 3: [hand], 6: [hand]}
+    )
+    assert kept == []
+    assert suppressed[0]["suppression_state"] == "pink"
 
 
 def test_prior_flags_must_be_private_and_paired(blur_job, capsys):
@@ -306,6 +314,8 @@ def test_prior_flags_must_be_private_and_paired(blur_job, capsys):
     with pytest.raises(SystemExit):
         blur_job.parse_args([*BASE_ARGS, "--pink-demote-generated-fills"])
     with pytest.raises(SystemExit):
+        blur_job.parse_args([*BASE_ARGS, "--pink-suppress-wearer-hands"])
+    with pytest.raises(SystemExit):
         blur_job.parse_args(
             [
                 *BASE_ARGS,
@@ -318,7 +328,7 @@ def test_prior_flags_must_be_private_and_paired(blur_job, capsys):
     assert "requires --detect-hz 10.0" in capsys.readouterr().err
 
 
-def test_active_hand_suppression_requires_all_track_hits(blur_job):
+def test_active_hand_suppression_accepts_a_same_hand_majority(blur_job):
     hand = {
         "shape": "circle",
         "kind": "hand",
@@ -344,8 +354,10 @@ def test_active_hand_suppression_requires_all_track_hits(blur_job):
         [all_hand, mixed], stable
     )
 
-    assert kept == [mixed]
-    assert [entry["track_id"] for entry in suppressed] == [1]
+    assert kept == []
+    assert [entry["track_id"] for entry in suppressed] == [1, 2]
+    assert suppressed[1]["n_overlap_hits"] == 3
+    assert suppressed[1]["required_overlap_hits"] == 3
 
 
 def test_active_hand_suppression_rejects_an_unstable_or_mixed_track(blur_job):
@@ -360,13 +372,13 @@ def test_active_hand_suppression_rejects_an_unstable_or_mixed_track(blur_job):
     for frame_idx in (0, 3, 6, 9):
         track.frames[frame_idx] = ((0.0, 45.0, 10.0, 55.0), "det")
     kept, suppressed = blur_job.suppress_stable_wearer_hand_tracks(
-        [track], {0: [hand], 3: [hand], 6: [hand]}
+        [track], {0: [hand], 3: [hand]}
     )
     assert kept == [track]
     assert suppressed == []
 
 
-def test_active_hand_suppression_requires_one_hand_track_for_every_hit(blur_job):
+def test_active_hand_suppression_requires_one_hand_track_for_a_majority(blur_job):
     first = {"shape": "circle", "kind": "hand", "center": [5, 50], "radius": 20, "track_id": 1}
     second = {"shape": "circle", "kind": "hand", "center": [5, 50], "radius": 20, "track_id": 2}
     track = blur_job.Track(track_id=1, cls="face", last_frame=9)
@@ -393,7 +405,7 @@ def test_hand_prior_loader_rejects_weakened_or_stale_active_evidence(blur_job, t
         "wearer_candidate": True,
         "stable_wearer_candidate": True,
     }
-    rows = [{"frame_idx": frame_idx, "hands": [hand]} for frame_idx in (0, 3, 6, 9)]
+    rows = [{"frame_idx": frame_idx, "hands": [hand]} for frame_idx in range(10)]
     artifact = {
         "schema_version": 1,
         "artifact_type": "pre_redaction_hand_prior",
@@ -405,7 +417,7 @@ def test_hand_prior_loader_rejects_weakened_or_stale_active_evidence(blur_job, t
             "fps": 30.0,
             "n_frames": 10,
         },
-        "sampling": {"detect_hz": 10.0},
+        "sampling": {"detect_hz": 30.0},
         "model": {
             "name": blur_job.HAND_PRIOR_MODEL_NAME,
             "url": blur_job.HAND_PRIOR_MODEL_URL,
@@ -479,7 +491,7 @@ def test_checkpoint_dir_must_be_private_and_outside_publishable_output(blur_job)
 
 
 def _audit(blur_job, *, fill=None, integrity=None, sweep=None, yunet=None,
-           hand_suppressed=0, pink_demoted=0):
+           hand_suppressed=0, pink_suppressed=0, pink_demoted=0):
     return blur_job.build_audit(
         _clip(blur_job),
         fill if fill is not None else {"n_frames_with_fill": 10},
@@ -489,6 +501,7 @@ def _audit(blur_job, *, fill=None, integrity=None, sweep=None, yunet=None,
         yunet if yunet is not None else {"n_yunet_uncovered": 0},
         "2",
         n_hand_suppressed_tracks=hand_suppressed,
+        n_pink_suppressed_tracks=pink_suppressed,
         n_pink_demoted_tracks=pink_demoted,
         n_pink_generated_fill_frames_removed=pink_demoted * 2,
     )
@@ -507,7 +520,13 @@ def test_skipped_yunet_is_a_visibly_weaker_pass(blur_job):
 def test_active_hand_suppression_always_requires_review(blur_job):
     audit = _audit(blur_job, hand_suppressed=1)
     assert audit["status"] == "NEEDS_REVIEW"
-    assert "Hand Landmarker wearer-hand suppression" in " ".join(audit["status_reasons"])
+    assert "amber Hand Landmarker suppression" in " ".join(audit["status_reasons"])
+
+
+def test_pink_raw_hand_suppression_always_requires_review(blur_job):
+    audit = _audit(blur_job, pink_suppressed=1)
+    assert audit["status"] == "NEEDS_REVIEW"
+    assert "pink Hand Landmarker suppression" in " ".join(audit["status_reasons"])
 
 
 def test_pink_generated_fill_demotion_always_requires_review(blur_job):

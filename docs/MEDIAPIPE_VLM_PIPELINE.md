@@ -112,115 +112,64 @@ input; only the private overlap report is new.
 
 ### Experimental active wearer-hand suppression
 
-Pose remains a useful private diagnostic, but it does **not** make the active
-decision: its camera-near amber label occasionally changed between the wearer
-and a nearby person, and the conservative Pose-only gate consequently withheld
-zero tracks. The active gate instead uses a separate MediaPipe **Hand
-Landmarker** prior. YuNet is paused and is not part of this protocol.
+Pose remains a private shadow diagnostic; it never changes redaction. The
+behavior-changing prior is a separate MediaPipe **Hand Landmarker** pass over
+the original. It defaults to **30 fps** to preserve fast hand motion. Its
+artifact is complete at that cadence (including no-hand frames), holds all 21
+2D landmarks and short-continuity anchors, and stays private.
 
-Build the private hand prior from the original at exactly EgoBlur's 10 Hz
-cadence. Active suppression rejects any other cadence, so do not override
-either command's `--detect-hz` value. Its preview makes the evidence reviewable: amber is a stable wearer
-candidate, magenta is a provisional candidate that cannot suppress anything,
-and blue is another hand.
+Use two requested hands for the active artifact. A four-hand prior/preview is
+valuable for diagnosis, but its different model configuration is rejected for
+active suppression. Preview colours are evidence labels only: amber is a
+temporally stable likely wearer hand, magenta/pink is a provisional likely
+wearer hand, and blue is another/unknown hand. MediaPipe Left/Right, entry
+zone, screen side, and `H#` are private review hints, not identity proof.
 
-For the first human review, request four hands. This enables the preview to
-show a potential third/fourth hand rather than silently dropping it at the
-detector limit. This four-hand artifact is **diagnostic only** and must not be
-passed to `--hand-suppress-wearer-hands`: active suppression remains pinned to
-the reviewed two-hand configuration. If active suppression is approved after
-review, make a separate, fresh two-hand artifact.
+EgoBlur still detects faces full-frame at its calibrated 10 Hz. Before it
+acts, it validates the full 30-fps artifact and selects only the exact 10-Hz
+detector frames; therefore the hand prior never becomes an ROI or changes
+detector input, thresholds, association, or treatment of other people.
+
+- Amber (`--hand-suppress-wearer-hands`) can withhold a raw face track only
+  when one stable hand track explains at least three raw face detections and a
+  two-thirds majority of that track, at >=90% box overlap.
+- Pink (`--pink-suppress-wearer-hands`) applies the same three-hit and
+  two-thirds rule to one provisional likely-wearer hand, at >=92% overlap.
+  It is deliberately only slightly tighter than amber, so it can suppress
+  convincing fast-hand false positives rather than merely report them.
+- Blue changes nothing. Missing hand evidence remains unknown, so the normal
+  face-redaction decision is retained.
+
+Any active amber or pink action writes a private per-clip report and forces
+`NEEDS_REVIEW`. `--pink-demote-generated-fills` remains an optional separate
+experiment for capping interpolation/hold frames; it never removes a raw
+detection. For a batch, `--hand-suppression-report` must be a private
+directory so no clip loses its evidence.
 
 ```bash
 uv run egoannote-run hand-prior \
   --original-video /workspace/in/GX010057.MP4 \
   --video-id GX010057 \
-  --num-hands 4 \
-  --output /workspace/private/hand-prior/GX010057.review4.hand_prior.json \
+  --num-hands 2 \
+  --output /workspace/private/hand-prior/GX010057.hand_prior.json \
   --models-dir /workspace/private/models \
-  --preview-video /workspace/private/hand-preview/GX010057.review4.mp4
-```
+  --preview-video /workspace/private/hand-preview/GX010057.hands.mp4
 
-The first call downloads the versioned official Hand Landmarker model to the
-private model cache. The artifact stores source/model hashes, every 10 Hz
-sample (including no-hand frames), 21 two-dimensional hand landmarks, its
-short temporal hand-track identifier, and the wearer-candidate/stable state.
-It is original-derived and must never be published.
-
-Each preview label additionally exposes review-only identity evidence:
-
-- `H23` is a **short-continuity anchor**, not a person ID. A hand that is
-  absent longer than the small tracking grace period gets a new anchor; the
-  system records its identity as unknown rather than pretending it has
-  re-identified the hand.
-- `MP: Left 0.94` or `MP: Right 0.94` is MediaPipe's anatomical-handedness
-  hint and its confidence. It is displayed, but never used to merge anchors,
-  decide wearer identity, or change blur.
-- `entry: left | now: right` is the image-side/edge evidence for that short
-  anchor. It helps a human inspect a suspicious re-entry, but a change of side
-  is not proof of a different person in a moving egocentric camera.
-- `3+ hands: review only` means three or more hands were detected in that
-  sample. It is strong evidence to inspect an extra hand, not an automatic
-  outsider or redaction decision.
-
-Only a stable candidate can affect the fill map. The active gate additionally
-requires all of the following:
-
-- a close, lower-frame or side-edge hand candidate observed for at least five
-  temporally continuous 10 Hz samples (a single missed sample may bridge the
-  same hand track);
-- at least four raw EgoBlur face detections in the proposed face track; and
-- at least 95% overlap between **every** raw face box and one same stable hand
-  track's circle. A track with even one uncertain/non-hand hit is retained and
-  blurred.
-
-EgoBlur still runs full-frame; the hand prior cannot change detector inputs,
-thresholds, tracking association, or the treatment of other people. It only
-filters an already-built, exceptionally well-supported false-positive track.
-A nonzero suppression count always yields `NEEDS_REVIEW`; it is never a
-publication approval.
-
-Magenta evidence always creates private reporting evidence. If every raw
-EgoBlur face box in a track overlaps the same provisional wearer-hand track,
-and that face track then gains generated interpolation or hold fills, the
-private hand-suppression report records it as a
-`pink_amplification_candidate`. This lets review target brief hand detections
-that may have produced a visibly long false-positive fill.
-
-The default is report-only. An explicit experimental option,
-`--pink-demote-generated-fills`, may lower pink's fill priority slightly: it
-requires at least two raw face hits, each >=90% inside the same provisional
-hand, keeps every raw detector box, and retains only the configured generated
-context around those boxes (12 frames by default, rather than the normal
-45-frame hold). It can remove only `interp`/`hold` entries, never a raw
-`det`/`det_low` entry, and any nonzero change forces `NEEDS_REVIEW`. The
-private report records every removed generated fill. It accepts only the
-pinned two-hand artifact, never the four-hand diagnostic artifact.
-
-Use fresh output/checkpoint/report destinations, preserving the ordinary run
-for byte/hash comparison:
-
-```bash
 ... jobs/10_blur_egoblur.py ... \
-  --output-dir /workspace/out-gx010057-active-hand \
-  --checkpoint-dir /workspace/private/checkpoints/GX010057-active-hand \
-  --pose-prior /workspace/private/pose-prior/GX010057.pose_prior.json \
-  --pose-shadow-report /workspace/private/pose-shadow/GX010057.hand_pose_shadow.json \
   --hand-prior /workspace/private/hand-prior/GX010057.hand_prior.json \
   --hand-suppression-report /workspace/private/hand-suppression/GX010057.json \
-  --pink-demote-generated-fills \
-  --pink-generated-context-frames 12 \
-  --hand-suppress-wearer-hands
+  --hand-suppress-wearer-hands \
+  --pink-suppress-wearer-hands
 ```
-
-For a batch, pass `--hand-suppression-report` a private **directory**, not a
-single `.json` file. The job writes one review report per clip and rejects a
-single report path that would overwrite earlier evidence.
 
 ## Independent YuNet verification
 
-YuNet is an optional separate verifier, but is not part of the current
-Pose-plus-EgoBlur pilot.
+YuNet is an optional post-redaction verifier. It is intentionally much more
+relaxed than EgoBlur for wearer-hand false positives: when given the private
+30-fps hand prior, it expands amber and pink hand circles by 1.5x and removes
+an uncovered hit from the *actionable review queue* at >=10% overlap. The raw
+YuNet result/count stays in the private report; non-hand residuals stay
+actionable. This filtering cannot change an already-redacted video.
 
 YuNet runs **after** redaction. It is a CPU-only, independent detector over the
 redacted video: any face it finds outside EgoBlur's reconstructed fill map is
@@ -240,6 +189,7 @@ uv run egoannote-run verify-yunet \
   --ffmpeg ffmpeg \
   --report /private/GX010057.yunet_review.json \
   --preview-video /private/GX010057.yunet_full_debug.mp4 \
+  --hand-prior private/hand-prior/GX010057.hand_prior.json \
   --pose-prior private/pose-prior/GX010057.pose_prior.json \
   --candidate-contact-sheet-dir private/GX010057.yunet_candidates
 ```

@@ -42,7 +42,7 @@ HAND_NUM_HANDS = 2
 # change the pinned active-suppression detector configuration.
 HAND_REVIEW_NUM_HANDS = 4
 HAND_MIN_CONFIDENCE = 0.5
-HAND_DETECT_HZ = 10.0
+HAND_DETECT_HZ = 30.0
 
 # A hand has to be both large enough to plausibly belong to the wearer and
 # camera-near.  The geometry is intentionally a candidate heuristic, not an
@@ -53,7 +53,11 @@ WEARER_LOWER_BAND = 0.70
 WEARER_MIN_RADIUS_FRAC = 0.025
 TRACK_MAX_DISTANCE = 0.28
 TRACK_MAX_GAP_SAMPLES = 1
-MIN_STABLE_SAMPLES = 5
+# A stable wearer candidate must persist for real elapsed time, not an
+# arbitrary number of samples.  This keeps the meaning unchanged when the
+# prior changes from 10 to 30 fps: five samples at 30 fps would be just
+# 0.17 seconds and would weaken the evidence threefold.
+MIN_STABLE_SECONDS = 0.5
 
 # The GPU job validates this complete mapping before an artifact can change
 # redaction behaviour. A matching schema alone is not enough provenance.
@@ -65,7 +69,7 @@ ACTIVE_SUPPRESSION_CONFIGURATION = {
     "wearer_min_radius_frac": WEARER_MIN_RADIUS_FRAC,
     "track_max_distance": TRACK_MAX_DISTANCE,
     "track_max_gap_samples": TRACK_MAX_GAP_SAMPLES,
-    "min_stable_samples": MIN_STABLE_SAMPLES,
+    "min_stable_seconds": MIN_STABLE_SECONDS,
 }
 
 HAND_PREVIEW_STABLE_BGR = (0, 191, 255)  # amber
@@ -272,14 +276,24 @@ def _track_hands(
     stride: int,
     width: int,
     height: int,
+    source_fps: float | None = None,
 ) -> None:
     """Assign short-lived physical hand tracks, then mark stable candidates.
 
     Handedness labels are intentionally ignored for identity: egocentric views
-    regularly label both hands alike.  Nearest-centre continuity at the shared
-    10 Hz EgoBlur cadence is the only link, and a missed sample may bridge one
-    cadence interval but no more.
+    regularly label both hands alike.  Nearest-centre continuity is the only
+    link, and a missed sample may bridge one cadence interval but no more.
+    ``source_fps`` makes the stable-wearer threshold duration-based for a
+    production prior; retaining the old five-sample fallback keeps this pure
+    helper convenient for small unit fixtures.
     """
+    if source_fps is not None and source_fps <= 0:
+        raise ValueError("source_fps must be > 0")
+    min_stable_samples = (
+        max(1, math.ceil(MIN_STABLE_SECONDS * source_fps / stride))
+        if source_fps is not None
+        else 5
+    )
     active: dict[int, tuple[int, tuple[float, float]]] = {}
     max_distance_px = math.hypot(width, height) * TRACK_MAX_DISTANCE
     next_track_id = 0
@@ -317,17 +331,17 @@ def _track_hands(
             if last_frame is not None and frame_idx - last_frame > stride * (
                 TRACK_MAX_GAP_SAMPLES + 1
             ):
-                if len(run) >= MIN_STABLE_SAMPLES:
+                if len(run) >= min_stable_samples:
                     stable.update((track_id, value) for value in run)
                 run = []
             if wearer_candidate:
                 run.append(frame_idx)
             else:
-                if len(run) >= MIN_STABLE_SAMPLES:
+                if len(run) >= min_stable_samples:
                     stable.update((track_id, value) for value in run)
                 run = []
             last_frame = frame_idx
-        if len(run) >= MIN_STABLE_SAMPLES:
+        if len(run) >= min_stable_samples:
             stable.update((track_id, value) for value in run)
     for row in frames:
         for hand in row["hands"]:
@@ -619,7 +633,13 @@ def build_hand_prior(
             f"missing={sorted(expected - emitted)[:8]}"
         )
     stride = max(1, round(info.fps / detect_hz))
-    _track_hands(frames, stride=stride, width=info.width, height=info.height)
+    _track_hands(
+        frames,
+        stride=stride,
+        width=info.width,
+        height=info.height,
+        source_fps=info.fps,
+    )
     review_anchor_summary = _annotate_review_anchors(
         frames, width=info.width, height=info.height
     )
@@ -638,7 +658,12 @@ def build_hand_prior(
             "fps": info.fps,
             "n_frames": info.n_frames,
         },
-        "sampling": {"detect_hz": detect_hz, "stride": stride, "n_sampled_frames": len(frames)},
+        "sampling": {
+            "detect_hz": detect_hz,
+            "stride": stride,
+            "n_sampled_frames": len(frames),
+            "min_stable_samples": math.ceil(MIN_STABLE_SECONDS * info.fps / stride),
+        },
         "model": {
             "name": "mediapipe_hand_landmarker",
             "url": HAND_MODEL_URL,
@@ -760,8 +785,15 @@ def load_hand_prior(
         for name, expected in expected_source.items()
         if source.get(name) != expected
     }
-    if sampling.get("detect_hz") != detect_hz:
-        mismatches["detect_hz"] = {"expected": detect_hz, "artifact": sampling.get("detect_hz")}
+    try:
+        sample_hz = float(sampling["detect_hz"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{path} lacks a usable hand-prior sampling rate") from exc
+    if sample_hz < detect_hz:
+        mismatches["detect_hz"] = {
+            "minimum_required": detect_hz,
+            "artifact": sample_hz,
+        }
     expected_model = {
         "name": "mediapipe_hand_landmarker",
         "url": HAND_MODEL_URL,
@@ -776,8 +808,10 @@ def load_hand_prior(
         }
     if mismatches:
         raise ValueError(f"hand-prior provenance does not match this clip: {mismatches}")
-    stride = max(1, round(fps / detect_hz))
-    expected_indices = set(range(0, n_frames, stride))
+    sample_stride = max(1, round(fps / sample_hz))
+    sampled_indices = set(range(0, n_frames, sample_stride))
+    required_stride = max(1, round(fps / detect_hz))
+    required_indices = set(range(0, n_frames, required_stride))
     rows = artifact.get("frames")
     if not isinstance(rows, list):
         raise ValueError(f"{path} frames must be a list")
@@ -790,7 +824,7 @@ def load_hand_prior(
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"{path} has an invalid frame entry") from exc
         if (
-            frame_idx not in expected_indices
+            frame_idx not in sampled_indices
             or frame_idx in by_frame
             or not isinstance(hands, list)
         ):
@@ -807,9 +841,14 @@ def load_hand_prior(
             ],
             "stable_wearer": [hand for hand in hands if hand["stable_wearer_candidate"]],
         }
-    if set(by_frame) != expected_indices:
+    if set(by_frame) != sampled_indices:
         raise ValueError(
-            f"hand prior is incomplete: sampled_frames={len(by_frame)}/{len(expected_indices)}, "
-            f"missing={sorted(expected_indices - set(by_frame))[:8]}"
+            f"hand prior is incomplete: sampled_frames={len(by_frame)}/{len(sampled_indices)}, "
+            f"missing={sorted(sampled_indices - set(by_frame))[:8]}"
         )
-    return by_frame
+    if not required_indices.issubset(by_frame):
+        raise ValueError(
+            "hand prior cannot align to the requested detector timeline: "
+            f"missing={sorted(required_indices - set(by_frame))[:8]}"
+        )
+    return {frame_idx: by_frame[frame_idx] for frame_idx in required_indices}

@@ -336,6 +336,7 @@ def annotate_video(
         private_row["stages"]["hands"] = {
             "status": "complete",
             "input": "redacted",
+            "target_fps": config.MP_FPS,
             "path": str(hands_path),
             "rows": n_rows if n_rows >= 0 else "resumed_existing",
             "missing_gaps": n_gaps if n_gaps >= 0 else "resumed_existing",
@@ -549,6 +550,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="optional private pre-redaction pose prior; ranks likely wearer-limb false positives",
     )
     yunet.add_argument(
+        "--hand-prior",
+        type=Path,
+        help=(
+            "optional private 30-fps pre-redaction Hand Landmarker prior; filters likely "
+            "wearer-hand YuNet noise using expanded amber/pink hand regions"
+        ),
+    )
+    yunet.add_argument(
         "--candidate-contact-sheet-dir",
         type=Path,
         help="optional private redacted-only contact sheets, one per temporal YuNet candidate",
@@ -673,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
             report=args.report.resolve(),
             preview_video=args.preview_video.resolve() if args.preview_video else None,
             pose_prior_path=args.pose_prior.resolve() if args.pose_prior else None,
+            hand_prior_path=args.hand_prior.resolve() if args.hand_prior else None,
             candidate_contact_sheet_dir=(
                 args.candidate_contact_sheet_dir.resolve()
                 if args.candidate_contact_sheet_dir else None

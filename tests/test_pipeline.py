@@ -21,7 +21,7 @@ def test_existing_truncated_hand_track_cannot_be_resumed(tmp_path: Path, monkeyp
         "probe",
         lambda _video: type("Info", (), {"fps": 30.0, "n_frames": 10})(),
     )
-    with pytest.raises(RuntimeError, match=r"1/5 expected"):
+    with pytest.raises(RuntimeError, match=r"1/10 expected"):
         pipeline._run_hands(VideoInput(tmp_path / "clip.mp4"), "vid", tmp_path)
 
 

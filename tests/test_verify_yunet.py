@@ -233,6 +233,35 @@ def test_yunet_candidates_are_temporal_and_only_wearer_overlap_is_lower_priority
     assert other_candidate["priority"] == "normal"
 
 
+def test_yunet_hand_filter_is_relaxed_for_both_amber_and_pink() -> None:
+    amber = {
+        "shape": "circle",
+        "kind": "hand",
+        "center": [5.0, 5.0],
+        "radius": 5.0,
+        "track_id": 1,
+    }
+    pink = {**amber, "track_id": 2}
+    detections = [
+        {"frame_idx": 0, "box": [9, 0, 13, 4], "score": 0.8, "covered": False},
+        {"frame_idx": 2, "box": [9, 0, 13, 4], "score": 0.8, "covered": False},
+        {"frame_idx": 4, "box": [30, 30, 34, 34], "score": 0.9, "covered": False},
+    ]
+    frames = {
+        0: {"stable_wearer": [amber], "provisional_wearer": []},
+        2: {"stable_wearer": [], "provisional_wearer": [pink]},
+        4: {"stable_wearer": [], "provisional_wearer": []},
+    }
+
+    actionable, suppressed = verify_yunet.filter_yunet_wearer_hand_noise(
+        detections, hand_frames=frames
+    )
+
+    assert [row["frame_idx"] for row in actionable] == [4]
+    assert [row["hand_state"] for row in suppressed] == ["amber", "pink"]
+    assert all(row["expanded_hand_overlap"] >= verify_yunet.YUNET_HAND_MIN_OVERLAP for row in suppressed)
+
+
 def test_confirmed_candidate_decisions_become_forced_boxes_only(tmp_path: Path) -> None:
     report = tmp_path / "private" / "review.json"
     report.parent.mkdir()

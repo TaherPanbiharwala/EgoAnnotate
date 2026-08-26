@@ -22,12 +22,18 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
-from . import pose_prior
+from . import hand_prior, pose_prior
 
 CANDIDATE_TRACK_IOU = 0.20
 CANDIDATE_MAX_GAP_SAMPLES = 2
 CANDIDATE_LOWER_PRIORITY_OVERLAP = pose_prior.LIMB_OVERLAP_LOWER_PRIORITY
 CANDIDATE_CONTACT_SHEET_SAMPLES = 6
+# YuNet frequently draws a loose face box around fingers, palms, and wrists.
+# This filter is intentionally more permissive than EgoBlur's raw-track
+# policy: both amber and pink wearer-hand evidence can suppress an uncovered
+# YuNet review observation, and the private circle is enlarged only here.
+YUNET_HAND_RADIUS_SCALE = 1.5
+YUNET_HAND_MIN_OVERLAP = 0.10
 _DECISIONS = frozenset({"confirmed_face", "false_positive", "uncertain"})
 
 
@@ -47,6 +53,70 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
+
+
+def _expanded_hand_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return private hand circles enlarged for the noisy YuNet audit only."""
+    expanded: list[dict[str, Any]] = []
+    for region in regions:
+        if region.get("shape") != "circle" or region.get("kind") != "hand":
+            raise ValueError(f"unsupported Hand Landmarker region in YuNet filter: {region!r}")
+        enlarged = dict(region)
+        enlarged["radius"] = float(region["radius"]) * YUNET_HAND_RADIUS_SCALE
+        expanded.append(enlarged)
+    return expanded
+
+
+def filter_yunet_wearer_hand_noise(
+    detections: list[dict[str, Any]],
+    *,
+    hand_frames: dict[int, dict[str, list[dict[str, Any]]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Drop likely wearer-hand false positives from the YuNet review queue.
+
+    The raw detector result is retained in the private report, including why
+    it was filtered.  Covered detections are left alone because they were
+    never candidate residual faces.  Amber gets first precedence; pink is
+    deliberately accepted too, so YuNet can stay useful for non-hand edge
+    cases instead of overwhelming review with limb noise.
+    """
+    actionable: list[dict[str, Any]] = []
+    suppressed: list[dict[str, Any]] = []
+    for detection in detections:
+        if bool(detection["covered"]):
+            actionable.append(detection)
+            continue
+        frame_idx = int(detection["frame_idx"])
+        frame = hand_frames.get(frame_idx)
+        if frame is None:
+            raise ValueError(f"hand prior lacks YuNet sampled frame {frame_idx}")
+        box = tuple(float(value) for value in detection["box"])
+        amber_overlap = pose_prior.limb_overlap_fraction(
+            box, _expanded_hand_regions(frame["stable_wearer"])
+        )
+        pink_overlap = pose_prior.limb_overlap_fraction(
+            box, _expanded_hand_regions(frame["provisional_wearer"])
+        )
+        if amber_overlap is not None and amber_overlap >= YUNET_HAND_MIN_OVERLAP:
+            suppressed.append(
+                {
+                    **detection,
+                    "hand_state": "amber",
+                    "expanded_hand_overlap": amber_overlap,
+                }
+            )
+            continue
+        if pink_overlap is not None and pink_overlap >= YUNET_HAND_MIN_OVERLAP:
+            suppressed.append(
+                {
+                    **detection,
+                    "hand_state": "pink",
+                    "expanded_hand_overlap": pink_overlap,
+                }
+            )
+            continue
+        actionable.append(detection)
+    return actionable, suppressed
 
 
 def _load_job_module(job_script: Path) -> ModuleType:
@@ -709,6 +779,7 @@ def verify_yunet(
     report: Path,
     preview_video: Path | None = None,
     pose_prior_path: Path | None = None,
+    hand_prior_path: Path | None = None,
     candidate_contact_sheet_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Run and persist a fail-closed, post-redaction YuNet review report."""
@@ -752,6 +823,19 @@ def verify_yunet(
             detect_hz=float(manifest["egoblur"]["detect_hz"]),
         )
         pose_artifact_sha256 = _sha256_file(pose_prior_path)
+    hand_frames = None
+    hand_artifact_sha256 = None
+    if hand_prior_path is not None:
+        hand_frames = hand_prior.load_hand_prior(
+            hand_prior_path,
+            source_sha256=str(source.get("sha256") or ""),
+            width=int(source["width"]),
+            height=int(source["height"]),
+            fps=float(source["fps"]),
+            n_frames=int(source["n_frames"]),
+            detect_hz=float(manifest["egoblur"]["detect_hz"]),
+        )
+        hand_artifact_sha256 = _sha256_file(hand_prior_path)
     config = SimpleNamespace(
         yunet_model=yunet_model,
         nms_iou=float(manifest["egoblur"]["nms_iou"]),
@@ -776,13 +860,26 @@ def verify_yunet(
     all_detections = result.pop("yunet_detections", None)
     if not isinstance(all_detections, list):
         raise RuntimeError("YuNet helper did not return detections for candidate review")
+    candidate_detections = all_detections
+    hand_suppressed: list[dict[str, Any]] = []
+    if hand_frames is not None:
+        candidate_detections, hand_suppressed = filter_yunet_wearer_hand_noise(
+            all_detections, hand_frames=hand_frames
+        )
     candidates = build_candidate_tracks(
-        all_detections,
+        candidate_detections,
         pose_frames=pose_frames,
         fps=float(source["fps"]),
         detect_hz=float(manifest["egoblur"]["detect_hz"]),
     )
     result["candidates"] = candidates
+    raw_uncovered = int(result.get("n_yunet_uncovered", 0))
+    result["n_yunet_actionable_uncovered"] = sum(
+        not bool(row["covered"]) for row in candidate_detections
+    )
+    result["n_yunet_hand_suppressed"] = len(hand_suppressed)
+    result["yunet_hand_suppressed"] = hand_suppressed[:200]
+    result["yunet_hand_suppressed_truncated"] = max(0, len(hand_suppressed) - 200)
     preview_frames = None
     if preview_video is not None:
         preview_frames = _write_preview_video(
@@ -805,11 +902,17 @@ def verify_yunet(
             height=int(source["height"]),
             n_source_frames=int(source["n_frames"]),
         )
-    uncovered = int(result.get("n_yunet_uncovered", 0))
+    actionable_uncovered = int(result["n_yunet_actionable_uncovered"])
     report_data = {
         "schema_version": 1,
         "review_type": "post_redaction_yunet",
-        "review_status": "PASS_NO_UNCOVERED_YUNET" if uncovered == 0 else "NEEDS_REVIEW",
+        "review_status": (
+            "NEEDS_REVIEW"
+            if actionable_uncovered > 0
+            else "PASS_NO_UNCOVERED_YUNET"
+            if raw_uncovered == 0
+            else "PASS_NO_ACTIONABLE_UNCOVERED_YUNET"
+        ),
         "approval_scope": (
             "YuNet-only independent post-redaction check. This report does not approve "
             "the complete EgoBlur audit, replace human review, or permit publication by itself."
@@ -835,6 +938,21 @@ def verify_yunet(
                 "path": pose_prior_path.name,
                 "sha256": pose_artifact_sha256,
                 "priority_policy": "wearer_limb_overlap_only",
+            }
+        ),
+        "hand_prior": (
+            None
+            if hand_prior_path is None
+            else {
+                "path": hand_prior_path.name,
+                "sha256": hand_artifact_sha256,
+                "filter_policy": {
+                    "amber_and_pink_suppress_review_noise": True,
+                    "radius_scale": YUNET_HAND_RADIUS_SCALE,
+                    "min_box_overlap": YUNET_HAND_MIN_OVERLAP,
+                    "raw_uncovered_detections": raw_uncovered,
+                    "actionable_uncovered_detections": actionable_uncovered,
+                },
             }
         ),
         "yunet": result,
