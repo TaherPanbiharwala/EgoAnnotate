@@ -90,6 +90,47 @@ def test_all_windows_captioned_on_a_clean_run(stub_media, tmp_path):
     store.close()
 
 
+def test_segment_summary_is_source_bound_and_reused(tmp_path: Path) -> None:
+    class SummaryBackend(_Backend):
+        def caption(self, frames_jpeg, prompt) -> VLMResponse:
+            assert frames_jpeg == []
+            assert "OBSERVATIONS=" in prompt
+            self.calls += 1
+            return VLMResponse(
+                text=(
+                    '{"summary":"The camera wearer folds a box.",'
+                    '"steps":["Fold the box flap."]}'
+                ),
+                latency_ms=1,
+            )
+
+    captions = [
+        {
+            "window_idx": 0,
+            "start_ts_ms": 0,
+            "end_ts_ms": 6000,
+            "activity": {"caption": "The camera wearer folds a box."},
+            "actions": [{"start_frame": 0, "end_frame": 7, "task_step": "fold_box_flap"}],
+        }
+    ]
+    store = Store(tmp_path / "run.db")
+    backend = SummaryBackend()
+
+    first, first_called = capmod.summarize_caption_windows(
+        captions, backend=backend, store=store, video_id="v.segment.0000", run_id="run"
+    )
+    second, second_called = capmod.summarize_caption_windows(
+        captions, backend=backend, store=store, video_id="v.segment.0000", run_id="run"
+    )
+
+    assert first_called is True
+    assert second_called is False
+    assert backend.calls == 1
+    assert first["summary"] == second["summary"] == "The camera wearer folds a box."
+    assert first["source_caption_sha256"].startswith("sha256:")
+    store.close()
+
+
 def test_resume_skips_completed_and_retries_only_failures(stub_media, tmp_path):
     """The core regression guard: a second run must re-call the backend ONLY
     for the window that failed, and must overwrite rather than duplicate.

@@ -24,6 +24,11 @@ def test_shipped_registry_parses() -> None:
     reg = load_registry()
     assert "models" in reg
     assert "fake" in reg["models"], "the zero-setup fake backend must be registered"
+    flash = reg["models"]["qwen3.8-flash"]
+    assert flash["model"] == "qwen/qwen3.8-flash"
+    assert flash["price_in_per_mtok"] == 0.15
+    assert flash["price_out_per_mtok"] == 0.47
+    assert flash["reasoning_enabled"] is False
 
 
 def test_fake_backend_builds_with_no_key(tmp_path) -> None:

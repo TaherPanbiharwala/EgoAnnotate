@@ -12,6 +12,44 @@ If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
 reading the source alone, and re-learning them costs real GPU money.
 
+## Latest operational checkpoint — 2026-09-02
+
+The current branch is **`original-trim-mediapipe-vlm`**.  It is a private,
+original-derived MediaPipe/VLM workflow and must remain independent from
+EgoBlur, YuNet, Stage 2, WiLoR, SAM2, and DepthV3.  Those stages are paused.
+
+The manually reviewed face-free batch has completed end-to-end for 13 clips.
+All artifacts below are private and must not be uploaded to Hugging Face.
+
+- The source `batch_upload/` folder was deliberately archived off-device
+  after the user verified a Drive copy.  Do not expect the original source
+  files to be local.  The retained, 29.97-fps normalized children and their
+  timeline manifests are the rendering/caption inputs:
+  `runs/face-free-c40-2026-09-01/private/face_free_children/<VIDEO_ID>/`.
+- MediaPipe Hand Landmarker uses 30-fps, per-frame annotations.  The chosen
+  threshold is **0.4** for fast-paced `GX010059` and `GX010063`, and **0.55**
+  for focused household-task clips `GX010072`, `073`, `075`–`079`, `081`,
+  `082`, `084`, and `087`.  The 0.5 comparison run and temporary threshold
+  review outputs were removed.
+- Dense Qwen 3.8 Max (`qwen/qwen3.8-max`) captions completed successfully for
+  all 13 clips.  The model entry uses minimal required reasoning with the
+  trace excluded.  A transient 429 retried successfully.  Do not rerun paid
+  captioning unless the text or prompt is intentionally being replaced.
+- Final, decode-checked review videos have both stored MediaPipe hands and
+  Qwen captions burned in.  `GX010059` and `GX010063` are at
+  `runs/face-free-c40-2026-09-01/private/annotated-videos/`; the other eleven
+  are at `runs/face-free-c55-household-2026-09-02/private/annotated-videos/`.
+- The source-binding rule remains fail-closed for curation and annotation.
+  Rendering alone may use a hash-verified retained child after the source is
+  archived; `load_manifest(..., verify_source=False)` is intentionally used
+  only by the rendering context.  Do not widen that exception to new
+  annotation or curation work.
+
+Before deleting any batch data, preserve the normalized children plus the
+matching `private/original_curated/` annotation/caption state.  The final
+MP4s are review artifacts; remove them only after the user has copied or
+approved them.
+
 ## What this project is
 
 A solo developer is turning a shelved egocentric-video-annotation startup

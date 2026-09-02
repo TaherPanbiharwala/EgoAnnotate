@@ -9,6 +9,7 @@ no possibility of the duplicate-record bug v1 had with append-mode JSONL.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -25,6 +26,14 @@ from ..schema import WindowCaption, hash_prompt, utc_now_isoformat
 from ..store import Store
 
 log = logging.getLogger(__name__)
+
+
+# This is intentionally a separate, private derived record.  It never
+# replaces the frame-grounded window responses, which remain the source of
+# truth for every caption event and for later error review.
+_SEGMENT_SUMMARY_STAGE = "caption_segment_summary"
+_SEGMENT_SUMMARY_VERSION = "v1"
+_SEGMENT_SUMMARY_MAX_SOURCE_CHARS = 100_000
 
 
 def _load_prompt() -> tuple[str, str]:
@@ -79,6 +88,155 @@ def _render_prompt(template: str, n_frames: int) -> str:
         .replace("{max_frame_idx}", str(n_frames - 1))
         .replace("{window_seconds}", seconds_str)
     )
+
+
+def _summary_observations(captions: list[dict]) -> dict:
+    """Make a bounded, deterministic text-only evidence packet for a summary call.
+
+    A segment summary must be grounded in the saved visual-window observations;
+    it must not be a new, untraceable interpretation of the original video.
+    Deliberately omit verbose scene prose here: task steps, atomic captions,
+    hands, and timing are the material needed to summarize the procedure.
+    """
+    windows: list[dict] = []
+    for caption in sorted(captions, key=lambda item: int(item["window_idx"])):
+        actions: list[dict] = []
+        for action in caption.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            actions.append(
+                {
+                    "start_frame": action.get("start_frame"),
+                    "end_frame": action.get("end_frame"),
+                    "task_step": action.get("task_step"),
+                    "action_caption": action.get("action_caption"),
+                    "left_hand": action.get("left_hand"),
+                    "right_hand": action.get("right_hand"),
+                    "tool_in_use": action.get("tool_in_use"),
+                    "coordination": action.get("coordination"),
+                    "handover_event": action.get("handover_event"),
+                }
+            )
+        windows.append(
+            {
+                "window_idx": caption.get("window_idx"),
+                "start_ts_ms": caption.get("start_ts_ms"),
+                "end_ts_ms": caption.get("end_ts_ms"),
+                "activity": (caption.get("activity") or {}).get("caption"),
+                "actions": actions,
+            }
+        )
+    return {"windows": windows}
+
+
+def _summary_source_hash(observations: dict) -> str:
+    encoded = json.dumps(observations, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _segment_summary_prompt(observations: dict) -> str:
+    evidence = json.dumps(observations, ensure_ascii=False, separators=(",", ":"))
+    if len(evidence) > _SEGMENT_SUMMARY_MAX_SOURCE_CHARS:
+        raise ValueError(
+            "caption segment is too long for one source-grounded summary call; "
+            "split the curated original at a natural cut before captioning"
+        )
+    return (
+        "You are consolidating already-saved, frame-grounded observations from a "
+        "single uninterrupted first-person video segment. Do not add facts that are "
+        "not in these observations. Do not mention a window number, frame number, "
+        "or missing information. Describe the camera wearer, not an unnamed person.\n\n"
+        "Return one JSON object only, with no markdown:\n"
+        '{"summary":"one to three concise sentences",'
+        '"steps":["short ordered visible procedure step", "..."]}\n\n'
+        "The summary describes the overall visible activity. steps are ordered, "
+        "deduplicated procedure-level steps supported by the observations; do not "
+        "turn a continuing action at a six-second boundary into a new step.\n\n"
+        f"OBSERVATIONS={evidence}"
+    )
+
+
+def _parse_segment_summary(raw: str) -> dict[str, object]:
+    """Validate the deliberately small summary response instead of trusting text."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.strip().removesuffix("```").strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PermanentBackendError("caption segment summary was not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise PermanentBackendError("caption segment summary must be a JSON object")
+    summary = value.get("summary")
+    steps = value.get("steps")
+    if not isinstance(summary, str) or not summary.strip() or len(summary.strip()) > 1_200:
+        raise PermanentBackendError("caption segment summary has no usable summary text")
+    if not isinstance(steps, list) or not steps or len(steps) > 32:
+        raise PermanentBackendError("caption segment summary has no usable ordered steps")
+    normalized_steps = [step.strip() for step in steps if isinstance(step, str) and step.strip()]
+    if len(normalized_steps) != len(steps) or any(len(step) > 300 for step in normalized_steps):
+        raise PermanentBackendError("caption segment summary contains invalid ordered steps")
+    return {"summary": summary.strip(), "steps": normalized_steps}
+
+
+def summarize_caption_windows(
+    captions: list[dict],
+    *,
+    backend: VLMBackend,
+    store: Store,
+    video_id: str,
+    run_id: str,
+) -> tuple[dict, bool]:
+    """Create or reuse one source-bound, text-only summary for a full segment.
+
+    The bool is true only when an API call was made.  The cache key is the
+    deterministic hash of all complete raw captions, so a changed raw caption
+    cannot silently inherit an old summary.
+    """
+    if not captions:
+        raise ValueError("cannot summarize an empty caption segment")
+    observations = _summary_observations(captions)
+    source_sha256 = _summary_source_hash(observations)
+    cached = store.read(
+        video_id=video_id,
+        unit_idx=0,
+        stage=_SEGMENT_SUMMARY_STAGE,
+        model_id=backend.model_id,
+    )
+    if (
+        isinstance(cached, dict)
+        and cached.get("summary_version") == _SEGMENT_SUMMARY_VERSION
+        and cached.get("source_caption_sha256") == source_sha256
+        and isinstance(cached.get("summary"), str)
+        and isinstance(cached.get("steps"), list)
+    ):
+        return cached, False
+
+    response = backend.caption([], _segment_summary_prompt(observations))
+    parsed = _parse_segment_summary(response.text)
+    payload = {
+        "summary_version": _SEGMENT_SUMMARY_VERSION,
+        "source_caption_sha256": source_sha256,
+        "source_window_count": len(captions),
+        "model_id": backend.model_id,
+        "run_id": run_id,
+        "summary": parsed["summary"],
+        "steps": parsed["steps"],
+        "latency_ms": response.latency_ms,
+        "input_tokens": response.input_tokens,
+        "output_tokens": response.output_tokens,
+        "cost_usd": response.cost_usd,
+        "provider": response.provider,
+    }
+    store.write(
+        video_id=video_id,
+        unit_idx=0,
+        stage=_SEGMENT_SUMMARY_STAGE,
+        model_id=backend.model_id,
+        payload=payload,
+    )
+    return payload, True
 
 
 class _RunAborted(Exception):
@@ -256,6 +414,20 @@ def caption_video(
             "boundary precision in downstream segmentation)", video_id,
         )
 
+    # A resume is safe only when it resumes the same prompt contract.  The
+    # primary key intentionally has no prompt column (a retry must overwrite
+    # its old row), so inspect successful saved rows before treating them as
+    # done.  Otherwise a pilot made with an earlier prompt could silently be
+    # mixed into a V5 event timeline.
+    for _index, _model, payload, error in store.iter_stage(
+        video_id=video_id, stage="caption", model_id=backend.model_id
+    ):
+        if error is None and payload.get("prompt_version") != config.CAPTION_PROMPT_VERSION:
+            raise ValueError(
+                f"caption resume for {video_id} mixes prompt versions "
+                f"{payload.get('prompt_version')!r} and {config.CAPTION_PROMPT_VERSION!r}; "
+                "use a fresh --run-dir for the new prompt"
+            )
     done = store.done_set(video_id=video_id, stage="caption", model_id=backend.model_id)
     n_written = 0
 

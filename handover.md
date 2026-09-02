@@ -1,5 +1,68 @@
 # egoannote — session handover
 
+## Branch note: `original-trim-mediapipe-vlm` (2026-08-27)
+
+This branch is for the user's explicitly private original-derived workflow
+only: manually trim selected original frames, then run MediaPipe and VLM on
+the retained segments. New code lives in `src/egoannote/original_curated.py`
+and is exposed through `curate-original` and `annotate-curated-original`.
+It does not invoke, modify, approve, or publish an EgoBlur/YuNet result. All
+inputs, child videos, frames, models, annotations, and summaries must remain
+under private paths. See `docs/PRIVATE_ORIGINAL_CURATED_PIPELINE.md`.
+
+## Latest completed batch — 2026-09-02
+
+The private, manually face-reviewed batch is complete.  Stage 2, EgoBlur,
+YuNet, WiLoR, SAM2, and DepthV3 were not used for this batch and remain out of
+scope.
+
+### Inputs and provenance
+
+- 13 face-free clips were normalized to 29.97 fps under
+  `runs/face-free-c40-2026-09-01/private/face_free_children/<VIDEO_ID>/`.
+  Each child has a private timeline JSON and is the authoritative local video
+  for later rendering or inspection.
+- The original `batch_upload/` sources were verified on Drive and then moved
+  out of the workspace/Trash to free disk.  This is intentional.  The original
+  path recorded in a timeline can therefore be absent locally.
+- Curation/annotation still verify source bindings by default.  Rendering is
+  the narrow exception: `load_manifest(..., verify_source=False)` verifies the
+  child hash and all stored private artifacts, but allows an archived source.
+  Do not use that flag for new curation or annotation runs.
+
+### Chosen MediaPipe policy
+
+MediaPipe Hand Landmarker annotations run at full 30 fps.
+
+- **0.4 confidence:** `GX010059`, `GX010063` (fast-paced activities).
+- **0.55 confidence:** `GX010072`, `GX010073`, `GX010075`, `GX010076`,
+  `GX010077`, `GX010078`, `GX010079`, `GX010081`, `GX010082`, `GX010084`,
+  `GX010087` (single focused household tasks; higher threshold reduced noisy
+  flicker while accepting gaps when hands are not reliably visible).
+
+The rejected 0.5 run, 0.4 household review overlays, and 0.55 temporary
+comparison overlays were removed.  The retained 0.4 `GX010059/GX010063`
+reviews remain in
+`runs/face-free-c40-2026-09-01/private/hand-review-videos/`.
+
+### Captions and final review videos
+
+- Qwen 3.8 Max (`qwen/qwen3.8-max`) completed dense captions and event
+  summaries for all 13 clips.  It uses required minimal reasoning with hidden
+  reasoning trace.  One 429 was retried successfully; no caption job failed.
+- All 13 caption-plus-hand burn-ins passed a full FFmpeg decode check:
+  - `GX010059`, `GX010063`:
+    `runs/face-free-c40-2026-09-01/private/annotated-videos/`
+  - remaining eleven:
+    `runs/face-free-c55-household-2026-09-02/private/annotated-videos/`
+- These MP4s are private review artifacts, never Hugging Face upload inputs.
+  Preserve the normalized child, stored hands, captions/event data, and final
+  chosen MP4s until the user has backed them up or approved deletion.
+
+At handover there was roughly 9.5 GB free after final rendering; re-check
+disk before creating more previews.  The immediate next action is user review
+of the final annotated videos, not rerunning MediaPipe or paid VLM calls.
+
 ## Current implementation checkpoint (2026-08-26)
 
 `master` is at `4c91e8f`; the finalized 30-fps hand-prior policy is committed.

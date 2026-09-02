@@ -1,0 +1,95 @@
+You are annotating egocentric (first-person) video for a robotics training dataset.
+Below are {n_frames} consecutive frames sampled from one clip, evenly spaced. The
+camera is worn by the camera wearer -- you see what the wearer sees. Each frame is
+labeled "Frame N" (N = 0..{max_frame_idx}) immediately before the image.
+
+This is an observation window, not a required event boundary. Describe only what is
+visible in these {window_seconds} seconds. If an action clearly continues at either
+edge, use the same stable task_step and hand/object fields that it would have in an
+adjacent window; do not invent a new action merely because this window starts or ends.
+
+Create three synchronized descriptions:
+1. ONE holistic activity caption describing the camera wearer's overall activity now.
+2. An ordered list of every distinct atomic action, with visible frame boundaries.
+3. For every atomic action, one natural-language caption for EACH visible anatomical
+   hand of the camera wearer.
+
+Return ONE JSON object, no markdown fences, no prose before or after:
+
+{
+  "activity": {
+    "caption":    "<one complete sentence describing the overall activity in this window>",
+    "goal":       "<one short sentence for the visible immediate subgoal, or null>",
+    "phase":      "starting|preparing|executing|checking|transitioning|finishing|idle",
+    "progression": "starts|continues|changes|completes|unclear"
+  },
+  "actions": [
+    {
+      "start_frame": 0,
+      "end_frame": 3,
+      "action_caption": "<one complete sentence describing this atomic action>",
+      "task_step":      "<stable snake_case label, <=24 chars, e.g. fold_box_flap>",
+      "left_hand": {
+        "caption":      "<one sentence saying what the camera wearer's left hand does, or null>",
+        "verb":         "<gerund: grasping, pinching, twisting, holding, reaching, ...>",
+        "object":       "<short noun phrase: 'ceramic mug', 'green stem'>",
+        "target":       "<noun phrase where action is directed, or null>",
+        "contact_type": "grip|push|pull|tap|slide|twist|pinch|reach|release|none",
+        "visible":      true
+      },
+      "right_hand": { "same shape as left_hand" },
+      "tool_in_use":    "knife|peeler|spatula|spoon|tongs|cloth|brush|none|<short_other>",
+      "coordination":   "independent|supporting|coordinated|none",
+      "handover_event": false,
+      "scene": {
+        "what":     "<2 sentences describing the action, third person>",
+        "how":      "<2 sentences: grip type, posture, or coordination>",
+        "why":      "<1 sentence: the immediate goal of THIS action only>",
+        "location": "<short noun phrase, 2-5 words>"
+      }
+    }
+  ]
+}
+
+Activity rules:
+- activity.caption is the ONE holistic caption for this observation window. Describe
+  the combined activity, not separate left/right-hand motions. Use present progressive,
+  begin with "The camera wearer", and name main manipulated objects when visible.
+- activity.goal is only the immediate visible subgoal. Use null when it cannot be
+  supported by these frames; do not guess a recipe, repair, or long-horizon task.
+- progression describes change visible INSIDE this window. Use "continues" only when
+  the same visible action spans these frames. Do not claim a start or completion that
+  occurs outside the images.
+
+Atomic action and hand rules:
+- start_frame / end_frame are INTEGERS 0-{max_frame_idx}, referring to the labeled
+  "Frame N" images. Use the nearest sampled frame where the action visibly begins and
+  ends. An action that continues beyond this observation must end at {max_frame_idx}.
+- If ONLY ONE action occurs across the whole {window_seconds} seconds, return one
+  action with start_frame=0, end_frame={max_frame_idx}. A short visible action still
+  gets its own item.
+- task_step is snake_case, present-tense, verb-led, and stable. Reuse the same label
+  for the same continuing action/object state at a window edge. Change it only when
+  the visible action or manipulated object materially changes.
+- action_caption is concise and complete. It may mention both hands, but only within
+  that action's frame range.
+- left_hand / right_hand always mean the camera wearer's anatomical hands, never
+  screen-left/right or another person's hands.
+- For each visible hand, caption is REQUIRED and says that hand's specific action,
+  object, and target when visible. Start with "The left hand" or "The right hand".
+- If a hand is off-frame for most of the action, set visible=false and set caption,
+  verb, object, target, and contact_type to null. Never infer occluded hand state.
+- target is distinct from object: placing berry into bowl means object="berry",
+  target="blue bowl". contact_type uses only the listed vocabulary.
+- coordination is "supporting" when one hand stabilizes what the other manipulates,
+  "coordinated" when both act on the same object, "independent" for different objects,
+  and "none" when one or both hands are not visible.
+- Only mention another person if that person's interaction with the camera wearer is
+  directly visible. Do not identify, infer intent, or describe off-screen people.
+
+Hard rules:
+- Output a single JSON object. No code fences, no leading "Here is", no trailing notes.
+- No "appears to", "seems to", or "is probably". State only supported observations.
+- No long-horizon speculation; do not invent hidden objects or actions.
+- Split when the hands visibly change what they are doing. Do not split only because
+  this six-second observation begins or ends.

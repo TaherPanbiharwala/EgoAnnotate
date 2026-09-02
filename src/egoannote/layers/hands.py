@@ -322,7 +322,12 @@ class HandAssigner:
         return current
 
 
-def _build_detector(models_dir: Path):
+def _build_detector(
+    models_dir: Path,
+    *,
+    detection_confidence: float = config.MP_MIN_HAND_CONFIDENCE,
+    presence_confidence: float = config.MP_MIN_PRESENCE_CONFIDENCE,
+) -> object:
     model_path = _ensure_model(models_dir)
     BaseOptions = mp.tasks.BaseOptions
     HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -333,8 +338,8 @@ def _build_detector(models_dir: Path):
         base_options=BaseOptions(model_asset_path=str(model_path)),
         running_mode=VisionRunningMode.VIDEO,
         num_hands=config.MP_NUM_HANDS,
-        min_hand_detection_confidence=config.MP_MIN_HAND_CONFIDENCE,
-        min_hand_presence_confidence=config.MP_MIN_PRESENCE_CONFIDENCE,
+        min_hand_detection_confidence=detection_confidence,
+        min_hand_presence_confidence=presence_confidence,
         min_tracking_confidence=config.MP_MIN_TRACKING_CONFIDENCE,
     )
     return HandLandmarker.create_from_options(options)
@@ -347,6 +352,7 @@ def run(
     *,
     info: VideoInfo | None = None,
     fps: int = config.MP_FPS,
+    hand_confidence: float = config.MP_MIN_HAND_CONFIDENCE,
 ) -> Iterator[HandFrame]:
     """Yield HandFrame records for every sampled frame of `video`.
 
@@ -358,6 +364,8 @@ def run(
     clock, which is exactly the bug probe.py's docstring says is fixed.
     Passing None re-probes rather than guessing.
     """
+    if not 0.0 < hand_confidence <= 1.0:
+        raise ValueError("hand_confidence must be in (0, 1]")
     if info is None:
         info = probe(video)
 
@@ -379,7 +387,11 @@ def run(
         video_id, source_fps, stride, source_fps / stride,
     )
 
-    detector = _build_detector(models_dir)
+    detector = _build_detector(
+        models_dir,
+        detection_confidence=hand_confidence,
+        presence_confidence=hand_confidence,
+    )
     assigner = HandAssigner()
     try:
         emitted_idx = 0

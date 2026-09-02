@@ -30,6 +30,41 @@ backend = "fake"
 supports_json_schema = true
 max_images = 8
 
+# Private original-curated VLM runs.  Prices were verified against the
+# OpenRouter model page on 2026-08-29; update this entry if the provider
+# changes its published rates.
+[models."qwen3.8-max"]
+backend = "openai-compat"
+model = "qwen/qwen3.8-max"
+max_images = 8
+price_in_per_mtok = 2.0
+price_out_per_mtok = 6.0
+supports_json_schema = true
+image_detail = "high"
+tokens_per_image_fn = "qwen_tile"
+# Qwen3.8 Max requires reasoning. Its default xhigh effort can exhaust a
+# small completion budget before it emits the final caption, so retain only
+# the smallest supported reasoning pass and omit its trace from the response.
+reasoning_effort = "minimal"
+reasoning_exclude = true
+
+# Lower-cost multimodal pilot model.  Unlike MiniMax M2.7 (text-only on
+# OpenRouter), this accepts the sampled JPEG frames used by the captioner.
+# No provider is pinned: this is deliberately for qualitative preview only.
+[models."qwen3.8-flash"]
+backend = "openai-compat"
+model = "qwen/qwen3.8-flash"
+max_images = 8
+price_in_per_mtok = 0.15
+price_out_per_mtok = 0.47
+supports_json_schema = true
+image_detail = "high"
+tokens_per_image_fn = "qwen_tile"
+# OpenRouter reports reasoning as optional but enabled by default for this
+# model. Dense captions need final JSON, so reserve its completion budget for
+# the answer rather than optional reasoning.
+reasoning_enabled = false
+
 # --- example entries: verify current model IDs, capabilities and prices at
 #     https://openrouter.ai/models before using these for a real run ---
 #

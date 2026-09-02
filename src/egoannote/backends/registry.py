@@ -44,6 +44,9 @@ _OPTIONAL_KEYS = {
     "price_in_per_mtok",
     "price_out_per_mtok",
     "provider_order",
+    "reasoning_enabled",
+    "reasoning_effort",
+    "reasoning_exclude",
     # Declared in models.toml but not yet consumed by any code path. Listed
     # here so they don't trip the unknown-key check, and flagged in
     # models.toml so nobody expects them to do anything.
@@ -76,6 +79,24 @@ def _validate_entry(model_id: str, entry: dict, path: Path) -> None:
         raise ValueError(
             f"models.toml entry '{model_id}' ({path}) is missing required "
             f"key(s): {sorted(missing)}"
+        )
+    for key in ("reasoning_enabled", "reasoning_exclude"):
+        if key in entry and not isinstance(entry[key], bool):
+            raise ValueError(
+                f"models.toml entry '{model_id}' has {key}={entry[key]!r}; it must be true or false"
+            )
+    if "reasoning_effort" in entry and entry["reasoning_effort"] not in {
+        "max",
+        "xhigh",
+        "high",
+        "medium",
+        "low",
+        "minimal",
+        "none",
+    }:
+        raise ValueError(
+            f"models.toml entry '{model_id}' has unsupported reasoning_effort="
+            f"{entry['reasoning_effort']!r}"
         )
 
 
@@ -173,6 +194,9 @@ def build_backend(
         price_in_per_mtok=float(entry.get("price_in_per_mtok", 0.0)),
         price_out_per_mtok=float(entry.get("price_out_per_mtok", 0.0)),
         provider_order=entry.get("provider_order"),
+        reasoning_enabled=entry.get("reasoning_enabled"),
+        reasoning_effort=entry.get("reasoning_effort"),
+        reasoning_exclude=entry.get("reasoning_exclude"),
     )
     return OpenAICompatBackend(
         cfg, key, max_spend_usd=max_spend_usd, spend_tracker=spend_tracker

@@ -49,6 +49,12 @@ class ModelConfig:
     price_in_per_mtok: float
     price_out_per_mtok: float
     provider_order: list[str] | None = None
+    # None preserves a provider's default.  Some models mandate reasoning;
+    # use the lowest supported effort and exclude its trace so the response
+    # budget is available for the required JSON final answer.
+    reasoning_enabled: bool | None = None
+    reasoning_effort: str | None = None
+    reasoning_exclude: bool | None = None
 
 
 class OpenAICompatBackend:
@@ -165,6 +171,15 @@ class OpenAICompatBackend:
         }
         if self._cfg.provider_order:
             body["provider"] = {"order": self._cfg.provider_order, "allow_fallbacks": False}
+        reasoning: dict[str, object] = {}
+        if self._cfg.reasoning_enabled is not None:
+            reasoning["enabled"] = self._cfg.reasoning_enabled
+        if self._cfg.reasoning_effort is not None:
+            reasoning["effort"] = self._cfg.reasoning_effort
+        if self._cfg.reasoning_exclude is not None:
+            reasoning["exclude"] = self._cfg.reasoning_exclude
+        if reasoning:
+            body["reasoning"] = reasoning
 
         last_exc: Exception | None = None
         for attempt in range(self._retries + 1):
@@ -202,7 +217,26 @@ class OpenAICompatBackend:
                     )
                 self._spend.add(cost_usd or 0.0)
 
-                text = data["choices"][0]["message"]["content"]
+                choices = data.get("choices")
+                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                    raise PermanentBackendError(
+                        f"{self._cfg.model_id}: response has no usable choices entry"
+                    )
+                choice = choices[0]
+                message = choice.get("message")
+                if not isinstance(message, dict):
+                    raise PermanentBackendError(
+                        f"{self._cfg.model_id}: response choice has no usable message"
+                    )
+                text = message.get("content")
+                if not isinstance(text, str) or not text.strip():
+                    reasoning = message.get("reasoning")
+                    raise PermanentBackendError(
+                        f"{self._cfg.model_id}: provider returned no final text content "
+                        f"(finish_reason={choice.get('finish_reason')!r}, "
+                        f"reasoning_present={bool(reasoning)}). Refusing to parse reasoning "
+                        "as a caption; lower or disable reasoning for this model."
+                    )
                 return VLMResponse(
                     text=text,
                     latency_ms=latency_ms,

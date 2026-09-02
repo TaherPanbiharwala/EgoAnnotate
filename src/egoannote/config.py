@@ -89,13 +89,21 @@ MAX_PLAUSIBLE_DELTA_PER_FRAME: Final[float] = 0.125
 # Caption generation knobs
 # ---------------------------------------------------------------------------
 
-CAPTION_PROMPT_VERSION: Final[str] = "v4"
+# V5 keeps V4's validated dense JSON contract but makes the window boundary
+# explicitly an *inference context*, not an event boundary.  The private
+# curated-original workflow compiles compatible adjacent actions into a
+# separate event timeline after all windows for a retained segment finish.
+CAPTION_PROMPT_VERSION: Final[str] = "v5"
 CAPTION_PROMPT_FILE: Final[Path] = PROMPTS_DIR / f"caption_{CAPTION_PROMPT_VERSION}.txt"
 
 # S1's ordered-list-of-actions schema is longer than v1's single v2.5 object;
 # v1 sized 1024 for one object and hit mid-string truncation at 480 before
 # that. Raised here; re-verify empirically in Phase 0.5/4 (Eng review A1-6).
-VLM_MAX_NEW_TOKENS: Final[int] = 2048
+# Reasoning-capable models may share this completion allowance between their
+# internal reasoning and the dense JSON answer.  4096 leaves room for a
+# mandatory minimal-reasoning pass plus the full window activity/actions/hands
+# schema. Actual usage, not this ceiling, is what OpenRouter bills.
+VLM_MAX_NEW_TOKENS: Final[int] = 4096
 VLM_TEMPERATURE: Final[float] = 0.2
 
 # Provisional pending the Phase 4 3-arm ablation (768 / 1280 / 1920). v1's

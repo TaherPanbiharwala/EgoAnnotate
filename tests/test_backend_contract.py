@@ -131,6 +131,65 @@ def test_max_tokens_and_temperature_are_actually_sent() -> None:
     b.close()
 
 
+def test_reasoning_can_be_minimized_and_excluded_per_model() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_ok_body())
+
+    b = OpenAICompatBackend(
+        _cfg(reasoning_effort="minimal", reasoning_exclude=True), "test-key"
+    )
+    b._client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url=_cfg().base_url
+    )
+    b.caption([b"x"], "p")
+    assert captured["body"]["reasoning"] == {"effort": "minimal", "exclude": True}
+    b.close()
+
+
+def test_reasoning_can_be_disabled_for_an_optional_reasoning_model() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_ok_body())
+
+    b = OpenAICompatBackend(_cfg(reasoning_enabled=False), "test-key")
+    b._client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url=_cfg().base_url
+    )
+    b.caption([b"x"], "p")
+    assert captured["body"]["reasoning"] == {"enabled": False}
+    b.close()
+
+
+def test_null_final_content_fails_before_parser_receives_reasoning() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": None, "reasoning": "thinking"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+            },
+        )
+
+    b = _backend(handler, retries=2)
+    with pytest.raises(PermanentBackendError, match="no final text content"):
+        b.caption([b"x"], "p")
+    assert calls["n"] == 1
+    b.close()
+
+
 # --------------------------------------------------------------------------
 # BUG: the spend guard multiplied provider-reported tokens by models.toml
 # prices, which ship as 0.0 placeholders. Every call estimated $0.00, the
