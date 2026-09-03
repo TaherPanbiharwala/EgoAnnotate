@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EgoAnnotate — face-free egocentric hand &amp; activity dataset</title>
+<meta name="description" content="EgoAnnotate v1: 13 manually reviewed, face-free egocentric clips with per-frame MediaPipe hand landmarks and dense activity captions. CC BY 4.0.">
+<meta property="og:title" content="EgoAnnotate — ordinary tasks, described by the hand that's doing them">
+<meta property="og:description" content="13 manually reviewed, face-free egocentric clips with synchronized hand landmarks and dense activity captions.">
+<meta property="og:image" content="https://taherpanbiharwala.github.io/EgoAnnotate/assets/thumbs/GX010059.jpg">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,340;0,9..144,480;0,9..144,600;0,9..144,700;1,9..144,420;1,9..144,500&family=DM+Sans:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+
+<style>
+/* ---------------------------------------------------------------- */
+/* Tokens                                                            */
+/* ---------------------------------------------------------------- */
+:root{
+  --paper:#FBF7EF;
+  --paper-raised:#F3ECDC;
+  --ink:#241C12;
+  --ink-soft:#6E6152;
+  --line:rgba(36,28,18,.16);
+  --forest:#1B4332;
+  --forest-ink:#F6F1E4;
+  --forest-bright:#2F6F52;
+  --gold:#E7CE86;
+  --gold-ink:#241C12;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#16130D;
+    --paper-raised:#201A11;
+    --ink:#F3ECDD;
+    --ink-soft:#B2A488;
+    --line:rgba(243,236,221,.16);
+    --forest:#2B5A44;
+    --forest-ink:#EFE7D2;
+    --forest-bright:#79BC98;
+    --gold:#6B5320;
+    --gold-ink:#F6ECC9;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#16130D;
+  --paper-raised:#201A11;
+  --ink:#F3ECDD;
+  --ink-soft:#B2A488;
+  --line:rgba(243,236,221,.16);
+  --forest:#2B5A44;
+  --forest-ink:#EFE7D2;
+  --forest-bright:#79BC98;
+  --gold:#6B5320;
+  --gold-ink:#F6ECC9;
+}
+
+/* ---------------------------------------------------------------- */
+/* Reset + base                                                      */
+/* ---------------------------------------------------------------- */
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--paper);
+  color:var(--ink);
+  font-family:'DM Sans',system-ui,-apple-system,sans-serif;
+  line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+  min-width:0;
+  overflow-x:hidden;
+}
+h1,h2,h3,h4{font-family:'Fraunces',Georgia,serif;text-wrap:balance;margin:0;font-weight:600;letter-spacing:-.01em}
+p{margin:0}
+a{color:inherit;text-decoration:none}
+img{display:block;object-fit:cover;background:var(--paper-raised)}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+.tabular{font-variant-numeric:tabular-nums}
+.eyebrow{
+  font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-soft);display:inline-flex;align-items:center;gap:.6em;
+}
+.wrap{max-width:1180px;margin:0 auto;padding:0 40px}
+:focus-visible{outline:2px solid var(--forest-bright);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.001ms !important;transition-duration:.001ms !important}}
+@media (max-width:640px){.wrap{padding:0 22px}}
+
+/* ---------------------------------------------------------------- */
+/* Shared primitives                                                  */
+/* ---------------------------------------------------------------- */
+.tag{
+  display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:2px;
+}
+.tag-forest{background:var(--forest);color:var(--forest-ink)}
+.tag-gold{background:var(--gold);color:var(--gold-ink)}
+
+.field-list dt{font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft)}
+.field-list dd{margin:2px 0 0;font-size:14px}
+.field-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:16px 22px;margin:0}
+
+.detail-toggle{
+  display:inline-flex;border:1px solid var(--line);border-radius:3px;overflow:hidden;font-size:12px;font-weight:600;
+}
+.detail-toggle button{padding:7px 14px}
+.detail-toggle button.on{background:var(--forest);color:var(--forest-ink)}
+.detail-toggle button[data-mode="ann"].on{background:var(--gold);color:var(--gold-ink)}
+
+footer.site{border-top:1px solid var(--line);padding:34px 0 46px;font-size:12.5px;color:var(--ink-soft)}
+footer.site .f-row{display:flex;flex-wrap:wrap;gap:8px 28px;align-items:baseline;margin-bottom:10px}
+footer.site a{color:var(--forest-bright);font-weight:600}
+footer.site a:hover{text-decoration:underline}
+
+/* ---------------------------------------------------------------- */
+/* Field Notes homepage                                              */
+/* ---------------------------------------------------------------- */
+@keyframes riseIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+.hero-c{padding:88px 0 40px;text-align:left;max-width:760px}
+.hero-c>*{animation:riseIn .62s cubic-bezier(.16,1,.3,1) both}
+.hero-c>*:nth-child(1){animation-delay:0s}
+.hero-c>*:nth-child(2){animation-delay:.05s}
+.hero-c>*:nth-child(3){animation-delay:.12s}
+.hero-c>*:nth-child(4){animation-delay:.18s}
+.hero-c>*:nth-child(5){animation-delay:.24s}
+h1.headline{font-size:clamp(42px,6vw,74px);line-height:1.03;margin-top:14px}
+h1.headline .line2{display:block;font-style:italic;font-weight:420;color:var(--forest-bright);margin-top:6px;font-family:'Fraunces',Georgia,serif}
+.hero-copy{margin-top:20px;font-size:17px;color:var(--ink-soft);max-width:58ch}
+.hero-stats{margin-top:16px;font-size:12.5px;color:var(--ink-soft);letter-spacing:.01em}
+.hero-stats b{color:var(--ink);font-weight:700}
+.hero-link{display:inline-flex;align-items:center;gap:8px;margin-top:24px;font-weight:700;font-size:14px;border-bottom:1px solid var(--ink);padding-bottom:2px}
+.hero-link:hover{color:var(--forest-bright);border-color:var(--forest-bright)}
+
+.filmstrip{display:flex;gap:2px;overflow-x:auto;border-top:1px solid var(--line);border-bottom:1px solid var(--line);scrollbar-width:thin}
+.filmstrip img{height:118px;width:190px;flex:none;filter:grayscale(.15);transition:filter .15s,transform .15s}
+.filmstrip button{flex:none;position:relative;overflow:hidden}
+.filmstrip button:hover img{filter:none;transform:scale(1.03)}
+.filmstrip .fs-tag{position:absolute;left:6px;bottom:6px;font-size:9.5px;font-weight:700;letter-spacing:.05em;color:#fff;background:rgba(20,15,8,.55);padding:2px 5px;border-radius:2px}
+
+section.blk{padding:54px 0;border-top:1px solid var(--line)}
+.blk-head{max-width:64ch;margin-bottom:30px}
+.blk-head .eyebrow{margin-bottom:10px}
+.blk-head h2{font-size:28px}
+
+.notebook{display:flex;flex-direction:column}
+.n-entry{border-bottom:1px solid var(--line)}
+.n-entry:first-child{border-top:1px solid var(--line)}
+.n-summary{display:grid;grid-template-columns:140px 1fr auto;gap:22px;align-items:center;padding:18px 4px;cursor:pointer;list-style:none}
+.n-summary::-webkit-details-marker{display:none}
+.n-summary:hover{background:var(--paper-raised)}
+.n-summary img{width:140px;height:88px;border-radius:3px}
+.n-id-row{display:flex;align-items:baseline;gap:10px;margin-bottom:5px}
+.n-id{font-weight:700;font-size:12px;color:var(--ink-soft)}
+.n-sum{font-family:'Fraunces',Georgia,serif;font-style:italic;font-weight:450;font-size:18px}
+.n-meta{font-size:12px;color:var(--ink-soft)}
+.n-plus{font-size:20px;color:var(--ink-soft);flex:none;transition:transform .15s}
+details[open] .n-plus{transform:rotate(45deg)}
+.n-body{padding:2px 4px 30px 162px}
+.n-cap{font-size:14.5px;line-height:1.65;max-width:62ch;margin-bottom:16px}
+@media (max-width:760px){
+  .n-summary{grid-template-columns:88px 1fr auto}
+  .n-summary img{width:88px;height:56px}
+  .n-body{padding-left:4px}
+}
+
+.method-steps{display:flex;flex-direction:column;gap:22px;max-width:64ch}
+.m-step{display:flex;gap:18px}
+.m-circle{
+  flex:none;width:34px;height:34px;border-radius:50%;border:1px solid var(--forest-bright);
+  display:flex;align-items:center;justify-content:center;font-family:'Fraunces',Georgia,serif;
+  font-size:14px;color:var(--forest-bright);
+}
+.m-txt .m-t{font-weight:700;font-size:14.5px;margin-bottom:3px}
+.m-txt .m-d{font-size:13.5px;color:var(--ink-soft)}
+.method-aside{font-size:12px;color:var(--ink-soft);margin-top:18px;max-width:64ch}
+
+.index-card{
+  background:var(--paper-raised);border:1px solid var(--line);border-radius:2px;
+  padding:26px 28px;max-width:64ch;position:relative;
+}
+.index-card::before{
+  content:"";position:absolute;top:14px;left:0;right:0;height:1px;
+  background:repeating-linear-gradient(90deg,var(--line) 0 6px,transparent 6px 12px);
+}
+.index-card .ic-quote{font-family:'Fraunces',Georgia,serif;font-style:italic;font-size:18px;margin-bottom:8px;margin-top:6px}
+.index-card .ic-note{font-size:13.5px;color:var(--ink-soft)}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="hero-c">
+    <span class="eyebrow">EgoAnnotate · public dataset v1</span>
+    <h1 class="headline">Ordinary tasks,<span class="line2">described by the hand that's doing them</span></h1>
+    <p class="hero-copy">13 manually reviewed, face-free egocentric clips. Every six-second window gets one holistic caption, its atomic actions, and a caption for each hand that's visible — grounded in per-frame MediaPipe landmarks, not guessed after the fact.</p>
+    <p class="hero-stats"><b>13</b> clips · <b class="tabular">16m 51s</b> · <b class="tabular">30,287</b> hand frames · <b class="tabular">248</b> caption events · <b>CC BY 4.0</b></p>
+    <a class="hero-link" href="#c-notebook">Browse the release <span>→</span></a>
+  </header>
+</div>
+
+<div class="filmstrip" id="c-filmstrip"></div>
+
+<div class="wrap">
+  <section class="blk" id="c-notebook">
+    <div class="blk-head">
+      <span class="eyebrow">The release</span>
+      <h2>Thirteen clips, one entry each</h2>
+    </div>
+    <div class="notebook" id="c-notebook-list"></div>
+  </section>
+
+  <section class="blk" id="c-method">
+    <div class="blk-head">
+      <span class="eyebrow">Reproducible method</span>
+      <h2>From source recording to published clip</h2>
+    </div>
+    <div class="method-steps" id="c-method-steps"></div>
+    <p class="method-aside">Caption structure follows the shape of Ego4D, EPIC-KITCHENS-100, LaViLa and Action Scene Graphs: one holistic narrative per window, atomic actions inside it, and a state for each hand.</p>
+  </section>
+
+  <section class="blk" id="c-notes">
+    <div class="blk-head">
+      <span class="eyebrow">Field notes</span>
+      <h2>A page not written yet</h2>
+    </div>
+    <div class="index-card">
+      <p class="ic-quote">"The post-mortem — why the startup got shelved, and what stayed after."</p>
+      <p class="ic-note">Reserved for later. This section will hold that write-up once it exists — nothing published here yet.</p>
+    </div>
+  </section>
+
+  <footer class="site" id="c-footer"></footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ---------------------------------------------------------------
+     Real per-clip data — sourced from public-release/egoannote-v1
+     manifests/<id>.json and annotations/<id>/captions.json
+  ----------------------------------------------------------------- */
+  const CLIPS = [
+    {id:"GX010059", dur:285.9, hands:8567, events:62, cleanMB:510, annMB:639,
+     caption:"The camera wearer repeatedly plucks small green leaves from bundles of rooted herb stems, collecting the stripped leaves in a blue bowl and a metal pot while discarding bare stems.",
+     example:{lh:"The left hand grasps the green stem and holds it steady in the air while the leaves are stripped from it.", rh:"The right hand pinches and strips the leaves off the held stem, then moves over the blue bowl to release the plucked leaves into it."}},
+    {id:"GX010063", dur:183.6, hands:5503, events:59, cleanMB:372, annMB:436,
+     caption:"Transfers small green plastic stick pieces between stacked blue trays."},
+    {id:"GX010072", dur:55.7, hands:1669, events:18, cleanMB:57, annMB:65,
+     caption:"Slices, peels and trims a red onion and a cucumber with a red-handled knife."},
+    {id:"GX010073", dur:131.1, hands:3928, events:23, cleanMB:133, annMB:149,
+     caption:"Cuts, peels and slices a cucumber into rounds."},
+    {id:"GX010075", dur:72.6, hands:2176, events:13, cleanMB:75, annMB:85,
+     caption:"Slices a red tomato with a red-handled knife and arranges the slices on a plate."},
+    {id:"GX010076", dur:16.6, hands:497, events:3, cleanMB:19, annMB:21,
+     caption:"Slices a watermelon wedge on a metal plate."},
+    {id:"GX010077", dur:81.4, hands:2440, events:16, cleanMB:93, annMB:104,
+     caption:"Cuts a watermelon into bite-sized cubes."},
+    {id:"GX010078", dur:70.9, hands:2125, events:18, cleanMB:71, annMB:82,
+     caption:"Slices, peels and dices melon into small cubes."},
+    {id:"GX010079", dur:14.8, hands:444, events:6, cleanMB:18, annMB:22,
+     caption:"Folds a white t-shirt on a white table."},
+    {id:"GX010081", dur:16.4, hands:493, events:7, cleanMB:21, annMB:25,
+     caption:"Folds two pairs of jeans, grey then light-blue."},
+    {id:"GX010082", dur:47.7, hands:1429, events:12, cleanMB:48, annMB:57,
+     caption:"Pours liquid from a lidded container into copper cups."},
+    {id:"GX010084", dur:14.8, hands:443, events:6, cleanMB:31, annMB:35,
+     caption:"Pours liquid from a pitcher into stacked glasses at a coffee table."},
+    {id:"GX010087", dur:19.1, hands:573, events:5, cleanMB:22, annMB:27,
+     caption:"Transfers yellow food items from a tray into a plastic container."},
+  ];
+
+  const METHOD = [
+    {t:"Manual face-free review", d:"Every source recording is watched. Any frame containing a recognizable face is cut before annotation begins — not detected and blurred, removed."},
+    {t:"Normalization", d:"Retained footage is normalized to 29.97 fps (30000/1001), with audio and container metadata stripped."},
+    {t:"Hand tracking", d:"MediaPipe Hand Landmarker runs per frame on the clean video — 21 landmarks per visible hand, left and right tracked separately."},
+    {t:"Dense captioning", d:"Qwen 3.8 Max captions each six-second window at three levels: one holistic activity caption, atomic hand-actions with timestamps, and a caption plus state for every visible hand."},
+    {t:"Segment accounting", d:"Every manifest declares its annotation segments and discontinuities explicitly. A privacy cut restarts tracking state — v1's 13 clips each hold one segment and zero discontinuities."},
+  ];
+
+  function fmtDur(sec){
+    const m = Math.floor(sec/60), s = Math.round(sec%60);
+    return m + ":" + String(s).padStart(2,"0");
+  }
+  function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;")}
+  function field(k,v){ return '<div><dt>'+k+'</dt><dd class="tabular">'+v+'</dd></div>'; }
+  function modeBodyHTML(c, mode){
+    if (mode === "clean"){
+      return '<p class="n-cap" style="color:var(--ink-soft)">Face-redacted source video. No captions or landmarks burned in — <span class="tag tag-forest" style="margin-left:2px">'+Math.round(c.cleanMB)+' MB</span></p>';
+    }
+    return '<p class="n-cap">"'+esc(c.caption)+'"'
+      + (c.example ? '<br><br><em style="color:var(--ink-soft);font-style:normal;font-size:13px">Left hand — '+esc(c.example.lh)+'</em><br><em style="color:var(--ink-soft);font-style:normal;font-size:13px">Right hand — '+esc(c.example.rh)+'</em>' : '')
+      + '</p><span class="tag tag-gold">'+Math.round(c.annMB)+' MB · hands + captions burned in</span>';
+  }
+
+  /* ---------------- filmstrip ---------------- */
+  const filmstrip = document.getElementById("c-filmstrip");
+  filmstrip.innerHTML = CLIPS.map(function(c){
+    return '<button type="button" data-jump="'+c.id+'"><img src="assets/thumbs/'+c.id+'.jpg" loading="lazy" alt="First-person view, '+esc(c.caption)+'"><span class="fs-tag">'+c.id.replace("GX0100","")+'</span></button>';
+  }).join("");
+  filmstrip.addEventListener("click", function(e){
+    const btn = e.target.closest("[data-jump]");
+    if (!btn) return;
+    const el = document.getElementById("n-"+btn.getAttribute("data-jump"));
+    if (el){ el.open = true; el.scrollIntoView({behavior:"smooth", block:"center"}); }
+  });
+
+  /* ---------------- notebook ---------------- */
+  const cList = document.getElementById("c-notebook-list");
+  cList.innerHTML = CLIPS.map(function(c,i){
+    return '<details class="n-entry" id="n-'+c.id+'"'+(i===0?' open':'')+'>'
+      + '<summary class="n-summary">'
+      +   '<img src="assets/thumbs/'+c.id+'.jpg" loading="lazy" alt="First-person view, '+esc(c.caption)+'">'
+      +   '<div><div class="n-id-row"><span class="n-id tabular">'+c.id+'</span><span class="n-meta tabular">'+fmtDur(c.dur)+'</span></div>'
+      +   '<div class="n-sum">'+esc(c.caption)+'</div></div>'
+      +   '<span class="n-plus">+</span>'
+      + '</summary>'
+      + '<div class="n-body">'
+      +   '<div class="detail-toggle" data-toggle="'+c.id+'" style="margin-bottom:14px"><button type="button" class="on" data-mode="clean">Clean</button><button type="button" data-mode="ann">Annotated</button></div>'
+      +   '<div data-mode-body="'+c.id+'">'+modeBodyHTML(c,"clean")+'</div>'
+      +   '<dl class="field-list" style="margin-top:16px;max-width:56ch">'
+      +     field("Hand frames", c.hands.toLocaleString())
+      +     field("Caption events", c.events)
+      +     field("Segments", "1 · 0 discontinuities")
+      +     field("License", "CC BY 4.0")
+      +   '</dl>'
+      +   '<a href="https://huggingface.co/datasets/TaherPanbiharwala/EgoAnnotate" target="_blank" rel="noopener" style="display:inline-block;margin-top:14px;font-size:12.5px;font-weight:700;color:var(--forest-bright)">Get this clip on Hugging Face ↗</a>'
+      + '</div></details>';
+  }).join("");
+  cList.addEventListener("click", function(e){
+    const modeBtn = e.target.closest("[data-mode]");
+    if (!modeBtn) return;
+    e.preventDefault();
+    const wrap = modeBtn.closest("[data-toggle]");
+    const id = wrap.getAttribute("data-toggle");
+    wrap.querySelectorAll("button").forEach(function(b){ b.classList.toggle("on", b===modeBtn); });
+    const c = CLIPS.find(function(x){ return x.id===id; });
+    document.querySelector('#n-'+id+' [data-mode-body="'+id+'"]').innerHTML = modeBodyHTML(c, modeBtn.getAttribute("data-mode"));
+  });
+
+  /* ---------------- method steps ---------------- */
+  document.getElementById("c-method-steps").innerHTML = METHOD.map(function(m,i){
+    return '<div class="m-step"><div class="m-circle tabular">'+(i+1)+'</div><div class="m-txt"><div class="m-t">'+m.t+'</div><div class="m-d">'+m.d+'</div></div></div>';
+  }).join("");
+
+  /* ---------------- footer ---------------- */
+  document.getElementById("c-footer").innerHTML =
+      '<div class="f-row">'
+    + '<span>Dataset: EgoAnnotate v1 · CC BY 4.0</span>'
+    + '<span>Pipeline code: MIT</span>'
+    + '<a href="https://huggingface.co/datasets/TaherPanbiharwala/EgoAnnotate" target="_blank" rel="noopener">huggingface.co/datasets/TaherPanbiharwala/EgoAnnotate ↗</a>'
+    + '</div>'
+    + '<div>Release verified against published Hub metadata — 42/42 LFS objects and 40/40 blob hashes matched at upload.</div>';
+})();
+</script>
+</body>
+</html>
