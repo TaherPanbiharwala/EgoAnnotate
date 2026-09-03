@@ -26,6 +26,7 @@ from . import config, curated_caption_events
 from . import hand_prior as hand_prior_layer
 from . import original_curated as original_curated_layer
 from . import pose_prior as pose_prior_layer
+from . import public_release as public_release_layer
 from .archive import archive_files
 from .backends.openai_compat import SpendTracker
 from .backends.registry import build_backend
@@ -1219,6 +1220,36 @@ def _build_parser() -> argparse.ArgumentParser:
     render_caption_segment.add_argument("--segment-id", type=int, required=True)
     render_caption_segment.add_argument("--output-video", type=Path, required=True)
 
+    public_release = sub.add_parser(
+        "prepare-public-release",
+        help="build an owner-approved public dataset folder from curated face-free artifacts",
+    )
+    public_release.add_argument(
+        "--children-dir",
+        type=Path,
+        required=True,
+        help="private face-free child directory containing one <video-id> directory per clip",
+    )
+    public_release.add_argument(
+        "--annotation-run-dir",
+        type=Path,
+        action="append",
+        required=True,
+        help="ordered private run directory; first hash-bound complete annotation set wins",
+    )
+    public_release.add_argument(
+        "--annotated-video-dir",
+        type=Path,
+        action="append",
+        required=True,
+        help="ordered directory containing final hand-and-caption overlay MP4s",
+    )
+    public_release.add_argument("--output-dir", type=Path, required=True)
+    public_release.add_argument("--video-id", action="append", required=True)
+    public_release.add_argument("--model", required=True)
+    public_release.add_argument("--approved-by", required=True)
+    public_release.add_argument("--release-version", default="v1.0")
+
     archive = sub.add_parser("archive-drive", help="copy, verify, receipt, optionally delete")
     archive.add_argument("--run-dir", type=Path, required=True)
     archive.add_argument("--drive-root", required=True)
@@ -1433,6 +1464,23 @@ def main(argv: list[str] | None = None) -> int:
             output_video=args.output_video,
         )
         print(f"complete: {preview['video_id']} segment pilot -> {args.output_video}")
+        return 0
+
+    if args.command == "prepare-public-release":
+        release = public_release_layer.build_public_release(
+            children_dir=args.children_dir,
+            annotation_run_dirs=args.annotation_run_dir,
+            annotated_video_dirs=args.annotated_video_dir,
+            output_dir=args.output_dir,
+            video_ids=[_validate_video_id(video_id) for video_id in args.video_id],
+            model_id=args.model,
+            approved_by=args.approved_by,
+            release_version=args.release_version,
+        )
+        print(
+            f"complete: {len(release['video_ids'])} public release video(s) -> "
+            f"{release['output_dir']}"
+        )
         return 0
 
     if args.command == "annotate":

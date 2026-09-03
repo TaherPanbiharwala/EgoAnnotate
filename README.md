@@ -55,6 +55,15 @@ Hugging Face upload, and Drive archive commands, is documented in
 [`docs/MEDIAPIPE_VLM_PIPELINE.md`](docs/MEDIAPIPE_VLM_PIPELINE.md). The Python
 layer APIs below remain available for custom experiments.
 
+### Release the approved face-free batch
+
+The approved public release is intentionally built from a fresh, allowlisted
+folder rather than uploading a run directory. It contains the clean videos,
+final hand-and-caption overlay videos, per-frame hand annotations in JSON and
+Parquet, caption/event JSON, and public curation manifests. See
+[`docs/PUBLIC_FACE_FREE_RELEASE.md`](docs/PUBLIC_FACE_FREE_RELEASE.md) for the
+exact build, verification, and Hugging Face upload commands.
+
 ### Hand tracking (local CPU, free — no API key needed)
 
 ```python
@@ -174,6 +183,6 @@ uv run --with ruff ruff check src scripts jobs tests
 
 ## License
 
-Code: MIT (see `LICENSE`). The dataset uses Hugging Face's `other` license
-metadata. Private uploads receive conservative prerelease terms; a public
-release is blocked until the owner supplies an approved license file and name.
+Code: MIT (see `LICENSE`). The approved face-free v1 dataset release uses
+CC BY 4.0. Other original-derived workflows and operator diagnostics remain
+private by default and are not part of that public release.

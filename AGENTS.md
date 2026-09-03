@@ -12,6 +12,28 @@ If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
 reading the source alone, and re-learning them costs real GPU money.
 
+## Current public release and website — 2026-09-03
+
+The explicitly approved **EgoAnnotate v1** release is public at
+`https://huggingface.co/datasets/TaherPanbiharwala/EgoAnnotate`.
+It contains 13 manually reviewed face-free clips, clean and hand/caption
+overlay MP4s, hand JSON/Parquet, captions, and public manifests. The public
+files and their Hub hashes were verified after upload.
+
+The public package is the allowlisted release folder only. Do not upload
+SQLite databases, source timelines, extracted caption frames, local paths,
+private review artifacts, private-only labels, or any other files from
+`runs/**/private/`. The public manifest documents curation using output
+segments and discontinuities; it does not expose private source evidence.
+
+The next product task is a separate public website. The chosen direction is
+**Dataset Atlas**: a research-lab, video-first homepage with a grid of the 13
+clips, video/caption/hand-overlay preview controls, per-clip public metadata,
+a curation-and-annotations explanation, Hugging Face download links, and an
+intentionally empty blog area. Keep website work separate from the private
+pipeline and do not rebuild, modify, or delete the published dataset as part
+of website work. See `decisions.md` for the decision record.
+
 ## Latest operational checkpoint — 2026-09-02
 
 The current branch is **`original-trim-mediapipe-vlm`**.  It is a private,
@@ -19,7 +41,9 @@ original-derived MediaPipe/VLM workflow and must remain independent from
 EgoBlur, YuNet, Stage 2, WiLoR, SAM2, and DepthV3.  Those stages are paused.
 
 The manually reviewed face-free batch has completed end-to-end for 13 clips.
-All artifacts below are private and must not be uploaded to Hugging Face.
+The local pipeline artifacts described below remain private and must not be
+uploaded to Hugging Face. The separately allowlisted public release is the
+verified EgoAnnotate v1 package described in the current section above.
 
 - The source `batch_upload/` folder was deliberately archived off-device
   after the user verified a Drive copy.  Do not expect the original source

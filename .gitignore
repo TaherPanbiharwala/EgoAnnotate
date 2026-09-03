@@ -17,6 +17,7 @@ private/
 *.db
 *.db-wal
 *.db-shm
+public-release/
 
 # secrets
 .env
