@@ -5,9 +5,8 @@
 
 Runs the real pipeline (probe -> frame extraction -> MediaPipe hands ->
 VLM captioning) against a bundled synthetic clip, using the deterministic
-FakeBackend in place of a real API call. Reports what ran and what's still
-pending (segmentation and preview rendering — see the module docstrings in
-pipeline/src/egoannote/layers/segment.py and pack/preview.py for why).
+FakeBackend in place of a real API call. Reports what ran and what this demo
+doesn't exercise (segmentation, curation/rendering — see the printed output).
 
 This is intentionally honest about scope: it is a plumbing smoke test, not
 proof the annotation pipeline produces good captions or correct segments —
@@ -100,9 +99,11 @@ def main() -> int:
     print(f"  wrote {n} window(s) to {_display(run_dir / 'annotations.db')}")
 
     print()
-    print("== NOT yet run (see task list / plan for status) ==")
-    print("  - segmentation (layers/segment.py) — pending real footage + Phase 0.5 gate")
-    print("  - preview rendering (pack/preview.py) — not yet implemented")
+    print("== NOT run by this demo ==")
+    print("  - segmentation — deliberately unimplemented; needs real hand-tracking/")
+    print("    caption measurements to calibrate its thresholds against")
+    print("  - curation, rendering, and archiving — see `egoannote-run --help` for the")
+    print("    curate-original / annotate-curated-original / render-curated-* commands")
     print()
     print("Demo complete. Real annotation quality cannot be judged from this run —")
     print("it only proves the plumbing runs end to end.")

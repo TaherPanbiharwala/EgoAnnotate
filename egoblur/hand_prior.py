@@ -23,8 +23,8 @@ from typing import Any
 import cv2
 import mediapipe as mp
 
-from .probe import VideoInfo, probe
 from .pose_prior import require_private_path
+from .probe import VideoInfo, probe
 
 SCHEMA_VERSION = 1
 ARTIFACT_TYPE = "pre_redaction_hand_prior"

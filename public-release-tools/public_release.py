@@ -19,9 +19,8 @@ from typing import Any
 import cv2
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from . import curated_caption_events, original_curated
-from .media.probe import VideoInfo, probe
+from egoannote import curated_caption_events, original_curated
+from egoannote.media.probe import VideoInfo, probe
 
 PUBLIC_RELEASE_SCHEMA_VERSION = 1
 PUBLIC_PRIVACY_LABEL = "public_release"

@@ -1,5 +1,12 @@
 # MediaPipe + dense VLM caption pipeline
 
+> **Parked.** This document describes the historical EgoBlur-redacted-video
+> workflow — superseded by the active curate-original / annotate-curated-original
+> pipeline (see [`PRIVATE_ORIGINAL_CURATED_PIPELINE.md`](PRIVATE_ORIGINAL_CURATED_PIPELINE.md))
+> but kept accurate as a reference. Its commands now live in `egoblur/cli.py`
+> (pre/post-redaction tooling) and `public-release-tools/cli.py`
+> (annotate/publish-hf/approve-redaction), not the main `egoannote-run`.
+
 ## Scope
 
 This pipeline starts from `master`, after EgoBlur. Stage 2 segmentation is
@@ -77,7 +84,7 @@ blur on other people is not down-ranked merely because their pose was found.
 Run it only against the original and keep both model and artifact private:
 
 ```bash
-uv run egoannote-run pose-prior \
+uv run egoblur/cli.py pose-prior \
   --original-video /private/GX010057.MP4 \
   --video-id GX010057 \
   --output private/pose-prior/GX010057.pose_prior.json \
@@ -148,7 +155,7 @@ detection. For a batch, `--hand-suppression-report` must be a private
 directory so no clip loses its evidence.
 
 ```bash
-uv run egoannote-run hand-prior \
+uv run egoblur/cli.py hand-prior \
   --original-video /workspace/in/GX010057.MP4 \
   --video-id GX010057 \
   --num-hands 2 \
@@ -181,7 +188,7 @@ Download the matching redacted video, EgoBlur manifest, and private
 `checkpoints/` directory. Obtain a YuNet ONNX model separately, then run:
 
 ```bash
-uv run egoannote-run verify-yunet \
+uv run egoblur/cli.py verify-yunet \
   --redacted-video /private/GX010057.blurred.mp4 \
   --blur-manifest /private/GX010057.manifest.json \
   --checkpoint-dir /private/checkpoints \
@@ -217,11 +224,11 @@ Create a review template, change each value to `confirmed_face`,
 `false_positive`, or `uncertain`, then produce only confirmed remediation boxes:
 
 ```bash
-uv run egoannote-run init-yunet-decisions \
+uv run egoblur/cli.py init-yunet-decisions \
   --report private/GX010057.yunet_review.json \
   --output private/GX010057.yunet_decisions.json
 
-uv run egoannote-run decisions-to-forced-boxes \
+uv run egoblur/cli.py decisions-to-forced-boxes \
   --report private/GX010057.yunet_review.json \
   --decisions private/GX010057.yunet_decisions.json \
   --output private/GX010057.forced_boxes.json
@@ -242,7 +249,7 @@ EgoBlur manifest, its private hand-suppression report, and its private YuNet
 report locally, then record the named decision once:
 
 ```bash
-uv run egoannote-run approve-redaction \
+uv run public-release-tools/cli.py approve-redaction \
   --run-dir runs/gx010057-final \
   --video-id GX010057 \
   --redacted-video /private-input/GX010057.blurred.mp4 \
@@ -276,7 +283,7 @@ Use five windows spread across the clip. The current 271-second clip has 46
 windows, so the proposed sample is `0,11,23,34,45`.
 
 ```bash
-uv run egoannote-run annotate \
+uv run public-release-tools/cli.py annotate \
   --run-dir runs/mediapipe-vlm-pilot \
   --redacted-video GX010057.blurred.mp4 \
   --blur-manifest GX010057.manifest.json \
@@ -309,7 +316,7 @@ windows and captions only the remaining 41. MediaPipe also skips its existing
 Parquet output.
 
 ```bash
-uv run egoannote-run annotate \
+uv run public-release-tools/cli.py annotate \
   --run-dir runs/mediapipe-vlm-pilot \
   --redacted-video GX010057.blurred.mp4 \
   --blur-manifest GX010057.manifest.json \
@@ -335,7 +342,7 @@ For multiple clips, create JSONL with one object per line:
 Then replace the single-video inputs with:
 
 ```bash
-uv run egoannote-run annotate \
+uv run public-release-tools/cli.py annotate \
   --run-dir runs/batch-001 \
   --batch-manifest batch.jsonl \
   --model MODEL_A \
@@ -356,7 +363,7 @@ resumably, then streams each redacted video without making a second local copy.
 It defaults to a private dataset.
 
 ```bash
-uv run egoannote-run publish-hf \
+uv run public-release-tools/cli.py publish-hf \
   --run-dir runs/batch-001 \
   --repo-id OWNER/DATASET
 ```
@@ -371,7 +378,7 @@ terms. Public release requires terms approved by the rights holder; pass them
 explicitly so the bundled `LICENSE` and card metadata are updated together:
 
 ```bash
-uv run egoannote-run publish-hf \
+uv run public-release-tools/cli.py publish-hf \
   --run-dir runs/batch-001 \
   --repo-id OWNER/DATASET \
   --public \

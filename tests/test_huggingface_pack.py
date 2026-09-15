@@ -5,15 +5,14 @@ from pathlib import Path
 
 import huggingface_hub
 import pyarrow.parquet as pq
-
-from egoannote.pack.huggingface import (
+from egoannote.schema import WindowCaption
+from egoannote.store import Store
+from pack.huggingface import (
     build_video_bundle,
     export_captions,
     install_public_license,
     upload_bundle,
 )
-from egoannote.schema import WindowCaption
-from egoannote.store import Store
 
 
 def _write_dense_window(store: Store) -> None:

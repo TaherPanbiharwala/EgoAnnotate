@@ -1,8 +1,11 @@
 # Annotation pipeline
 
-This directory contains the installable `egoannote` package for local
-annotation, curation, validation, and public-release export. It deliberately
-does not depend on the GPU-only EgoBlur workflow.
+This directory contains the installable `egoannote` package: the active
+pipeline (manual frame curation, then MediaPipe hands and dense VLM
+captioning on the retained segments) plus its shared media/backend/storage
+infrastructure. It deliberately does not depend on the GPU-only EgoBlur
+workflow (`egoblur/`) or the historical Hugging Face publishing mechanism
+(`public-release-tools/`), both parked at the repo root.
 
 ## Run it
 

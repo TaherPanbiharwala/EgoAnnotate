@@ -67,6 +67,12 @@ ignore = [
 # probe.py: `(s.split("/") + ["1"])[:2]` reads more clearly than unpacking
 # for "split, and default the denominator if absent".
 "pipeline/src/egoannote/media/probe.py" = ["RUF005"]
+# egoblur/probe.py is a vendored copy of the above, same reason.
+"egoblur/probe.py" = ["RUF005"]
+# egoblur/cli.py and public-release-tools/cli.py are standalone scripts run
+# via `uv run <path>`, same sys.path-before-import reason as demo.py.
+"egoblur/cli.py" = ["E402"]
+"public-release-tools/cli.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

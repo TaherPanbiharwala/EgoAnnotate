@@ -16,9 +16,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from .. import config
-from ..store import Store
+from egoannote import config
+from egoannote.store import Store
 
 _PRIVATE_LICENSE_NAME = "Egoannote private prerelease terms"
 _PRIVATE_LICENSE_TEXT = """EGOANNOTE DATASET — PRIVATE PRERELEASE TERMS

@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import public_release
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from egoannote import original_curated, public_release
+from egoannote import original_curated
 from egoannote.media.probe import VideoInfo
 
 

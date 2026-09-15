@@ -28,7 +28,7 @@ selected where it exists, then the 0.4 fast-motion run supplies `GX010059` and
 `GX010063`.
 
 ```bash
-uv run egoannote-run prepare-public-release \
+uv run public-release-tools/cli.py prepare-public-release \
   --children-dir runs/face-free-c40-2026-09-01/private/face_free_children \
   --annotation-run-dir runs/face-free-c55-household-2026-09-02 \
   --annotation-run-dir runs/face-free-c40-2026-09-01 \

@@ -9,26 +9,30 @@ demo. Runs on one laptop plus a small amount of rented GPU time.
 
 ## Repository layout
 
-The project is intentionally split by runtime boundary:
+The active pipeline is deliberately small: `curate-original` ffmpeg-cuts out
+frames where a face is visible from a manually-authored cut list, then
+`annotate-curated-original` runs MediaPipe hands and dense VLM captioning on
+what's retained. Everything else is parked but kept working, isolated by
+runtime boundary, as public references:
 
-- [`pipeline/`](pipeline/README.md) contains the installable `egoannote`
-  annotation pipeline, its prompts and model registry. Its public command is
-  `egoannote-run`.
-- [`egoblur/`](egoblur/README.md) contains the self-contained GPU privacy
-  redaction job and its RunPod setup/review tools. It has an isolated PEP 723
-  environment and is not a dependency of the annotation pipeline.
+- [`pipeline/`](pipeline/README.md) is the installable `egoannote` package —
+  the active pipeline above, plus its shared media/backend/storage
+  infrastructure. Its command is `egoannote-run`.
+- [`egoblur/`](egoblur/README.md) is the automated GPU face-redaction job
+  (an alternative to manual curation) and its pre/post-redaction review
+  tooling. It has an isolated PEP 723 environment and is not a dependency of
+  `pipeline/`.
+- [`public-release-tools/`](public-release-tools/README.md) is the historical
+  mechanism for turning an EgoBlur-redacted video into a published Hugging
+  Face dataset (MediaPipe + captioning on redacted video, bundle packaging,
+  upload). Not staged as an active public pipeline right now, but kept
+  working since this repo is public.
 
-This separation keeps ordinary local annotation work free of CUDA/GPU
-dependencies while making the privacy-redaction workflow easy to find.
-
-> **Status: early build.** The core pipeline (frame extraction, hand
-> tracking, dense VLM captioning, storage, privacy-safe HF packaging, and
-> verified Drive archiving) is implemented and tested. Segmentation is paused;
-> the review UI and GPU perception layers (objects/depth/pose) remain in progress
-> — see `docs/` and the task list in this repo for current
-> status. This README will grow a results table and a hero clip once real
-> footage has been annotated (currently blocked on Google Drive access — see
-> Known limitations below).
+> **Status: early build.** The active pipeline (frame curation, hand
+> tracking, dense VLM captioning, storage, verified Drive archiving) is
+> implemented and tested. Stage-2 segmentation is deliberately unimplemented
+> — see `docs/` for current status. This README will grow a results table
+> and a hero clip once real footage has been annotated.
 
 ## Setup
 
@@ -64,10 +68,17 @@ doesn't demonstrate.
 
 ## Usage — annotate your own footage
 
-The resumable MediaPipe + dense-caption batch workflow, including the pilot,
-Hugging Face upload, and Drive archive commands, is documented in
-[`docs/MEDIAPIPE_VLM_PIPELINE.md`](docs/MEDIAPIPE_VLM_PIPELINE.md). The Python
-layer APIs below remain available for custom experiments.
+The active workflow — a manual cut list, `curate-original`, then
+`annotate-curated-original` for MediaPipe hands and dense VLM captioning on
+the retained segments — is documented in
+[`docs/PRIVATE_ORIGINAL_CURATED_PIPELINE.md`](docs/PRIVATE_ORIGINAL_CURATED_PIPELINE.md).
+The Python layer APIs below remain available for custom experiments.
+
+The historical EgoBlur-redacted-video annotate/publish workflow (automated
+redaction instead of a manual cut list) is parked but documented as a
+reference in [`docs/MEDIAPIPE_VLM_PIPELINE.md`](docs/MEDIAPIPE_VLM_PIPELINE.md)
+— its commands now live in `egoblur/cli.py` and `public-release-tools/cli.py`,
+not `egoannote-run`.
 
 ### Release the approved face-free batch
 
@@ -76,7 +87,8 @@ folder rather than uploading a run directory. It contains the clean videos,
 final hand-and-caption overlay videos, per-frame hand annotations in JSON and
 Parquet, caption/event JSON, and public curation manifests. See
 [`docs/PUBLIC_FACE_FREE_RELEASE.md`](docs/PUBLIC_FACE_FREE_RELEASE.md) for the
-exact build, verification, and Hugging Face upload commands.
+exact build, verification, and Hugging Face upload commands (now run via
+`public-release-tools/cli.py`).
 
 ### Hand tracking (local CPU, free — no API key needed)
 
@@ -145,7 +157,7 @@ install:
 
 ```bash
 uv run pytest
-uv run --with ruff ruff check pipeline/src pipeline/demo.py egoblur tests
+uv run --with ruff ruff check pipeline/src pipeline/demo.py egoblur public-release-tools tests
 ```
 
 ## What's here right now
@@ -181,10 +193,9 @@ uv run --with ruff ruff check pipeline/src pipeline/demo.py egoblur tests
 
 ## What's not here yet
 
-- The segmentation algorithm (`pipeline/src/egoannote/layers/segment.py`) — the
-  design is finalized but deliberately not implemented until real hand-
-  tracking data exists to calibrate its thresholds against. See that file's
-  docstring for the full design and why it's staged this way.
+- The segmentation algorithm — the design is finalized but deliberately not
+  implemented until real hand-tracking data exists to calibrate its
+  thresholds against.
 - The review UI, GPU perception layers (objects/depth/camera-pose), and the
   published benchmarks.
 

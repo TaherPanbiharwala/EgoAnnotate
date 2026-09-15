@@ -8,6 +8,22 @@ update: **`4c91e8f`**. The 30-fps Hand Landmarker / amber-pink suppression /
 YuNet hand-noise changes are committed. Run `git status` before trusting this
 describes `HEAD` exactly.
 
+> **2026-09-16 restructuring — read this before trusting anything below.**
+> The project's scope narrowed to ONE active pipeline: `curate-original` +
+> `annotate-curated-original` (manual cut list → ffmpeg → MediaPipe hands →
+> dense VLM captioning), documented in
+> `docs/PRIVATE_ORIGINAL_CURATED_PIPELINE.md`. EgoBlur automated redaction
+> (plus its pre/post-redaction review tooling: `pose_prior.py`, `hand_prior.py`,
+> `verify_yunet.py`) and the Hugging Face publishing mechanism described at
+> length below are **parked, not deleted** — kept working as public references
+> in `egoblur/` and the new `public-release-tools/` respectively, each with
+> their own `cli.py`. `egoannote-run` (the main CLI) now covers only the
+> active pipeline. Everything below this banner describes that parked,
+> pre-restructuring state faithfully for its own internals (settings, bug
+> history, RunPod ops) but its file paths and "the pipeline" framing predate
+> the split — see the "Repo layout" section immediately below for the current
+> tree, and the root `README.md` for the current three-way split.
+
 If you're an agent starting a fresh session here, read this whole file
 before touching code — several hard-won lessons below aren't visible from
 reading the source alone, and re-learning them costs real GPU money.
@@ -102,47 +118,78 @@ on the developer's Mac (MediaPipe is CPU/Metal; captioning is an HTTP API
 call). This matters: don't assume the whole pipeline needs to run on a
 rented pod.
 
-## Repo layout
+## Repo layout (current, post-2026-09-16 restructuring)
 
 ```
-egoblur/
-  job.py                    self-contained PEP 723 GPU redaction job.
-  contract.py               shard-metadata contract to vendor by copy.
-  review.py                 HTML gallery for human review.
-  runpod_setup.sh           idempotent RunPod environment setup.
-pipeline/
+pipeline/                    THE ACTIVE PIPELINE. Installed as `egoannote`;
+                             `egoannote-run` is its CLI (8 commands: curate-
+                             original, annotate-curated-original, batch-
+                             face-free-hands, preview/render-curated-*,
+                             archive-drive).
   demo.py                   zero-setup non-GPU pipeline smoke test.
   models.toml               VLM model registry.
   prompts/                  caption prompt versions.
   src/egoannote/
-  layers/hands.py           MediaPipe hand tracking. Built, tested, proven
-                             working — NOT yet run against real blurred
-                             output, only synthetic test data.
-  layers/caption.py         VLM captioning via any OpenAI-compatible API.
-                             Built, tested — pipeline/models.toml still has
-                             placeholder model IDs, not yet run for real.
-  layers/segment.py         Turns captions into action segments.
-                             DELIBERATELY UNIMPLEMENTED — its own
-                             docstring explains it's blocked on real
-                             measurements (boundary error, velocity-minima
-                             density) that don't exist until hands +
-                             captions have run on real footage. Don't
-                             implement this until that data exists.
-  backends/                 VLM backend abstraction (OpenAI-compatible +
+    original_curated.py     the curate-original / annotate-curated-original
+                             core: ffmpeg frame trimming, segment timeline,
+                             rendering. Imports only config/curated_caption_
+                             events/media.probe — nothing EgoBlur-related.
+    pipeline.py              CLI dispatch + shared private-manifest helpers
+                             (also imported by public-release-tools/).
+    curated_caption_events.py de-seams adjacent VLM window captions within
+                             one retained segment. Deliberately not
+                             layers/segment.py (removed, see below).
+    layers/hands.py          MediaPipe hand tracking.
+    layers/caption.py        VLM captioning via any OpenAI-compatible API.
+    backends/                VLM backend abstraction (OpenAI-compatible +
                              a deterministic FakeBackend for tests/demo).
-  media/probe.py            ffprobe wrapper, single source of truth for
-                             fps/duration (both hand and caption tracks
-                             must derive timestamps from this one clock).
-  store.py                  SQLite + parquet persistence. Currently only
-                             wired for the hands layer.
-  schema.py                 Dataclasses: HandFrame, WindowCaption, Segment.
-tests/                       pytest, 279 tests. Run before AND after any
+    media/probe.py           ffprobe wrapper, single source of truth for
+                             fps/duration.
+    store.py                 SQLite + parquet persistence.
+    schema.py                Dataclasses: HandFrame, WindowCaption, Segment.
+    archive.py                verified Google Drive archiving (rclone).
+    config.py                 shared tunables.
+
+egoblur/                     PARKED, not deleted. Automated GPU face
+                             redaction (an alternative to curate-original's
+                             manual cut list) plus its pre/post-redaction
+                             review tooling. Self-contained — zero imports
+                             from pipeline/. Own CLI: `egoblur/cli.py`
+                             (verify-yunet, pose-prior, hand-prior, init-
+                             yunet-decisions, decisions-to-forced-boxes).
+  job.py                    self-contained PEP 723 GPU redaction job.
+  review.py                 HTML gallery for human review.
+  runpod_setup.sh           idempotent RunPod environment setup.
+  pose_prior.py             pre-redaction MediaPipe Pose shadow prior.
+  hand_prior.py             pre-redaction Hand Landmarker wearer prior.
+  verify_yunet.py           post-redaction independent YuNet face audit.
+  probe.py                  vendored copy of pipeline's media/probe.py
+                             (this folder must stay dependency-isolated).
+
+public-release-tools/        PARKED, not deleted. The historical mechanism
+                             for turning an EgoBlur-redacted video into a
+                             published HF dataset. Own CLI:
+                             `public-release-tools/cli.py` (annotate,
+                             publish-hf, prepare-public-release, approve-
+                             redaction). Imports the installed `egoannote`
+                             package normally (no CUDA isolation need).
+  annotate_redacted.py      MediaPipe + captioning on a --redacted-video,
+                             extracted from the old pipeline.py `annotate`
+                             command.
+  public_release.py         builds the owner-approved public release folder.
+  pack/huggingface.py       privacy-safe bundle export + Hub upload.
+  export_frame_previews.py, extract_preview.sh
+                             cut short preview clips for the blog/README.
+
+tests/                       pytest, 379 tests. Run before AND after any
                              change: `uv run --extra test pytest tests/ -q`
 handover.md                  a PREVIOUS session's own continuation notes.
-                             Tracked in git (not gitignored) — read it,
-                             it's usually more current/detailed than this
-                             file on whatever the last session actually did.
+                             Gitignored — local-only, read it if present.
 ```
+
+`layers/segment.py`, the empty `verify/` package, and `egoblur/contract.py`
+(unused GPU-job scaffolding) were deleted outright as dead code in this same
+restructuring — they had zero importers anywhere in the repo.
 
 ## Why the GPU job is a single self-contained script
 

@@ -28,6 +28,13 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# public-release-tools/ is a flat sibling folder (not a package under egoannote):
+# its modules import the installed `egoannote` package normally, and tests reach
+# them as `import annotate_redacted`, `import public_release`, `from pack...`.
+_PUBLIC_RELEASE_TOOLS = _ROOT / "public-release-tools"
+if str(_PUBLIC_RELEASE_TOOLS) not in sys.path:
+    sys.path.insert(0, str(_PUBLIC_RELEASE_TOOLS))
+
 
 def _load(rel: str, name: str):
     spec = importlib.util.spec_from_file_location(name, _ROOT / rel)

@@ -1,0 +1,4 @@
+input,start_frame,end_frame,output
+# Paths are relative to this CSV file. Frame numbers start at 0 and include both ends.
+# public-release/egoannote-v1/videos/GX010059.mp4,0,239,GX010059-intro.mp4
+# public-release/egoannote-v1/annotated-videos/GX010059.mp4,600,899,GX010059-annotations.mp4
