@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from egoannote import pose_prior
+from egoblur import pose_prior
 
 
 def _artifact(

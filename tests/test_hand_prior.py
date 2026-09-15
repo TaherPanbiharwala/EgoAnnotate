@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from egoannote import hand_prior
+from egoblur import hand_prior
 
 
 def _landmarks(x: float, y: float) -> list[SimpleNamespace]:

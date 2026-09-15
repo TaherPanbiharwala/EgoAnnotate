@@ -23,7 +23,7 @@ from typing import Any
 import cv2
 import mediapipe as mp
 
-from .media.probe import VideoInfo, probe
+from .probe import VideoInfo, probe
 from .pose_prior import require_private_path
 
 SCHEMA_VERSION = 1

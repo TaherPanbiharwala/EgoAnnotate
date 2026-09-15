@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from egoannote import verify_yunet
+from egoblur import verify_yunet
 
 
 def _sha256(path: Path) -> str:

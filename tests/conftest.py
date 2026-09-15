@@ -21,6 +21,13 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 
+# egoblur/ is a real package (has __init__.py): its pose_prior.py/hand_prior.py/
+# verify_yunet.py use ordinary relative imports internally, so tests reach them
+# as `from egoblur import pose_prior` rather than loading them by path like the
+# standalone job.py/review.py above.
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 
 def _load(rel: str, name: str):
     spec = importlib.util.spec_from_file_location(name, _ROOT / rel)

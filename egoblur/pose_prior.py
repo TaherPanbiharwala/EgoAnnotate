@@ -25,7 +25,7 @@ from typing import Any
 import cv2
 import mediapipe as mp
 
-from .media.probe import VideoInfo, probe
+from .probe import VideoInfo, probe
 
 SCHEMA_VERSION = 1
 ARTIFACT_TYPE = "pre_redaction_pose_prior"
