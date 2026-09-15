@@ -18,9 +18,10 @@ private/
 *.db-wal
 *.db-shm
 public-release/
+DO-NOT-SHIP/
 
 # secrets
-.env
+*.env
 *.key
 
 .DS_Store
