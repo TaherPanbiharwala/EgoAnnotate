@@ -1,6 +1,6 @@
 """Shared fixtures.
 
-`jobs/10_blur_egoblur.py` and `scripts/22_blur_review.py` start with digits,
+`egoblur/job.py` and `egoblur/review.py` are standalone scripts,
 so they are not importable module names. They are also standalone scripts by
 design (PEP 723 / no-CLI), not package members. Loading them by path is what
 makes their pure logic testable without a GPU, real EgoBlur weights, or a
@@ -32,9 +32,9 @@ def _load(rel: str, name: str):
 
 @pytest.fixture(scope="session")
 def blur_job():
-    return _load("jobs/10_blur_egoblur.py", "blur_job")
+    return _load("egoblur/job.py", "blur_job")
 
 
 @pytest.fixture(scope="session")
 def blur_review():
-    return _load("scripts/22_blur_review.py", "blur_review")
+    return _load("egoblur/review.py", "blur_review")

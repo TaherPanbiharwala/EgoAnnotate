@@ -1,5 +1,5 @@
 """Deterministic backend — no network call, no API key, $0. Makes the full
-pipeline CI-testable and is what scripts/demo.py runs by default.
+pipeline CI-testable and is what pipeline/demo.py runs by default.
 
 Two modes:
   - Fixture-replay: pass `fixture_path` to a JSONL file of REAL captured VLM

@@ -7,6 +7,20 @@ pose, object masks, relative depth and camera pose — and reports real
 numbers for how good each field actually is, instead of just shipping a
 demo. Runs on one laptop plus a small amount of rented GPU time.
 
+## Repository layout
+
+The project is intentionally split by runtime boundary:
+
+- [`pipeline/`](pipeline/README.md) contains the installable `egoannote`
+  annotation pipeline, its prompts and model registry. Its public command is
+  `egoannote-run`.
+- [`egoblur/`](egoblur/README.md) contains the self-contained GPU privacy
+  redaction job and its RunPod setup/review tools. It has an isolated PEP 723
+  environment and is not a dependency of the annotation pipeline.
+
+This separation keeps ordinary local annotation work free of CUDA/GPU
+dependencies while making the privacy-redaction workflow easy to find.
+
 > **Status: early build.** The core pipeline (frame extraction, hand
 > tracking, dense VLM captioning, storage, privacy-safe HF packaging, and
 > verified Drive archiving) is implemented and tested. Segmentation is paused;
@@ -33,13 +47,13 @@ uv sync
 `uv sync` creates a `.venv` and installs everything in `pyproject.toml`
 (MediaPipe, OpenCV, PyArrow, Pydantic, httpx). There is no separate GPU
 install step — the layers implemented so far (hand tracking, VLM captioning)
-run on CPU; the future GPU perception layers (objects/depth/pose) are
-isolated PEP 723 job scripts under `jobs/`, not part of this environment.
+run on CPU. The isolated GPU privacy workflow lives under `egoblur/` and is
+not part of this environment.
 
 ## Try it — no accounts, no GPU, no API key
 
 ```bash
-uv run scripts/demo.py
+uv run pipeline/demo.py
 ```
 
 Runs the real pipeline (probe → frame extraction → MediaPipe hand tracking →
@@ -87,15 +101,15 @@ print(f"{n_frames} frames written, {len(gaps)} no-hands gaps")
 The MediaPipe hand-landmarker model (~7.8 MB) is downloaded once to
 `config.MODELS_DIR` and cached on disk after that.
 
-### VLM captioning (needs an API key and a model in `models.toml`)
+### VLM captioning (needs an API key and a model in `pipeline/models.toml`)
 
-1. Pick or add a model entry in `models.toml` under `[models.<id>]` — fill
+1. Pick or add a model entry in `pipeline/models.toml` under `[models.<id>]` — fill
    in real prices from your provider before setting a spend cap (a `0.0`
    price disables the cap silently, by design of the validation, so it's
    loud if you forget: `build_backend` will refuse a spend cap against a
    zero-priced model).
 2. Export your key: `export OPENROUTER_API_KEY=sk-...` (never put it in
-   `models.toml` — that file is committed).
+   `pipeline/models.toml` — that file is committed).
 3. Run:
 
 ```python
@@ -103,7 +117,7 @@ from egoannote.backends.registry import build_backend
 from egoannote.layers import caption as caption_layer
 from egoannote.store import Store
 
-backend = build_backend("example-a")  # the [models.example-a] id from models.toml
+backend = build_backend("example-a")  # the [models.example-a] id from pipeline/models.toml
 store = Store(Path("runs") / video_id / "annotations.db")
 
 n = caption_layer.caption_video(video, video_id, backend, store)
@@ -117,48 +131,48 @@ same `store` skips windows already recorded and only retries error rows.
 
 ### Config knobs
 
-Everything tunable lives in `src/egoannote/config.py`, each with a comment
+Everything tunable lives in `pipeline/src/egoannote/config.py`, each with a comment
 explaining where the number came from. Two are environment overrides rather
 than constants, for a checkout that isn't the repo root or a non-editable
 install:
 
 - `EGOANNOTE_DATA_DIR` — where runtime data (models cache, frame cache, SQLite,
   reports) lives. Defaults to `./runs`.
-- `EGOANNOTE_MODELS_TOML` — path to `models.toml`. Defaults to the repo-root
-  copy; a wheel install doesn't bundle it, so this is required there.
+- `EGOANNOTE_MODELS_TOML` — path to `pipeline/models.toml`. Defaults to that
+  repository copy; a wheel install doesn't bundle it, so this is required there.
 
 ### Tests and lint
 
 ```bash
 uv run pytest
-uv run --with ruff ruff check src scripts jobs tests
+uv run --with ruff ruff check pipeline/src pipeline/demo.py egoblur tests
 ```
 
 ## What's here right now
 
-- `src/egoannote/media/` — ffprobe/ffmpeg wrappers. One `probe()` call is the
+- `pipeline/src/egoannote/media/` — ffprobe/ffmpeg wrappers. One `probe()` call is the
   single source of truth for a video's fps/duration, shared by every stage
   so two tracks never assume two different clocks.
-- `src/egoannote/layers/hands.py` — MediaPipe hand tracking, local CPU, free.
+- `pipeline/src/egoannote/layers/hands.py` — MediaPipe hand tracking, local CPU, free.
   Fixes a real bug from the pipeline this was rebuilt from: MediaPipe often
   labels *both* detected hands "Right" in egocentric footage, and the naive
   fix (trust the first label match) silently drops one hand. This version
   assigns both detections jointly using frame-to-frame continuity, with
   handedness labels only breaking ties when there's no prior frame to anchor
   to.
-- `src/egoannote/parse.py` — a 4-tier JSON repair ladder (fence-strip →
+- `pipeline/src/egoannote/parse.py` — a 4-tier JSON repair ladder (fence-strip →
   `json.loads` → `json_repair` → regex fallback) for VLM responses, with a
   `pydantic`-validated schema. Distinguishes "the JSON parsed" from "the JSON
   matched the shape we needed" — a response can be valid JSON and still
   carry zero usable data, and that distinction matters downstream.
-- `src/egoannote/backends/` — one interface, swappable implementations. The
+- `pipeline/src/egoannote/backends/` — one interface, swappable implementations. The
   real captioning backend talks to any OpenAI-compatible endpoint
   (OpenRouter, Ollama, vLLM, etc.), loaded from `models.toml` by
   `backends/registry.py`; a deterministic fake backend makes the whole
   pipeline testable with no network access. Each image is sent with a
   `Frame N` text label immediately before it, because the caption prompt
   asks the model to return frame indices referring to those labels.
-- `src/egoannote/store.py` — one SQLite database (laptop-only — GPU pods
+- `pipeline/src/egoannote/store.py` — one SQLite database (laptop-only — GPU pods
   write immutable artifact shards, never a shared database file, so two
   machines can never silently overwrite each other's rows).
 - `tests/` — pytest, no GPU or network required. A large share are
@@ -167,7 +181,7 @@ uv run --with ruff ruff check src scripts jobs tests
 
 ## What's not here yet
 
-- The segmentation algorithm (`src/egoannote/layers/segment.py`) — the
+- The segmentation algorithm (`pipeline/src/egoannote/layers/segment.py`) — the
   design is finalized but deliberately not implemented until real hand-
   tracking data exists to calibrate its thresholds against. See that file's
   docstring for the full design and why it's staged this way.

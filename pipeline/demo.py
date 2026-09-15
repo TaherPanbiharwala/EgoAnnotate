@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Zero-setup demo. No API key, no GPU, no accounts, no Drive access.
 
-    uv run scripts/demo.py
+    uv run pipeline/demo.py
 
 Runs the real pipeline (probe -> frame extraction -> MediaPipe hands ->
 VLM captioning) against a bundled synthetic clip, using the deterministic
 FakeBackend in place of a real API call. Reports what ran and what's still
 pending (segmentation and preview rendering — see the module docstrings in
-src/egoannote/layers/segment.py and pack/preview.py for why).
+pipeline/src/egoannote/layers/segment.py and pack/preview.py for why).
 
 This is intentionally honest about scope: it is a plumbing smoke test, not
 proof the annotation pipeline produces good captions or correct segments —
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "pipeline" / "src"))
 
 from egoannote import config
 from egoannote.backends.fake import FakeBackend

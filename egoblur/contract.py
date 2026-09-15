@@ -2,8 +2,8 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""The ONE thing every jobs/*.py script agrees on. Vendored BY COPY into
-each job script (not imported — jobs run as self-contained PEP-723 scripts
+"""The ONE thing every EgoBlur GPU script agrees on. Vendored BY COPY into
+each job script (not imported — they run as self-contained PEP-723 scripts
 on ephemeral pods with no shared environment), with a CI test asserting all
 copies stay byte-identical to this canonical file.
 
@@ -17,7 +17,7 @@ check give the same anti-drift guarantee without it.
 
 Every job writes ONLY this: raw arrays + this metadata. NO schema
 knowledge, no database, no interpretation of what the numbers mean — that
-all lives laptop-side in src/egoannote/layers/*.py, which is the only place
+all lives laptop-side in pipeline/src/egoannote/layers/*.py, which is the only place
 that ingests these shards into the SQLite store.
 """
 

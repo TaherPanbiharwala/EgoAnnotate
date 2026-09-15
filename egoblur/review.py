@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Turn a blur job's flagged coordinates into something a human can actually look at.
 
-    uv run scripts/22_blur_review.py runs/blur/GX010042.manifest.json
-    uv run scripts/22_blur_review.py runs/blur/            # every manifest in a dir
-    uv run scripts/22_blur_review.py runs/blur/ --timelapse
+    uv run egoblur/review.py runs/blur/GX010042.manifest.json
+    uv run egoblur/review.py runs/blur/            # every manifest in a dir
+    uv run egoblur/review.py runs/blur/ --timelapse
 
-jobs/10_blur_egoblur.py marks a clip NEEDS_REVIEW when the low-threshold
+egoblur/job.py marks a clip NEEDS_REVIEW when the low-threshold
 sweep or the independent YuNet pass finds a region that may contain a face
 nothing redacted. It reports those as raw `[x1,y1,x2,y2]` coordinates at a
 frame index — which is unreviewable by hand. This extracts each flagged

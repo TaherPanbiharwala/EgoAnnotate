@@ -19,7 +19,7 @@ def _write(tmp_path, body: str):
 
 
 def test_shipped_registry_parses() -> None:
-    """The models.toml committed at the repo root must actually be valid TOML
+    """The pipeline/models.toml registry must actually be valid TOML
     with the structure the loader expects."""
     reg = load_registry()
     assert "models" in reg
@@ -114,7 +114,7 @@ def test_openai_compat_entry_without_model_is_rejected(tmp_path) -> None:
 def test_env_var_overrides_the_default_registry_path(tmp_path, monkeypatch) -> None:
     """config.py documents `parents[3]` as a known defect (only resolves for
     an editable install). registry.py had reintroduced it; the env var is the
-    only thing that works under a wheel install, since models.toml is not
+    only thing that works under a wheel install, since pipeline/models.toml is not
     bundled in the package."""
     p = _write(tmp_path, '[models.fake]\nbackend = "fake"\n')
     monkeypatch.setenv("EGOANNOTE_MODELS_TOML", str(p))

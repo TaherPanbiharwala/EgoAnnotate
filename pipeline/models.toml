@@ -24,7 +24,7 @@
 base_url = "https://openrouter.ai/api/v1"
 # api_key is read from $OPENROUTER_API_KEY — never put a key in this file.
 
-# --- fake backend for CI / scripts/demo.py — no network, no key required ---
+# --- fake backend for CI / pipeline/demo.py — no network, no key required ---
 [models.fake]
 backend = "fake"
 supports_json_schema = true

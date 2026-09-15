@@ -105,27 +105,21 @@ rented pod.
 ## Repo layout
 
 ```
-jobs/10_blur_egoblur.py     the ONE GPU job. Self-contained PEP 723 script
-                             (see below for why). ~2800 lines, heavily
-                             tested and heavily reviewed — read its module
-                             docstring before changing anything in it.
-jobs/_contract.py           the shard-metadata contract other future GPU
-                             jobs (hand-pose, depth, SLAM) will vendor by
-                             copy — NOT imported (see PEP 723 section).
-scripts/22_blur_review.py   builds an HTML gallery of flagged detections
-                             from a run's manifest, for human review before
-                             publishing.
-scripts/runpod_setup.sh     idempotent RunPod environment setup. Re-run
-                             after every pod restart (see "RunPod" below).
-scripts/demo.py             zero-setup plumbing smoke test — no GPU, no
-                             API key, runs the whole non-GPU pipeline
-                             against a bundled synthetic clip.
-src/egoannote/
+egoblur/
+  job.py                    self-contained PEP 723 GPU redaction job.
+  contract.py               shard-metadata contract to vendor by copy.
+  review.py                 HTML gallery for human review.
+  runpod_setup.sh           idempotent RunPod environment setup.
+pipeline/
+  demo.py                   zero-setup non-GPU pipeline smoke test.
+  models.toml               VLM model registry.
+  prompts/                  caption prompt versions.
+  src/egoannote/
   layers/hands.py           MediaPipe hand tracking. Built, tested, proven
                              working — NOT yet run against real blurred
                              output, only synthetic test data.
   layers/caption.py         VLM captioning via any OpenAI-compatible API.
-                             Built, tested — models.toml still has
+                             Built, tested — pipeline/models.toml still has
                              placeholder model IDs, not yet run for real.
   layers/segment.py         Turns captions into action segments.
                              DELIBERATELY UNIMPLEMENTED — its own
@@ -142,13 +136,6 @@ src/egoannote/
   store.py                  SQLite + parquet persistence. Currently only
                              wired for the hands layer.
   schema.py                 Dataclasses: HandFrame, WindowCaption, Segment.
-verify/, pack/               EMPTY FILES. Nobody has started dataset
-                             assembly/validation. Real work, not stubs to
-                             delete.
-models.toml                 VLM model registry. Ships with placeholder
-                             entries; needs 2 real models from DIFFERENT
-                             labs (see file's own comments on why) before
-                             any real captioning run.
 tests/                       pytest, 279 tests. Run before AND after any
                              change: `uv run --extra test pytest tests/ -q`
 handover.md                  a PREVIOUS session's own continuation notes.
@@ -159,15 +146,15 @@ handover.md                  a PREVIOUS session's own continuation notes.
 
 ## Why the GPU job is a single self-contained script
 
-`jobs/10_blur_egoblur.py` starts with a PEP 723 header (`# /// script ...`)
+`egoblur/job.py` starts with a PEP 723 header (`# /// script ...`)
 declaring its own dependencies (`egoblur`, `torch`+CUDA, `opencv`, etc.)
-and runs via `uv run jobs/10_blur_egoblur.py <args>` — no install step, no
+and runs via `uv run egoblur/job.py <args>` — no install step, no
 shared virtualenv. This is deliberate: it runs on an ephemeral rented GPU
 pod with no persistent environment, and future GPU jobs (hand-mesh
-estimation, depth, SLAM — see `jobs/_contract.py`'s comment for the
+estimation, depth, SLAM — see `egoblur/contract.py`'s comment for the
 planned stage names) will each need **mutually incompatible** torch/CUDA
 versions. One shared environment can't satisfy all of them at once; one
-script per job, each fully self-contained, can. `jobs/_contract.py`
+script per job, each fully self-contained, can. `egoblur/contract.py`
 (the shard-writing metadata format other GPU jobs will use) is meant to
 be **vendored by copy** into each new job script, not imported — a real
 import would break the isolation that's the whole point.
@@ -181,7 +168,7 @@ anyone tries to run it locally on a Mac.
 
 ## Design principles this codebase already learned the hard way
 
-These recur throughout `jobs/10_blur_egoblur.py` and its ~270 tests.
+These recur throughout `egoblur/job.py` and its ~270 tests.
 Violating them silently reintroduces bugs that were already found, fixed,
 and pinned with a regression test:
 
@@ -243,7 +230,7 @@ command.
 
 ## Immediate priority — the EgoBlur redaction work
 
-Read this section before doing anything with `jobs/10_blur_egoblur.py`.
+Read this section before doing anything with `egoblur/job.py`.
 
 **The fill-integrity question is RESOLVED, with actual evidence — not
 just a visual spot-check.** An early run (`test-run-1`, default settings)
@@ -276,7 +263,7 @@ combinations against already-computed detections at zero extra GPU
 cost):
 
 ```bash
-uv run jobs/10_blur_egoblur.py --input-dir /workspace/in --output-dir /workspace/out2 \
+uv run egoblur/job.py --input-dir /workspace/in --output-dir /workspace/out2 \
   --run-id test-run-3 --gen 2 \
   --face-weights-gen2 /workspace/weights/ego_blur_face_gen2.jit \
   --face-threshold 0.30 --hold-frames 45 \
@@ -300,7 +287,7 @@ video).
 dead-canary gate and hysteresis's drift bound (commit `d0cbe10`); plus,
 **currently uncommitted but tested and mutation-tested**, two of the
 three remaining hysteresis visibility gaps (see item 2 below) and a
-durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
+durable SSH `authorized_keys` mechanism in `egoblur/runpod_setup.sh`
 (see "Operational notes for RunPod"). What's left:
 
 1. **A resumed multi-clip batch can silently mix redaction configs.**
@@ -360,7 +347,7 @@ durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
 ## Operational notes for RunPod
 
 - **The pod's container disk is wiped on every `stop`; only
-  `/workspace` (the mounted volume) survives.** `scripts/runpod_setup.sh`
+  `/workspace` (the mounted volume) survives.** `egoblur/runpod_setup.sh`
   installs `uv`, `ffmpeg`, `ffprobe`, and `rclone` to `/workspace/bin`
   specifically because installing via `apt-get` (which lands in
   `/usr/bin`) silently evaporates on the next restart — this cost
@@ -369,14 +356,14 @@ durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
   container disk.
 - After any pod restart or new terminal:
   ```bash
-  cd /workspace/egoannote && git pull && bash scripts/runpod_setup.sh
+  cd /workspace/egoannote && git pull && bash egoblur/runpod_setup.sh
   source /workspace/env.sh
   ```
 - **Long-running jobs must be detached**, or a disconnected
   browser/terminal kills them mid-run:
   ```bash
   cd /workspace/egoannote && setsid nohup env PATH="/workspace/bin:$PATH" \
-    UV_CACHE_DIR=/workspace/.uv-cache /workspace/bin/uv run jobs/10_blur_egoblur.py \
+    UV_CACHE_DIR=/workspace/.uv-cache /workspace/bin/uv run egoblur/job.py \
     <args> > /workspace/run.log 2>&1 < /dev/null &
   tail -f /workspace/run.log
   ```
@@ -400,7 +387,7 @@ durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
   SSH over exposed TCP** (`ssh root@<ip> -p <port>`) does. Needs `22`
   listed under the pod's Expose TCP Ports, and `sshd` actually running
   (`pgrep -a sshd`; `service ssh start` or `mkdir -p /run/sshd &&
-  /usr/sbin/sshd` if not). `scripts/runpod_setup.sh` now keeps the real
+  /usr/sbin/sshd` if not). `egoblur/runpod_setup.sh` now keeps the real
   `authorized_keys` on `/workspace/.ssh/` and symlinks
   `/root/.ssh/authorized_keys` to it — same wiped-container-disk pattern
   as everything else above — so populating
@@ -415,12 +402,11 @@ durable SSH `authorized_keys` mechanism in `scripts/runpod_setup.sh`
 ```bash
 uv sync                                  # install deps (non-GPU deps only)
 uv run --extra test pytest tests/ -q     # run the full test suite
-uv run scripts/demo.py                   # zero-setup plumbing smoke test
+uv run pipeline/demo.py                  # zero-setup plumbing smoke test
 ```
 
-The GPU job (`jobs/10_blur_egoblur.py`) is tested WITHOUT a GPU by loading
-it via `importlib` (its filename starts with a digit, so it can't be a
-normal import — see `tests/conftest.py`'s `_load()` helper) and testing
+The GPU job (`egoblur/job.py`) is tested WITHOUT a GPU by loading it via
+`importlib` and testing
 its pure logic (tracking, coverage math, audit gating) directly, with the
 decoder/detector mocked. One test file
 (`tests/test_blur_encode_roundtrip.py`) deliberately uses a REAL ffmpeg
@@ -430,7 +416,7 @@ replaced with this real encode/decode round trip. Keep that file's
 tests real; don't mock them for convenience.
 
 Before committing: run the full test suite, and if you change anything
-in `jobs/10_blur_egoblur.py`'s tracking, redaction, or audit logic,
+in `egoblur/job.py`'s tracking, redaction, or audit logic,
 mutation-test your own fix (revert it, confirm the new test fails,
 restore) before considering it done — this project has a real, repeated
 history of tests that looked correct but passed against a reverted fix.

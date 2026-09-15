@@ -1,5 +1,16 @@
 # egoannote — session handover
 
+## Repository layout update — 2026-09-03
+
+The implementation was reorganized without deleting code. The installable
+annotation package now lives at `pipeline/src/egoannote/`, with prompts and
+the VLM registry beside it in `pipeline/`. The retained public entry point is
+still `egoannote-run`; use `uv run pipeline/demo.py` for the smoke test.
+
+The GPU-only privacy-redaction workflow now lives in `egoblur/`: use
+`egoblur/job.py`, `egoblur/review.py`, and `egoblur/runpod_setup.sh`. Older
+path references below are historical notes from before this layout change.
+
 ## Branch note: `original-trim-mediapipe-vlm` (2026-08-27)
 
 This branch is for the user's explicitly private original-derived workflow

@@ -18,7 +18,7 @@
 # ///
 """GPU anonymization job: EgoBlur face + license-plate redaction, one burn-in
 re-encode. Runs on an ephemeral RunPod pod. Self-contained per PEP 723 — see
-jobs/_contract.py's module docstring for why this can't import src/.
+egoblur/contract.py's module docstring for why this can't import the pipeline.
 
 Pipeline: preflight -> discover clips -> detect (10 Hz, tracked +
 interpolated) -> redact + encode (one pass, yuv420p raw pipes) -> verify ->
@@ -102,10 +102,10 @@ from pathlib import Path
 from typing import Any
 
 # =============================================================================
-# NOTE ON jobs/_contract.py
+# NOTE ON egoblur/contract.py
 #
 # Other job scripts vendor _contract.py's ShardMeta/write_shard by copy,
-# because a PEP-723 script cannot import from src/. This job does NOT: it
+# because a PEP-723 script cannot import from pipeline/src. This job does NOT: it
 # produces a redacted video plus a manifest, not arrays, so there is nothing
 # for the .npz shard format to carry. An earlier version pasted the contract
 # in anyway — 61 lines nothing ever called, while three comments and the

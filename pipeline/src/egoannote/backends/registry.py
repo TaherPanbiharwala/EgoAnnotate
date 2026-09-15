@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 # fallback. config.py documents `parents[3]` as a known v1 defect (it only
 # resolves for an editable install from the repo), and review caught this
 # module reintroducing the same pattern. pyproject packages only
-# src/egoannote, so models.toml is NOT bundled in a wheel — under a wheel
+# pipeline/src/egoannote, so models.toml is NOT bundled in a wheel — under a wheel
 # install the env var is the only thing that works.
 _ENV_REGISTRY_PATH = os.environ.get("EGOANNOTE_MODELS_TOML")
 DEFAULT_REGISTRY_PATH = (
@@ -105,7 +105,7 @@ def load_registry(path: Path | None = None) -> dict:
     if not path.exists():
         raise FileNotFoundError(
             f"Model registry not found at {path}. This file defines which VLMs "
-            f"are available; copy models.toml from the repo root, or pass an "
+            f"are available; copy pipeline/models.toml from the repo, or pass an "
             f"explicit path."
         )
     with path.open("rb") as f:

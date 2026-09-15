@@ -1,4 +1,4 @@
-"""Tests for scripts/22_blur_review.py.
+"""Tests for egoblur/review.py.
 
 This script produces the single artifact a human looks at before deciding
 whether a clip is safe to publish. The failure that matters is not a crash —

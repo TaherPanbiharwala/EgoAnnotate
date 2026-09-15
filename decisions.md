@@ -22,3 +22,5 @@ The homepage should include:
 5. A reserved blog section marked as writing in progress. Blog content will be supplied later.
 
 Website work is separate from the private annotation pipeline. It may link to the public Hugging Face repository but must not expose private artifacts, local paths, private review evidence, source timelines, or private-only labels.
+
+**Status: live.** The "Field Notes" layout direction was chosen and deployed at **https://taherpanbiharwala.github.io/EgoAnnotate/**, served from an orphan `gh-pages` branch on this repo — isolated from `master` and the private working branches, no shared history. Content is sourced entirely from the public `public-release/egoannote-v1/` manifests and captions plus the Hugging Face dataset card.

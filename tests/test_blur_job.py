@@ -1,4 +1,4 @@
-"""Tests for jobs/10_blur_egoblur.py.
+"""Tests for egoblur/job.py.
 
 Every test here pins a bug that was actually found and fixed, not a
 hypothetical. The job runs unattended on a paid GPU against footage of real

@@ -100,7 +100,7 @@ It is for improving the pilot only and must never be uploaded or published.
 Pass that artifact to the pod alongside a private report destination:
 
 ```bash
-... jobs/10_blur_egoblur.py ... \
+... egoblur/job.py ... \
   --checkpoint-dir /workspace/private/checkpoints/GX010057-shadow \
   --pose-prior /workspace/private/pose-prior/GX010057.pose_prior.json \
   --pose-shadow-report /workspace/private/pose-shadow/GX010057.pose_shadow.json
@@ -156,7 +156,7 @@ uv run egoannote-run hand-prior \
   --models-dir /workspace/private/models \
   --preview-video /workspace/private/hand-preview/GX010057.hands.mp4
 
-... jobs/10_blur_egoblur.py ... \
+... egoblur/job.py ... \
   --hand-prior /workspace/private/hand-prior/GX010057.hand_prior.json \
   --hand-suppression-report /workspace/private/hand-suppression/GX010057.json \
   --hand-suppress-wearer-hands \
@@ -186,7 +186,7 @@ uv run egoannote-run verify-yunet \
   --blur-manifest /private/GX010057.manifest.json \
   --checkpoint-dir /private/checkpoints \
   --yunet-model /private/face_detection_yunet.onnx \
-  --job-script jobs/10_blur_egoblur.py \
+  --job-script egoblur/job.py \
   --ffmpeg ffmpeg \
   --report /private/GX010057.yunet_review.json \
   --preview-video /private/GX010057.yunet_full_debug.mp4 \

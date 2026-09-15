@@ -1,7 +1,7 @@
 # examples/
 
 `synthetic_smoke_test.mp4` — a 12s synthetic ffmpeg test pattern (`testsrc`),
-NOT real egocentric footage. Its only job is to let `scripts/demo.py` and CI
+NOT real egocentric footage. Its only job is to let `pipeline/demo.py` and CI
 exercise the plumbing (probe → frame extraction → MediaPipe → captioning →
 storage) with zero setup: no API key, no GPU, no real video, no accounts.
 
@@ -23,7 +23,7 @@ directory should also gain:
 ## Recording a real VLM fixture for `backends.fake.FakeBackend`
 
 Once you have an OpenRouter key, capture a handful of REAL responses (not
-synthesized ones) so `scripts/demo.py` can replay genuine model behavior
+synthesized ones) so `pipeline/demo.py` can replay genuine model behavior
 with zero further API cost:
 
 ```python
