@@ -10,9 +10,12 @@ show `hands_present=0` on every frame — that's expected, not a bug.
 
 **This is not the golden-file test the plan calls for.** A real golden-file
 test (30s of real footage + human-labeled expected segment boundaries, for
-CI regression-testing the segmentation algorithm) needs real footage, which
-is blocked on Phase 0 (Google Drive access). Once real footage exists, this
-directory should also gain:
+CI regression-testing the segmentation algorithm) needs the segmentation
+algorithm itself, which remains deliberately unimplemented — see
+`docs/PRIVATE_ORIGINAL_CURATED_PIPELINE.md` and `curated_caption_events.py`
+for why. Real footage is no longer the blocker: the 13-clip EgoAnnotate v1
+release proved the rest of the pipeline against real GoPro footage. Once
+segmentation exists, this directory should also gain:
 
 - `sample.mp4` — a real ~30s clip
 - `sample.expected_boundaries.jsonl` — human-labeled boundaries

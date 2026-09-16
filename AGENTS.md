@@ -42,13 +42,17 @@ private review artifacts, private-only labels, or any other files from
 `runs/**/private/`. The public manifest documents curation using output
 segments and discontinuities; it does not expose private source evidence.
 
-The next product task is a separate public website. The chosen direction is
-**Dataset Atlas**: a research-lab, video-first homepage with a grid of the 13
-clips, video/caption/hand-overlay preview controls, per-clip public metadata,
-a curation-and-annotations explanation, Hugging Face download links, and an
-intentionally empty blog area. Keep website work separate from the private
-pipeline and do not rebuild, modify, or delete the published dataset as part
-of website work. See `decisions.md` for the decision record.
+The public website (**Dataset Atlas** direction: a research-lab, video-first
+homepage with a grid of the 13 clips, video/caption/hand-overlay preview
+controls, per-clip public metadata, a curation-and-annotations explanation,
+Hugging Face download links, and an initially-empty blog area) is **live**
+at `https://taherpanbiharwala.github.io/EgoAnnotate/`, served from an orphan
+`gh-pages` branch with no shared history with `master` or the private
+working branches. Content is sourced entirely from the public
+`public-release/egoannote-v1/` manifests/captions plus the HF dataset card.
+Keep website work separate from the private pipeline and do not rebuild,
+modify, or delete the published dataset as part of website work. See
+`decisions.md` for the decision record.
 
 ## Latest operational checkpoint — 2026-09-02
 
@@ -94,12 +98,27 @@ approved them.
 
 A solo developer is turning a shelved egocentric-video-annotation startup
 into a public, forkable annotation pipeline — a portfolio piece, not a
-company. The plan: publish ~1.5 hours of the developer's own GoPro
-footage (worn while working in a family paint/hardware shop) as an
-annotated dataset on HuggingFace, with faces automatically redacted for
-privacy, then write an honest post-mortem about the whole project.
+company. The plan: publish the developer's own GoPro footage (worn while
+working in a family paint/hardware shop) as an annotated dataset on
+HuggingFace, with faces kept out for privacy, then write an honest
+post-mortem about the whole project.
 
-Pipeline, in order:
+**Active pipeline, today, in order:**
+
+```
+curate-original         →  annotate-curated-original
+manual cut list, ffmpeg     MediaPipe hands (local CPU) + VLM captioning (API)
+removes face-visible         on the retained, face-free segments
+frames from the original
+```
+
+Nothing here needs a GPU. Both commands run free, locally, on the
+developer's Mac. See `docs/PRIVATE_ORIGINAL_CURATED_PIPELINE.md`.
+
+**Original plan, now parked but kept working as a public reference**
+(`egoblur/` + `public-release-tools/` — see "Repo layout" below): automated
+GPU redaction instead of a manual cut list, then the same MediaPipe/VLM
+annotation, then Hugging Face publishing.
 
 ```
 EgoBlur (GPU pod)  →  MediaPipe hands (local CPU)  →  VLM captioning (API)
@@ -109,14 +128,12 @@ EgoBlur (GPU pod)  →  MediaPipe hands (local CPU)  →  VLM captioning (API)
                                           segmentation (NOT implemented yet)
                                           turns captions into action segments
                                                               ↓
-                                          verify/pack (NOT implemented yet)
-                                          assembles + validates HF dataset
+                                    Hugging Face packaging + publishing
 ```
 
-**Only the EgoBlur stage needs a GPU.** Everything else runs free, locally,
-on the developer's Mac (MediaPipe is CPU/Metal; captioning is an HTTP API
-call). This matters: don't assume the whole pipeline needs to run on a
-rented pod.
+Only the EgoBlur stage needs a GPU — everything downstream of it runs free,
+locally. This matters if you're working in `egoblur/` or
+`public-release-tools/`: don't assume that whole path needs a rented pod.
 
 ## Repo layout (current, post-2026-09-16 restructuring)
 
@@ -184,7 +201,11 @@ public-release-tools/        PARKED, not deleted. The historical mechanism
 tests/                       pytest, 379 tests. Run before AND after any
                              change: `uv run --extra test pytest tests/ -q`
 handover.md                  a PREVIOUS session's own continuation notes.
-                             Gitignored — local-only, read it if present.
+                             Tracked in git, but also listed in .gitignore —
+                             that doesn't untrack it, it just stops a broad
+                             `git add -A` from re-adding it if it's ever
+                             removed from tracking. Read it, it's usually
+                             more current than this file.
 ```
 
 `layers/segment.py`, the empty `verify/` package, and `egoblur/contract.py`
@@ -253,7 +274,12 @@ and pinned with a regression test:
   codebase's history (grep test file docstrings for "vacuous" if curious
   why this is stated so bluntly).
 
-## Current status, stage by stage
+## Current status, stage by stage (parked EgoBlur pipeline — reference only)
+
+This table describes `egoblur/` + `public-release-tools/`, not the active
+pipeline (which is just curate-original + annotate-curated-original, both
+code-complete and in daily use). Kept as-is: still accurate for anyone
+picking this parked system back up.
 
 | Stage | Status |
 |---|---|
@@ -267,17 +293,21 @@ and pinned with a regression test:
 
 An active hand suppression deliberately leaves EgoBlur at `NEEDS_REVIEW`.
 Never edit that manifest status after watching a video. Use
-`egoannote-run approve-redaction` to create a private hash-bound decision that
-names the reviewer and binds the final redacted video, EgoBlur manifest,
-hand-suppression report, and YuNet report. Annotation accepts a non-PASS
-manifest only when passed that exact `--redaction-review`; publishing rechecks
-the same bindings. The approval is local/private evidence and must never enter
-`publish/` or Hugging Face. See `docs/MEDIAPIPE_VLM_PIPELINE.md` for the exact
-command.
+`public-release-tools/cli.py approve-redaction` to create a private
+hash-bound decision that names the reviewer and binds the final redacted
+video, EgoBlur manifest, hand-suppression report, and YuNet report.
+Annotation accepts a non-PASS manifest only when passed that exact
+`--redaction-review`; publishing rechecks the same bindings. The approval is
+local/private evidence and must never enter `publish/` or Hugging Face. See
+`docs/MEDIAPIPE_VLM_PIPELINE.md` for the exact command.
 
-## Immediate priority — the EgoBlur redaction work
+## EgoBlur redaction work (parked reference, not current priority)
 
-Read this section before doing anything with `egoblur/job.py`.
+Read this section before doing anything with `egoblur/job.py`. This whole
+section predates the 2026-09-16 restructuring and describes work that is
+parked, not blocking anything active — kept because the settings and bug
+history below are real and expensive to re-derive if this system is picked
+back up.
 
 **The fill-integrity question is RESOLVED, with actual evidence — not
 just a visual spot-check.** An early run (`test-run-1`, default settings)
@@ -328,7 +358,7 @@ first (visually, not just by the numbers — this exact regression looked
 fine in aggregate stats and only showed up when a human watched the
 video).
 
-## Known open work (real, scoped, not busywork)
+## Known open work in the parked EgoBlur pipeline (real, scoped, not busywork)
 
 **Fixed since this file was first written:** the `max_fill_area_frac`
 dead-canary gate and hysteresis's drift bound (commit `d0cbe10`); plus,
@@ -381,7 +411,7 @@ durable SSH `authorized_keys` mechanism in `egoblur/runpod_setup.sh`
      visibility fix — bigger, separate work. Don't enable
      `--continue-threshold` for a real batch until this is addressed.
 3. **YuNet is now an independent, post-redaction review signal, not an
-   approval mechanism.** The standalone `egoannote-run verify-yunet`
+   approval mechanism.** The standalone `egoblur/cli.py verify-yunet`
    command validates the redacted-video hash and full detector checkpoint,
    rebuilds EgoBlur's fill map, then runs YuNet only on the redacted video.
    It emits private temporal candidates and never changes the redaction.
@@ -448,9 +478,20 @@ durable SSH `authorized_keys` mechanism in `egoblur/runpod_setup.sh`
 
 ```bash
 uv sync                                  # install deps (non-GPU deps only)
-uv run --extra test pytest tests/ -q     # run the full test suite
+uv run --extra test pytest tests/ -q     # run the full test suite (379 tests)
 uv run pipeline/demo.py                  # zero-setup plumbing smoke test
+uv run egoannote-run --help              # the active pipeline's CLI
+uv run egoblur/cli.py --help             # parked EgoBlur pre/post-redaction tooling
+uv run public-release-tools/cli.py --help  # parked HF-publishing mechanism
 ```
+
+`tests/` covers all three of the above from one shared `tests/` directory —
+`egoannote-run`'s own commands, `egoblur/`'s (via path-loaded fixtures in
+`conftest.py` for the standalone `job.py`/`review.py`, ordinary imports for
+the rest), and `public-release-tools/`'s (via a `conftest.py` sys.path
+entry, since that folder isn't an installed package). There's no separate
+test root per folder — keep it that way; it's the same pattern this repo
+already used before the folder existed.
 
 The GPU job (`egoblur/job.py`) is tested WITHOUT a GPU by loading it via
 `importlib` and testing

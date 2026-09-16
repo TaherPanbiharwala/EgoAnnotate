@@ -1,5 +1,62 @@
 # egoannote — session handover
 
+## Scope narrowed to one active pipeline — 2026-09-16
+
+The owner decided to park everything except `curate-original` +
+`annotate-curated-original` (the workflow the 2026-08-27 branch note below
+introduced). This is a real scope decision, not just a refactor: EgoBlur
+automated redaction and the Hugging Face publishing mechanism are no longer
+being actively developed, just kept working as public references since this
+repo is public on GitHub.
+
+Four commits on `original-trim-mediapipe-vlm` (pushed to origin):
+
+1. Committed the flat→`pipeline/`/`egoblur/` rename that was already staged
+   from the 2026-09-03 reorg below.
+2. Deleted dead code: `layers/segment.py` (unimplemented stub), the empty
+   `verify/` package, `egoblur/contract.py` (unused GPU-job scaffolding),
+   and a stray accidental file. Closed a `.gitignore` gap (`DO-NOT-SHIP/`
+   wasn't ignored; `.env` wasn't a wildcard).
+3. Moved `pose_prior.py`/`hand_prior.py`/`verify_yunet.py` (EgoBlur's
+   pre/post-redaction support code) into `egoblur/`, which is now a real
+   package with its own `cli.py` and a vendored `probe.py` (needed once the
+   actual imports were traced — those two files depend on `media/probe.py`,
+   which `egoblur/` can't import across the pipeline/egoblur dependency
+   isolation boundary).
+4. Moved the old `annotate`/`publish-hf`/`prepare-public-release`/
+   `approve-redaction` commands, `public_release.py`, `pack/`, and the two
+   preview-clip scripts (`scripts/` is now empty) into a new
+   `public-release-tools/` folder — named with the `-tools` suffix because
+   `public-release/` was already taken by the gitignored generated-output
+   directory. It has its own `cli.py` and imports the installed `egoannote`
+   package normally (no CUDA isolation need, unlike `egoblur/`).
+
+`egoannote-run` (the main CLI) shrank from 17 commands to 8: `curate-original`,
+`annotate-curated-original`, `batch-face-free-hands`,
+`preview-curated-hands`, `render-curated-annotations`,
+`preview-curated-caption-pilot`, `preview-curated-caption-segment`,
+`archive-drive`. The other 9 live in `egoblur/cli.py` (5) and
+`public-release-tools/cli.py` (4) now.
+
+`pipeline.py`'s `_read_private_manifest`/`_save_private_manifest`/
+`_atomic_json`/`_load_json`/`_file_binding`/`_sha256_file`/`_utc_now`/
+`_validate_video_id` stayed put and are imported by
+`public-release-tools/annotate_redacted.py` rather than duplicated —
+`archive_run` (which stayed) has to keep reading the exact manifest format
+that moved code writes, so the reader and writer can't become two
+independently-maintained copies.
+
+All 379 tests pass after every one of the 4 commits (each is independently
+green); `ruff` is clean on everything touched. README.md, AGENTS.md,
+`pipeline/README.md`, `egoblur/README.md`, the new
+`public-release-tools/README.md`, and the two affected `docs/*.md` files
+were all updated to match. `docs/PRIVATE_ORIGINAL_CURATED_PIPELINE.md`
+needed no changes — its commands never moved.
+
+Not touched, deliberately: the published HF dataset, the live
+`gh-pages` website, and two untracked owner-local files
+(`.release-staging/`, `preview_clips.csv`).
+
 ## Repository layout update — 2026-09-03
 
 The implementation was reorganized without deleting code. The installable
