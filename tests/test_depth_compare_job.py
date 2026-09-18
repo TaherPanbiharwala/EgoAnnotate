@@ -41,7 +41,7 @@ def test_lower_fps_selection_uses_source_pts_and_keeps_first_frame(depth_compare
     assert all(item["time_base"] == "1/30000" for item in selected)
 
 
-def test_redacted_attestation_rejects_fisheye_or_noncontinuous_source(depth_compare_job, tmp_path):
+def test_input_attestation_rejects_fisheye_or_noncontinuous_source(depth_compare_job, tmp_path):
     attestation = tmp_path / "input.json"
     attestation.write_text(
         json.dumps(
@@ -55,7 +55,7 @@ def test_redacted_attestation_rejects_fisheye_or_noncontinuous_source(depth_comp
         )
     )
     with pytest.raises(depth_compare_job.ExperimentError, match="fisheye"):
-        depth_compare_job.require_redacted_attestation(attestation, "a" * 64)
+        depth_compare_job.require_input_attestation(attestation, "a" * 64, False)
 
     attestation.write_text(
         json.dumps(
@@ -69,7 +69,35 @@ def test_redacted_attestation_rejects_fisheye_or_noncontinuous_source(depth_comp
         )
     )
     with pytest.raises(depth_compare_job.ExperimentError, match="continuous_child"):
-        depth_compare_job.require_redacted_attestation(attestation, "a" * 64)
+        depth_compare_job.require_input_attestation(attestation, "a" * 64, False)
+
+
+def test_unredacted_private_exception_requires_flag_hash_and_nonpublication(depth_compare_job, tmp_path):
+    attestation = tmp_path / "input.json"
+    attestation.write_text(
+        json.dumps(
+            {
+                "privacy_status": "private_unredacted_user_authorized",
+                "continuous_child": True,
+                "contains_privacy_cuts": False,
+                "input_sha256": "a" * 64,
+                "projection": "rectilinear",
+                "publication_permitted": False,
+                "private_exception_reason": "One-off private experiment explicitly authorized by the user.",
+            }
+        )
+    )
+    with pytest.raises(depth_compare_job.ExperimentError, match="allow-private-unredacted-input"):
+        depth_compare_job.require_input_attestation(attestation, "a" * 64, False)
+
+    accepted = depth_compare_job.require_input_attestation(attestation, "a" * 64, True)
+    assert accepted["privacy_status"] == "private_unredacted_user_authorized"
+
+    attestation.write_text(
+        json.dumps({**accepted, "publication_permitted": True})
+    )
+    with pytest.raises(depth_compare_job.ExperimentError, match="publication_permitted"):
+        depth_compare_job.require_input_attestation(attestation, "a" * 64, True)
 
 
 def test_calibration_never_fills_in_missing_principal_point(depth_compare_job, tmp_path):
@@ -204,6 +232,7 @@ def test_report_uses_terminal_complete_status(depth_compare_job, monkeypatch, tm
         },
         "run_fingerprint": {"metric_preview_range_m": [0.2, 8.0]},
         "camera_calibration": None,
+        "privacy": {"private_unredacted_exception": False},
     }
 
     report_path = depth_compare_job.write_report(tmp_path, manifest, {}, set())

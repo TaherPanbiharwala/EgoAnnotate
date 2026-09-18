@@ -21,7 +21,10 @@
 
 This is an *experiment*, not an EgoAnnotate annotation layer.  It accepts one
 already-redacted, continuous input child and writes only to a directory whose
-path contains ``private``.  There is intentionally no upload, Drive write,
+path contains ``private``.  An explicit, user-authorized
+``--allow-private-unredacted-input`` exception exists for a one-off private
+source-footage experiment; it is non-publishable and is recorded distinctly in
+every manifest and report.  There is intentionally no upload, Drive write,
 Hugging Face write, reconstruction, SLAM, segmentation, or VLM code here.
 
 Why the workers are separate environments
@@ -256,15 +259,41 @@ def load_json_object(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
-def require_redacted_attestation(attestation_path: Path, input_sha256: str) -> dict[str, Any]:
-    """Reject source footage rather than guessing whether pixels were redacted."""
+def require_input_attestation(attestation_path: Path, input_sha256: str,
+                              allow_private_unredacted_input: bool) -> dict[str, Any]:
+    """Bind the input to a truthful privacy status; never infer redaction from pixels."""
 
-    data = load_json_object(attestation_path, "redacted-input attestation")
+    data = load_json_object(attestation_path, "input attestation")
     acceptable_statuses = {"redacted_public_safe", "redacted", "face_free_public_safe"}
-    if data.get("privacy_status") not in acceptable_statuses:
+    private_exception_status = "private_unredacted_user_authorized"
+    privacy_status = data.get("privacy_status")
+    if privacy_status == private_exception_status:
+        if not allow_private_unredacted_input:
+            raise ExperimentError(
+                "input is explicitly marked private unredacted source footage. Refusing to process it "
+                "without --allow-private-unredacted-input."
+            )
+        if data.get("publication_permitted") is not False:
+            raise ExperimentError(
+                "private-unredacted attestation must set publication_permitted: false; this exception "
+                "can never be represented as public-safe input."
+            )
+        reason = data.get("private_exception_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ExperimentError(
+                "private-unredacted attestation requires a non-empty private_exception_reason."
+            )
+    elif privacy_status in acceptable_statuses:
+        if allow_private_unredacted_input:
+            raise ExperimentError(
+                "--allow-private-unredacted-input is only valid when privacy_status is "
+                "private_unredacted_user_authorized. Remove the flag for a redacted input."
+            )
+    else:
         raise ExperimentError(
             "input is not attested as already-redacted public-safe footage. Refusing to process "
-            "possible source footage; request a redacted continuous child instead."
+            "possible source footage; request a redacted continuous child, or use the explicit "
+            "private-unredacted exception with a truthful attestation."
         )
     if data.get("continuous_child") is not True:
         raise ExperimentError(
@@ -578,18 +607,23 @@ def compact_input_metadata(probe: dict[str, Any], input_path: Path, input_sha256
             "time_base": probe["time_base"],
         },
         "resolution": {"width": probe["width"], "height": probe["height"]},
-        "redacted_input_attestation": {
+        "input_attestation": {
             "path": str(attestation_path.resolve()),
             "sha256": sha256_file(attestation_path),
             "privacy_status": attestation.get("privacy_status"),
             "continuous_child": attestation.get("continuous_child"),
             "contains_privacy_cuts": attestation.get("contains_privacy_cuts"),
             "projection": attestation.get("projection"),
+            "publication_permitted": attestation.get("publication_permitted"),
+            "private_unredacted_exception": (
+                attestation.get("privacy_status") == "private_unredacted_user_authorized"
+            ),
         },
     }
 
 
-def build_run_fingerprint(args: argparse.Namespace, input_sha256: str, clock: list[dict[str, Any]],
+def build_run_fingerprint(args: argparse.Namespace, input_sha256: str, attestation_path: Path,
+                          attestation: dict[str, Any], clock: list[dict[str, Any]],
                           selected: list[dict[str, Any]], calibration: Calibration | None,
                           input_size: tuple[int, int, str]) -> dict[str, Any]:
     script_path = Path(__file__).resolve()
@@ -598,6 +632,9 @@ def build_run_fingerprint(args: argparse.Namespace, input_sha256: str, clock: li
         "job": JOB_NAME,
         "job_script_sha256": sha256_file(script_path),
         "input_sha256": input_sha256,
+        "input_attestation_sha256": sha256_file(attestation_path),
+        "input_privacy_status": attestation.get("privacy_status"),
+        "allow_private_unredacted_input": args.allow_private_unredacted_input,
         "source_clock_sha256": fingerprint(clock),
         "selected_clock_sha256": fingerprint(selected),
         "requested_models": model_specs(args.models),
@@ -630,7 +667,14 @@ def initial_run_manifest(run_id: str, run_dir: Path, input_metadata: dict[str, A
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "privacy": {
-            "input_required": "already-redacted public-safe continuous child",
+            "input_required": (
+                "explicit user-authorized private unredacted source-footage exception"
+                if input_metadata["input_attestation"]["private_unredacted_exception"]
+                else "already-redacted public-safe continuous child"
+            ),
+            "input_privacy_status": input_metadata["input_attestation"]["privacy_status"],
+            "private_unredacted_exception": input_metadata["input_attestation"]["private_unredacted_exception"],
+            "publication_permitted": input_metadata["input_attestation"]["publication_permitted"],
             "privacy_cuts_are_hard_boundaries": True,
             "uploads_implemented": False,
             "scope": "private one-clip depth-only experiment",
@@ -1728,13 +1772,21 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
         if calibration
         else "No calibrated intrinsics/FOV was supplied. Both models' metre-valued outputs are exploratory estimates, not measurements; this pilot has no ground-truth depth."
     )
+    private_unredacted_exception = manifest["privacy"].get("private_unredacted_exception", False)
+    scope_line = (
+        "- Scope: one private unredacted source-footage exception, explicitly user-authorized; "
+        "this run is non-publishable and has no uploads."
+        if private_unredacted_exception
+        else "- Scope: one private, already-redacted, continuous child; no SLAM, reconstruction, "
+        "segmentation, production annotations, VLM calls, or uploads."
+    )
     lines = [
         "# Experiment 1 — DA3 Metric Large vs MoGe-3 ViT-L",
         "",
         "## Scope and result status",
         "",
         f"- Status: **{manifest['status']}**",
-        "- Scope: one private, already-redacted, continuous child; no SLAM, reconstruction, segmentation, production annotations, VLM calls, or uploads.",
+        scope_line,
         f"- Source frames: {len(manifest['source_clock'])}; inferred frames: {len(selected)}.",
         f"- Input SHA-256: `{manifest['input']['sha256']}`",
         f"- Input resolution / rate: {manifest['input']['resolution']['width']}x{manifest['input']['resolution']['height']} at `{manifest['input']['frame_rate']['avg_frame_rate']}` fps.",
@@ -1748,6 +1800,11 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
         "| Model | Checkpoint | Immutable revision | License | Pinned source revision |",
         "| --- | --- | --- | --- | --- |",
     ]
+    if private_unredacted_exception:
+        lines.append(
+            "- Privacy restriction: input status is `private_unredacted_user_authorized`; do not publish, "
+            "share, or upload this input or any derived artifact."
+        )
     for model in models:
         provenance = summaries[model]["model_provenance"]
         lines.append(
@@ -1802,14 +1859,14 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
 def run_orchestrator(args: argparse.Namespace) -> int:
     input_path = args.input.resolve()
     output_dir = args.output_dir.resolve()
-    attestation_path = args.redacted_input_attestation.resolve()
+    attestation_path = args.input_attestation.resolve()
     ensure_private_path(input_path, "--input")
     ensure_private_path(output_dir, "--output-dir")
     validate_run_id(args.run_id)
     if not input_path.is_file():
         raise ExperimentError(f"input video does not exist: {input_path}")
     if not attestation_path.is_file():
-        raise ExperimentError(f"redacted-input attestation does not exist: {attestation_path}")
+        raise ExperimentError(f"input attestation does not exist: {attestation_path}")
     if args.metric_min_m <= 0 or args.metric_max_m <= args.metric_min_m:
         raise ExperimentError("metric scale requires 0 < --metric-min-m < --metric-max-m")
     if args.moge_resolution_level < 0 or args.moge_resolution_level > 9:
@@ -1822,7 +1879,9 @@ def run_orchestrator(args: argparse.Namespace) -> int:
     run_dir = output_dir / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     input_sha256 = sha256_file(input_path)
-    attestation = require_redacted_attestation(attestation_path, input_sha256)
+    attestation = require_input_attestation(
+        attestation_path, input_sha256, args.allow_private_unredacted_input
+    )
     probe = run_ffprobe(input_path, args.ffprobe_bin)
     # This durable preflight record exists before the expensive full decode or a model download.
     # It is the binding record for a Drive transfer even when a corrupt clip fails later.
@@ -1844,8 +1903,9 @@ def run_orchestrator(args: argparse.Namespace) -> int:
                 "time_base": probe["time_base"],
             },
             "resolution": {"width": probe["width"], "height": probe["height"]},
-            "redacted_input_attestation_path": str(attestation_path),
-            "redacted_input_attestation_sha256": sha256_file(attestation_path),
+            "input_attestation_path": str(attestation_path),
+            "input_attestation_sha256": sha256_file(attestation_path),
+            "input_privacy_status": attestation.get("privacy_status"),
         },
     }
     atomic_write_json(transfer_manifest_path, transfer_manifest)
@@ -1863,7 +1923,9 @@ def run_orchestrator(args: argparse.Namespace) -> int:
     selected = select_source_frames(clock, args.fps)
     keyframes = choose_keyframes(selected, args.keyframe_count)
     input_metadata = compact_input_metadata(probe, input_path, input_sha256, attestation_path, attestation, clock)
-    run_fingerprint = build_run_fingerprint(args, input_sha256, clock, selected, calibration, input_size)
+    run_fingerprint = build_run_fingerprint(
+        args, input_sha256, attestation_path, attestation, clock, selected, calibration, input_size
+    )
     manifest_path = run_dir / "experiment_manifest.json"
     manifest = load_or_create_run(
         manifest_path,
@@ -1953,8 +2015,16 @@ def run_orchestrator(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input", type=Path, help="private local path to one redacted continuous input child")
-    parser.add_argument("--redacted-input-attestation", type=Path, help="private JSON attesting the input is redacted/public-safe and continuous")
+    parser.add_argument("--input", type=Path, help="private local path to one continuous input clip")
+    parser.add_argument(
+        "--input-attestation", "--redacted-input-attestation", dest="input_attestation", type=Path,
+        help="private JSON binding input hash, continuity, projection, and truthful privacy status",
+    )
+    parser.add_argument(
+        "--allow-private-unredacted-input", action="store_true",
+        help=("allow only privacy_status=private_unredacted_user_authorized with publication_permitted=false; "
+              "records a non-publishable private exception"),
+    )
     parser.add_argument("--output-dir", type=Path, help="private parent directory for experiment run IDs")
     parser.add_argument("--run-id", help="private experiment run ID")
     parser.add_argument("--models", choices=["both", "da3", "moge3"], default="both", help="default: both")
@@ -1989,7 +2059,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ExperimentError("worker request model does not match --worker")
             worker_process(request)
             return 0
-        missing = [name for name in ("input", "redacted_input_attestation", "output_dir", "run_id") if getattr(args, name) is None]
+        missing = [name for name in ("input", "input_attestation", "output_dir", "run_id") if getattr(args, name) is None]
         if missing:
             raise ExperimentError(f"required arguments missing: {', '.join('--' + item.replace('_', '-') for item in missing)}")
         return run_orchestrator(args)

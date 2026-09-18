@@ -27,6 +27,31 @@ The job cannot prove redaction from pixels. It therefore requires a private side
 }
 ```
 
+### Explicit private-unredacted exception
+
+The default redacted gate remains mandatory for ordinary and batch runs. For a
+one-off experiment on private source footage only, an explicit user-authorized
+exception is available. It does **not** make the video or any derived artifact
+public-safe or publishable, and it never enables Drive/Hugging Face uploads.
+Use this only with the accompanying flag and this truthful private attestation:
+
+```json
+{
+  "schema_version": 1,
+  "privacy_status": "private_unredacted_user_authorized",
+  "continuous_child": true,
+  "contains_privacy_cuts": false,
+  "projection": "rectilinear",
+  "input_sha256": "<sha256 printed after rclone copy>",
+  "publication_permitted": false,
+  "private_exception_reason": "Explicit user-authorized, one-off private source-footage depth experiment."
+}
+```
+
+Do not call an unknown or fisheye source `rectilinear`; obtain an approved
+dewarped input if it is fisheye. The manifest and report mark this mode as a
+non-publishable private-unredacted exception.
+
 Use `"rectilinear"` only when that is the actual projection. If the input is known fisheye, the job stops rather than inventing lens correction; provide an approved redacted dewarped child. If the Drive file is unredacted source footage, do not run it—ask for a redacted child.
 
 ## Google Drive to RunPod (read-only transfer)
@@ -97,7 +122,7 @@ source /workspace/env.sh
 env PATH="/workspace/bin:$PATH" UV_CACHE_DIR=/workspace/.uv-cache \
   /workspace/bin/uv run jobs/30_depth_compare_da3_moge3.py \
   --input /workspace/private-input/experiment-1/<REDACTED_CHILD>.mp4 \
-  --redacted-input-attestation /workspace/private-input/experiment-1/<REDACTED_CHILD>.attestation.json \
+  --input-attestation /workspace/private-input/experiment-1/<REDACTED_CHILD>.attestation.json \
   --output-dir /workspace/private-experiments \
   --run-id experiment-1-da3-moge3 \
   --camera-calibration /workspace/private-input/experiment-1/<REDACTED_CHILD>.calibration.json \
@@ -118,7 +143,7 @@ mkdir -p /workspace/private-experiments/logs
 setsid nohup env PATH="/workspace/bin:$PATH" UV_CACHE_DIR=/workspace/.uv-cache \
   /workspace/bin/uv run jobs/30_depth_compare_da3_moge3.py \
   --input /workspace/private-input/experiment-1/<REDACTED_CHILD>.mp4 \
-  --redacted-input-attestation /workspace/private-input/experiment-1/<REDACTED_CHILD>.attestation.json \
+  --input-attestation /workspace/private-input/experiment-1/<REDACTED_CHILD>.attestation.json \
   --output-dir /workspace/private-experiments \
   --run-id experiment-1-da3-moge3 \
   --models both \
