@@ -739,7 +739,10 @@ def build_worker_request(run_dir: Path, model_name: str, input_path: Path,
             "export_format": "mini_npz (no upstream export written)",
             "intrinsics_policy": "pass K only when fx, fy, cx, cy are all supplied",
             "metric_conversion": "depth_m_estimate = canonical_depth * focal_px / 300",
-            "confidence": "upstream prediction.conf, stored float32 without probability calibration claim",
+            "confidence": (
+                "upstream prediction.conf stored float32 when emitted; if the pinned checkpoint emits none, "
+                "store an all-NaN float32 unavailable sentinel plus confidence_available=0. Never fabricate confidence."
+            ),
             "precision_policy": "Depth Anything 3 upstream automatically selects bf16 when supported, else fp16; --precision controls MoGe only",
         }
     else:
@@ -831,7 +834,7 @@ def validate_worker_result(path: Path, model_name: str) -> dict[str, Any]:
             keys = set(archive.files)
             required = {"frame_index", "pts", "depth_m_estimate"}
             if model_name == "da3":
-                required |= {"confidence"}
+                required |= {"confidence", "confidence_available"}
             elif model_name == "moge3":
                 required |= {"valid_mask", "intrinsics_used_normalized", "intrinsics_predicted_normalized"}
             missing = required - keys
@@ -963,6 +966,40 @@ def tensor_to_numpy(value: Any) -> Any:
     return value.detach().float().cpu().numpy()
 
 
+def da3_confidence_for_storage(upstream_confidence: Any, canonical_depth_shape: tuple[int, int],
+                               source_width: int, source_height: int) -> tuple[Any, str, bool]:
+    """Keep DA3's absent confidence explicit instead of inventing a proxy.
+
+    ``DA3METRIC-LARGE`` can return ``Prediction.conf is None`` because its
+    metric checkpoint does not necessarily expose a depth-confidence head.
+    The numeric archive still has a shape-aligned ``confidence`` field for a
+    stable artifact contract, but an all-NaN map is an unavailable sentinel,
+    not a low-confidence estimate. ``confidence_available`` and the frame
+    manifest carry that distinction to previews and reports.
+    """
+
+    import numpy as np
+
+    if upstream_confidence is None:
+        return (
+            np.full((source_height, source_width), np.nan, dtype=np.float32),
+            "upstream_not_emitted_all_nan_sentinel",
+            False,
+        )
+    import cv2
+
+    confidence = np.asarray(upstream_confidence, dtype=np.float32)
+    if confidence.shape != canonical_depth_shape:
+        raise ExperimentError(
+            "DA3 confidence shape does not match canonical depth: "
+            f"{confidence.shape} != {canonical_depth_shape}"
+        )
+    confidence = upsample_to_source(confidence, source_width, source_height, cv2.INTER_LINEAR).astype(np.float32)
+    if not np.isfinite(confidence).any():
+        return confidence, "upstream_emitted_no_finite_values", False
+    return confidence, "upstream_prediction_conf", True
+
+
 def infer_da3(model: Any, frame_bgr: Any, source_width: int, source_height: int,
               calibration: Calibration | None) -> tuple[dict[str, Any], dict[str, Any]]:
     import cv2
@@ -987,9 +1024,11 @@ def infer_da3(model: Any, frame_bgr: Any, source_width: int, source_height: int,
 
     canonical_depth = np.asarray(prediction.depth[0], dtype=np.float32)
     depth_height, depth_width = canonical_depth.shape
-    confidence = np.asarray(prediction.conf[0], dtype=np.float32)
     raw_depth = upsample_to_source(canonical_depth, source_width, source_height, cv2.INTER_LINEAR).astype(np.float32)
-    confidence = upsample_to_source(confidence, source_width, source_height, cv2.INTER_LINEAR).astype(np.float32)
+    upstream_confidence = prediction.conf[0] if getattr(prediction, "conf", None) is not None else None
+    confidence, confidence_status, confidence_available = da3_confidence_for_storage(
+        upstream_confidence, canonical_depth.shape, source_width, source_height
+    )
     predicted_intrinsics = getattr(prediction, "intrinsics", None)
     predicted_intrinsics_array = (
         np.asarray(predicted_intrinsics[0], dtype=np.float32)
@@ -1016,6 +1055,7 @@ def infer_da3(model: Any, frame_bgr: Any, source_width: int, source_height: int,
         "depth_m_estimate": depth_m,
         "depth_canonical": raw_depth,
         "confidence": confidence,
+        "confidence_available": np.asarray([confidence_available], dtype=np.uint8),
         "intrinsics_predicted": predicted_intrinsics_array,
         "intrinsics_supplied": camera_k if camera_k is not None else np.full((3, 3), np.nan, dtype=np.float32),
         "focal_px_used": np.asarray([focal_px], dtype=np.float32),
@@ -1029,6 +1069,8 @@ def infer_da3(model: Any, frame_bgr: Any, source_width: int, source_height: int,
         "canonical_depth_grid_resolution": {"width": depth_width, "height": depth_height},
         "stored_map_resolution": {"width": source_width, "height": source_height},
         "effective_precision": "bf16" if torch.cuda.is_bf16_supported() else "fp16",
+        "confidence_status": confidence_status,
+        "confidence_available": confidence_available,
     }
     return arrays, record
 
@@ -1475,22 +1517,24 @@ def annotate_panel(image: Any, title: str, subtitle: str | None = None) -> Any:
     return panel
 
 
-def quality_overlay(da3_confidence: Any, moge_valid: Any) -> Any:
+def quality_overlay(da3_confidence: Any, moge_valid: Any, da3_confidence_available: bool) -> Any:
     import cv2
     import numpy as np
 
     finite = da3_confidence[np.isfinite(da3_confidence)]
-    if finite.size >= 4:
+    if da3_confidence_available and finite.size >= 4:
         low, high = np.percentile(finite, [2.0, 98.0])
         high = max(float(high), float(low) + 1e-6)
         values = np.clip((da3_confidence - low) / (high - low), 0.0, 1.0)
+        confidence = cv2.applyColorMap((values * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+        label = "DA3 model confidence | RED = MoGe invalid"
     else:
-        values = np.zeros_like(da3_confidence, dtype=np.float32)
-    confidence = cv2.applyColorMap((values * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+        confidence = np.full((*da3_confidence.shape, 3), 80, dtype=np.uint8)
+        label = "DA3 confidence unavailable | RED = MoGe invalid"
     invalid = ~moge_valid.astype(bool)
     confidence[invalid] = (0, 0, 255)
-    cv2.putText(confidence, "DA3 model confidence | RED = MoGe invalid", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(confidence, "DA3 model confidence | RED = MoGe invalid", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (20, 20, 20), 1, cv2.LINE_AA)
+    cv2.putText(confidence, label, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(confidence, label, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (20, 20, 20), 1, cv2.LINE_AA)
     return confidence
 
 
@@ -1598,6 +1642,7 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
     time_base = Fraction(probe["time_base"])
     rate = fraction_from_text(probe["avg_frame_rate"], "avg_frame_rate")
     exploratory_by_model: dict[str, bool] = {}
+    da3_confidence_available = True
     for model_name in models:
         worker = load_json_object(worker_state_path(run_dir, model_name), f"{model_name} worker manifest")
         frame_details = list(worker.get("completed_frames", {}).values())
@@ -1605,6 +1650,11 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
             detail.get("metric_status") == "exploratory_metres_estimate_no_calibration"
             for detail in frame_details
         )
+        if model_name == "da3":
+            da3_confidence_available = bool(frame_details) and all(
+                detail.get("confidence_status") == "upstream_prediction_conf"
+                for detail in frame_details
+            )
     previews_dir = run_dir / "previews"
     targets: dict[str, Path] = {}
     for model_name in models:
@@ -1664,7 +1714,12 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
             if "comparison_metric" in writers:
                 da3 = model_data["da3"]
                 moge = model_data["moge3"]
-                quality = quality_overlay(da3["confidence"], moge["valid_mask"])
+                quality = quality_overlay(da3["confidence"], moge["valid_mask"], da3_confidence_available)
+                quality_subtitle = (
+                    "DA3 confidence; red = MoGe invalid"
+                    if da3_confidence_available
+                    else "DA3 unavailable; red = MoGe invalid"
+                )
                 metric_tile = tile_panels(
                     [
                         annotate_panel(rgb_bgr, "Redacted RGB", "Source PTS preserved"),
@@ -1680,7 +1735,7 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
                             f"Fixed scale {metric_min_m:.2f}-{metric_max_m:.2f} m"
                             + (" | exploratory, no calibration" if exploratory_by_model["moge3"] else ""),
                         ),
-                        annotate_panel(quality, "Quality / confidence", "DA3 confidence; red = MoGe invalid"),
+                        annotate_panel(quality, "Quality / confidence", quality_subtitle),
                     ],
                     preview_max_width,
                 )
@@ -1697,7 +1752,7 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
                             "MoGe-3 structural only",
                             "Per-frame normalized; not metric comparison",
                         ),
-                        annotate_panel(quality, "Quality / confidence", "DA3 confidence; red = MoGe invalid"),
+                        annotate_panel(quality, "Quality / confidence", quality_subtitle),
                     ],
                     preview_max_width,
                 )
@@ -1768,6 +1823,7 @@ def model_report_summary(run_dir: Path, model_name: str, selected: list[dict[str
     peak_allocated = [int(frame["cuda_peak_allocated_bytes"]) for frame in frames]
     peak_reserved = [int(frame["cuda_peak_reserved_bytes"]) for frame in frames]
     output_bytes = sum(int(frame["size_bytes"]) for frame in frames)
+    confidence_statuses = [str(frame.get("confidence_status", "not_applicable")) for frame in frames]
     return {
         "worker_manifest": str(worker_state_path(run_dir, model_name)),
         "model_provenance": state["model_provenance"],
@@ -1776,6 +1832,11 @@ def model_report_summary(run_dir: Path, model_name: str, selected: list[dict[str
         "cuda_peak_memory_bytes": {"max_allocated": max(peak_allocated) if peak_allocated else None, "max_reserved": max(peak_reserved) if peak_reserved else None},
         "numeric_output_size_bytes": output_bytes,
         "temporal_flicker_proxy": compute_temporal_flicker(run_dir, model_name, selected),
+        "confidence": {
+            "statuses": sorted(set(confidence_statuses)),
+            "available_frame_count": sum(frame.get("confidence_available") is True for frame in frames),
+            "unavailable_frame_count": sum(frame.get("confidence_available") is not True for frame in frames),
+        } if model_name == "da3" else None,
     }
 
 
@@ -1856,6 +1917,19 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
                 f"- Temporal-flicker proxy: {summary['temporal_flicker_proxy']['median_m']!r} m median / {summary['temporal_flicker_proxy']['p95_m']!r} m p95 over {summary['temporal_flicker_proxy']['pair_count']} adjacent selected-frame pairs. This proxy includes true camera/object motion.",
             ]
         )
+        if model == "da3":
+            confidence = summary["confidence"]
+            if confidence["unavailable_frame_count"]:
+                lines.append(
+                    "- DA3 confidence: unavailable for "
+                    f"{confidence['unavailable_frame_count']}/{len(selected)} frame(s) "
+                    f"({', '.join(confidence['statuses'])}). The float32 `confidence` maps use an all-NaN "
+                    "sentinel where upstream emitted no usable confidence; the quality panel only shows MoGe validity there."
+                )
+            else:
+                lines.append(
+                    "- DA3 confidence: upstream model output was present for every frame; values are not claimed to be calibrated probabilities."
+                )
     lines.extend(
         [
             "",

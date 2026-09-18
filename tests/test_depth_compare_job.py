@@ -35,6 +35,18 @@ def test_exact_models_and_immutable_revisions_are_pinned(depth_compare_job):
     assert "addict>=2.4,<3" in depth_compare_job.worker_dependencies("da3")
 
 
+def test_da3_absent_confidence_is_an_explicit_unavailable_sentinel(depth_compare_job):
+    import numpy as np
+
+    confidence, status, available = depth_compare_job.da3_confidence_for_storage(None, (2, 3), 6, 4)
+
+    assert confidence.dtype == np.float32
+    assert confidence.shape == (4, 6)
+    assert not np.isfinite(confidence).any()
+    assert status == "upstream_not_emitted_all_nan_sentinel"
+    assert available is False
+
+
 def test_lower_fps_selection_uses_source_pts_and_keeps_first_frame(depth_compare_job):
     selected = depth_compare_job.select_source_frames(_clock(depth_compare_job), 10.0)
     assert selected[0]["frame_index"] == 0
@@ -232,6 +244,11 @@ def test_report_uses_terminal_complete_status(depth_compare_job, monkeypatch, tm
         "cuda_peak_memory_bytes": {"max_allocated": 1, "max_reserved": 2},
         "numeric_output_size_bytes": 3,
         "temporal_flicker_proxy": {"median_m": 0.1, "p95_m": 0.2, "pair_count": 1},
+        "confidence": {
+            "statuses": ["upstream_not_emitted_all_nan_sentinel"],
+            "available_frame_count": 0,
+            "unavailable_frame_count": 1,
+        },
     }
     monkeypatch.setattr(depth_compare_job, "model_report_summary", lambda *args: summary)
     manifest = {

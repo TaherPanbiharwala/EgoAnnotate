@@ -171,16 +171,16 @@ Re-run the identical command after an interruption to resume verified frame arch
   experiment_manifest.json              run-level provenance and completion status
   worker-requests/                      private immutable worker requests
   workers/{da3,moge3}/worker_manifest.json
-  arrays/da3/frame_XXXXXXXX.npz         float32 depth, canonical depth, confidence
+  arrays/da3/frame_XXXXXXXX.npz         float32 depth, canonical depth, confidence + availability flag
   arrays/moge3/frame_XXXXXXXX.npz       float32 depth, valid mask, predicted/used intrinsics
   keyframes/moge3/                      selected point/normal maps and optional estimated PLYs
   previews/                             metric, structural-only, and 2x2 comparison MP4s
   REPORT.md                             concise performance/provenance/review report
 ```
 
-All `.npz` archives use lossless ZIP compression. They carry source frame index and exact PTS/time base. DA3 confidence is the model-provided output (not asserted to be a calibrated probability). MoGe point clouds are camera-space model estimates—never a ground-truth reconstruction.
+All `.npz` archives use lossless ZIP compression. They carry source frame index and exact PTS/time base. DA3 confidence is saved when the pinned checkpoint emits it (and is not asserted to be a calibrated probability). Some `DA3METRIC-LARGE` calls emit no native confidence map; in that case `confidence` is an all-`NaN` float32 unavailable sentinel and `confidence_available=0`. It is never replaced with a made-up proxy. MoGe point clouds are camera-space model estimates—never a ground-truth reconstruction.
 
-The side-by-side metric video is: redacted RGB, DA3 fixed-range metric depth, MoGe fixed-range metric depth, and DA3-confidence/MoGe-validity quality overlay. The structural-only video is clearly watermarked as per-frame normalized and not a metric comparison. Every preview is decoded after encode before the run can be marked complete.
+The side-by-side metric video is: redacted RGB, DA3 fixed-range metric depth, MoGe fixed-range metric depth, and DA3-confidence/MoGe-validity quality overlay. If DA3 has no native confidence, that panel is visibly labelled unavailable and shows only MoGe invalid pixels in red. The structural-only video is clearly watermarked as per-frame normalized and not a metric comparison. Every preview is decoded after encode before the run can be marked complete.
 
 ## Review checklist
 
