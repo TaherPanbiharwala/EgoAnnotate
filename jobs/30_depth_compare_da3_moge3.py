@@ -763,24 +763,36 @@ def build_worker_request(run_dir: Path, model_name: str, input_path: Path,
     return path
 
 
-def run_worker_subprocess(worker_request: Path, model_name: str) -> None:
-    uv = shutil.which("uv")
-    if uv is None:
-        raise ExperimentError("uv is not on PATH; run /workspace/egoblur/runpod_setup.sh first")
-    command = [
+def build_worker_command(uv: str, worker_request: Path, model_name: str) -> list[str]:
+    """Build a uv invocation with every uv option before the script operand.
+
+    ``uv run`` stops parsing its own options once it sees the script path.  In
+    particular, putting ``--with`` after that path silently forwards it to this
+    script, where argparse correctly rejects it.  Keep this pure so the
+    ordering contract is testable without launching a GPU worker.
+    """
+
+    return [
         uv,
         "run",
         "--isolated",
-        "--script",
-        str(Path(__file__).resolve()),
         "--with",
         dependencies_for_worker(model_name),
+        "--script",
+        str(Path(__file__).resolve()),
         "--",
         "--worker",
         model_name,
         "--worker-request",
         str(worker_request),
     ]
+
+
+def run_worker_subprocess(worker_request: Path, model_name: str) -> None:
+    uv = shutil.which("uv")
+    if uv is None:
+        raise ExperimentError("uv is not on PATH; run /workspace/egoblur/runpod_setup.sh first")
+    command = build_worker_command(uv, worker_request, model_name)
     completed = subprocess.run(command, text=True)
     if completed.returncode != 0:
         raise ExperimentError(f"{model_name} worker exited {completed.returncode}; inspect its private worker manifest")

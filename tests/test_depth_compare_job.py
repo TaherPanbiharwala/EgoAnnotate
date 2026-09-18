@@ -41,6 +41,18 @@ def test_lower_fps_selection_uses_source_pts_and_keeps_first_frame(depth_compare
     assert all(item["time_base"] == "1/30000" for item in selected)
 
 
+def test_worker_command_keeps_uv_options_before_the_script_operand(depth_compare_job, tmp_path):
+    request = tmp_path / "private-worker-request.json"
+    command = depth_compare_job.build_worker_command("/workspace/bin/uv", request, "da3")
+
+    script_index = command.index(str(depth_compare_job.Path(depth_compare_job.__file__).resolve()))
+    with_index = command.index("--with")
+    separator_index = command.index("--")
+    assert with_index < script_index < separator_index
+    assert command[with_index + 1] == depth_compare_job.dependencies_for_worker("da3")
+    assert command[separator_index + 1:] == ["--worker", "da3", "--worker-request", str(request)]
+
+
 def test_input_attestation_rejects_fisheye_or_noncontinuous_source(depth_compare_job, tmp_path):
     attestation = tmp_path / "input.json"
     attestation.write_text(
