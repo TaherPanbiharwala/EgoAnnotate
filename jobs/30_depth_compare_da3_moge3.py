@@ -557,6 +557,19 @@ def dependencies_for_worker(model_name: str) -> str:
     raise ExperimentError(f"unknown worker model {model_name!r}")
 
 
+def worker_dependencies(model_name: str) -> list[str]:
+    """Return pinned model source plus upstream omissions needed at import time."""
+
+    dependencies = [dependencies_for_worker(model_name)]
+    if model_name == "da3":
+        # The pinned DA3 package imports ``addict.Dict`` from model/da3.py but
+        # omits addict from its project dependency metadata.  Declare the
+        # missing runtime dependency here rather than relying on a pod-global
+        # install or silently modifying the pinned upstream source.
+        dependencies.append("addict>=2.4,<3")
+    return dependencies
+
+
 def source_model_metadata(model_name: str) -> dict[str, Any]:
     if model_name == "da3":
         return {
@@ -566,7 +579,7 @@ def source_model_metadata(model_name: str) -> dict[str, Any]:
             "license": "Apache-2.0",
             "code_repository": DA3_CODE_REPOSITORY,
             "code_revision": DA3_CODE_REVISION,
-            "worker_dependency": dependencies_for_worker("da3"),
+            "worker_dependencies": worker_dependencies("da3"),
         }
     if model_name == "moge3":
         return {
@@ -576,7 +589,7 @@ def source_model_metadata(model_name: str) -> dict[str, Any]:
             "license": "MIT",
             "code_repository": MOGE_CODE_REPOSITORY,
             "code_revision": MOGE_CODE_REVISION,
-            "worker_dependency": dependencies_for_worker("moge3"),
+            "worker_dependencies": worker_dependencies("moge3"),
         }
     raise ExperimentError(f"unknown model {model_name!r}")
 
@@ -774,19 +787,24 @@ def build_worker_command(uv: str, worker_request: Path, model_name: str) -> list
     launching a GPU worker.
     """
 
-    return [
+    command = [
         uv,
         "run",
         "--isolated",
-        "--with",
-        dependencies_for_worker(model_name),
-        "--script",
-        str(Path(__file__).resolve()),
-        "--worker",
-        model_name,
-        "--worker-request",
-        str(worker_request),
     ]
+    for dependency in worker_dependencies(model_name):
+        command.extend(["--with", dependency])
+    command.extend(
+        [
+            "--script",
+            str(Path(__file__).resolve()),
+            "--worker",
+            model_name,
+            "--worker-request",
+            str(worker_request),
+        ]
+    )
+    return command
 
 
 def run_worker_subprocess(worker_request: Path, model_name: str) -> None:

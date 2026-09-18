@@ -32,6 +32,7 @@ def test_exact_models_and_immutable_revisions_are_pinned(depth_compare_job):
     assert len(depth_compare_job.MOGE_MODEL_REVISION) == 40
     assert "@" + depth_compare_job.DA3_CODE_REVISION in depth_compare_job.dependencies_for_worker("da3")
     assert "@" + depth_compare_job.MOGE_CODE_REVISION in depth_compare_job.dependencies_for_worker("moge3")
+    assert "addict>=2.4,<3" in depth_compare_job.worker_dependencies("da3")
 
 
 def test_lower_fps_selection_uses_source_pts_and_keeps_first_frame(depth_compare_job):
@@ -46,11 +47,11 @@ def test_worker_command_keeps_uv_options_before_the_script_operand(depth_compare
     command = depth_compare_job.build_worker_command("/workspace/bin/uv", request, "da3")
 
     script_index = command.index(str(depth_compare_job.Path(depth_compare_job.__file__).resolve()))
-    with_index = command.index("--with")
+    with_indexes = [index for index, value in enumerate(command) if value == "--with"]
     worker_index = command.index("--worker")
-    assert with_index < script_index < worker_index
+    assert with_indexes and max(with_indexes) < script_index < worker_index
     assert "--" not in command
-    assert command[with_index + 1] == depth_compare_job.dependencies_for_worker("da3")
+    assert [command[index + 1] for index in with_indexes] == depth_compare_job.worker_dependencies("da3")
     assert command[worker_index:] == ["--worker", "da3", "--worker-request", str(request)]
 
 
