@@ -47,10 +47,11 @@ def test_worker_command_keeps_uv_options_before_the_script_operand(depth_compare
 
     script_index = command.index(str(depth_compare_job.Path(depth_compare_job.__file__).resolve()))
     with_index = command.index("--with")
-    separator_index = command.index("--")
-    assert with_index < script_index < separator_index
+    worker_index = command.index("--worker")
+    assert with_index < script_index < worker_index
+    assert "--" not in command
     assert command[with_index + 1] == depth_compare_job.dependencies_for_worker("da3")
-    assert command[separator_index + 1:] == ["--worker", "da3", "--worker-request", str(request)]
+    assert command[worker_index:] == ["--worker", "da3", "--worker-request", str(request)]
 
 
 def test_input_attestation_rejects_fisheye_or_noncontinuous_source(depth_compare_job, tmp_path):

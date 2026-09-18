@@ -768,8 +768,10 @@ def build_worker_command(uv: str, worker_request: Path, model_name: str) -> list
 
     ``uv run`` stops parsing its own options once it sees the script path.  In
     particular, putting ``--with`` after that path silently forwards it to this
-    script, where argparse correctly rejects it.  Keep this pure so the
-    ordering contract is testable without launching a GPU worker.
+    script, where argparse correctly rejects it.  Conversely, this ``uv``
+    version forwards a literal ``--`` too, so worker arguments must follow the
+    script path directly. Keep this pure so that contract is testable without
+    launching a GPU worker.
     """
 
     return [
@@ -780,7 +782,6 @@ def build_worker_command(uv: str, worker_request: Path, model_name: str) -> list
         dependencies_for_worker(model_name),
         "--script",
         str(Path(__file__).resolve()),
-        "--",
         "--worker",
         model_name,
         "--worker-request",
