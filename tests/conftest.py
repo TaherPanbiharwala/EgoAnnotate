@@ -56,6 +56,7 @@ def blur_review():
 
 @pytest.fixture(scope="session")
 def depth_compare_job():
-    """The private GPU comparison job has stdlib-only module imports by design."""
+    """The private DA3 GPU job has stdlib-only module imports by design."""
 
-    return _load("jobs/30_depth_compare_da3_moge3.py", "depth_compare_job")
+    return _load("jobs/30_depth_da3_metric.py", "depth_compare_job")
+

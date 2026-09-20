@@ -17,7 +17,7 @@
 # torch = { index = "pytorch-cu128" }
 # torchvision = { index = "pytorch-cu128" }
 # ///
-"""Private one-clip GPU comparison: Depth Anything 3 Metric Large vs MoGe-3.
+"""Private one-clip GPU pilot: Depth Anything 3 Metric Large only.
 
 This is an *experiment*, not an EgoAnnotate annotation layer.  It accepts one
 already-redacted, continuous input child and writes only to a directory whose
@@ -27,15 +27,10 @@ source-footage experiment; it is non-publishable and is recorded distinctly in
 every manifest and report.  There is intentionally no upload, Drive write,
 Hugging Face write, reconstruction, SLAM, segmentation, or VLM code here.
 
-Why the workers are separate environments
-------------------------------------------
-DA3's pinned upstream package declares ``numpy<2`` while MoGe-3's declares
-``numpy>=2``.  A single environment would either fail resolution or silently
-override one model's declared dependency constraint.  The PEP 723 script is
-therefore a small private orchestrator.  It invokes this exact file once in a
-DA3 environment and once in a MoGe environment, each via ``uv run --script
---with`` and an immutable Git revision.  The two workers exchange only
-lossless private ``.npz`` arrays and JSON state under the run directory.
+The PEP 723 script is a small private orchestrator. It invokes this exact file
+once in an isolated DA3 environment at an immutable Git revision. The worker
+writes only lossless private ``.npz`` arrays and JSON state under the run
+directory.
 
 Completion semantics are deliberately strict.  A run is ``complete`` only
 after every selected source frame has a readable array for every requested
@@ -48,18 +43,16 @@ inference setting refuses to mix outputs under the same run ID.
 Depth semantics
 ---------------
 DA3 Metric Large exposes canonical depth.  Its upstream FAQ specifies
-``metres = focal_px * net_output / 300``.  Supplied calibrated focal length is
-used for that conversion.  Without it the script uses DA3's inferred focal
-when available (otherwise the resized frame width) only to make an explicitly
-labelled *exploratory* metre estimate; it is never claimed as a measurement.
-MoGe produces metric estimates directly, but these remain estimates without
-ground-truth validation.  If supplied GoPro FOV/calibration exists, MoGe is
-conditioned on it and additionally run once without it to retain its
-independently predicted intrinsics for comparison.
-
+``metres = focal_px * net_output / 300``.  A supplied approved calibration is
+used for that conversion.  For this pilot, ``--camera-segment 1`` or ``2`` can
+also use the recorded Linear GoPro FOV to derive an approximate focal, but the
+result remains explicitly labelled *exploratory*.  Segment ``3`` deliberately
+supplies no pinhole intrinsics because its Wide/EIS geometry is not known.
+Without a focal fact the script uses DA3's inferred focal when available
+(otherwise the resized frame width), again only for an exploratory estimate.
 Run from a Linux CUDA RunPod volume, for example:
 
-    /workspace/bin/uv run jobs/30_depth_compare_da3_moge3.py --help
+    /workspace/bin/uv run jobs/30_depth_da3_metric.py --help
 
 The no-GPU ``--dry-run`` performs the privacy attestation, hash, ffprobe and
 full-decode preflight, creates a private planned manifest, and exits before
@@ -88,7 +81,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
-JOB_NAME = "experiment-1-da3-moge3"
+JOB_NAME = "experiment-1-da3-metric-large"
 
 # Immutable upstream sources resolved on 2026-09-18.  Do not replace these
 # with branch names: a rerun needs the same code even after upstream moves.
@@ -96,14 +89,39 @@ DA3_MODEL_ID = "depth-anything/DA3METRIC-LARGE"
 DA3_MODEL_REVISION = "4010e39f3634a45bc60553321fb49fb760bd594e"
 DA3_CODE_REPOSITORY = "https://github.com/ByteDance-Seed/Depth-Anything-3.git"
 DA3_CODE_REVISION = "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
-MOGE_MODEL_ID = "Ruicheng/moge-3-vitl"
-MOGE_MODEL_REVISION = "184008f877d7ad1ad4c2cd2182a9bd1f63d0e5be"
-MOGE_CODE_REPOSITORY = "https://github.com/microsoft/MoGe.git"
-MOGE_CODE_REVISION = "74fbce054ebed49800de42d0ad0e83495065719a"
 
 DEFAULT_METRIC_MIN_M = 0.20
 DEFAULT_METRIC_MAX_M = 8.00
 DEFAULT_KEYFRAME_COUNT = 6
+CALIBRATION_APPROVAL_STATUS = "approved_cross_probe_consensus_v1"
+CONDITION_TYPE_APPROVED_CALIBRATION = "approved_calibration"
+CONDITION_TYPE_METADATA_FOV = "metadata_fov_exploratory"
+CONDITION_TYPE_METADATA_NO_PINHOLE = "metadata_no_pinhole_exploratory"
+# These are the three simple groups in the owner's private GoPro inventory.
+# Segment is an explicit operator selection, not an inferred calibration.
+CAMERA_SEGMENTS: dict[str, dict[str, Any]] = {
+    "1": {
+        "label": "Linear, electronic stabilization off, 1920x1080, 120000/1001 fps (11 clips)",
+        "projection": "rectilinear",
+        "diagonal_fov_deg": 100.583557128906,
+        "expected_width": 1920,
+        "expected_height": 1080,
+    },
+    "2": {
+        "label": "Linear, electronic stabilization off, 1920x1080, 30000/1001 fps (3 clips)",
+        "projection": "rectilinear",
+        "diagonal_fov_deg": 100.583557128906,
+        "expected_width": 1920,
+        "expected_height": 1080,
+    },
+    "3": {
+        "label": "Wide with electronic stabilization on, 1920x1080, 30000/1001 fps (1 clip)",
+        "projection": "wide_stabilized_unknown_pinhole",
+        "diagonal_fov_deg": None,
+        "expected_width": 1920,
+        "expected_height": 1080,
+    },
+}
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -113,10 +131,14 @@ class ExperimentError(RuntimeError):
 
 @dataclass(frozen=True)
 class Calibration:
-    """Only camera facts supplied by the operator; no lens facts are invented."""
+    """Approved calibration or explicitly exploratory metadata conditioning."""
 
     source_path: str
     source_sha256: str
+    condition_type: str
+    camera_segment: str | None
+    approval_status: str
+    camera_setup_fingerprint_sha256: str
     projection: str
     fx: float | None
     fy: float | None
@@ -139,6 +161,10 @@ class Calibration:
         return {
             "source_path": self.source_path,
             "source_sha256": self.source_sha256,
+            "condition_type": self.condition_type,
+            "camera_segment": self.camera_segment,
+            "approval_status": self.approval_status,
+            "camera_setup_fingerprint_sha256": self.camera_setup_fingerprint_sha256,
             "projection": self.projection,
             "fx_px": self.fx,
             "fy_px": self.fy,
@@ -323,6 +349,15 @@ def load_calibration(path: Path | None, width: int, height: int) -> Calibration 
     if path is None:
         return None
     data = load_json_object(path, "camera calibration")
+    approval_status = data.get("approval_status")
+    if approval_status != CALIBRATION_APPROVAL_STATUS:
+        raise ExperimentError(
+            "camera calibration is not an approved COLMAP cross-probe consensus; "
+            "do not pass a raw COLMAP cameras.txt estimate to DA3"
+        )
+    setup_fingerprint = data.get("camera_setup_fingerprint_sha256")
+    if not isinstance(setup_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", setup_fingerprint):
+        raise ExperimentError("camera calibration must contain a valid camera_setup_fingerprint_sha256")
     projection = data.get("projection")
     if projection not in {"rectilinear", "dewarped_rectilinear"}:
         raise ExperimentError(
@@ -366,6 +401,10 @@ def load_calibration(path: Path | None, width: int, height: int) -> Calibration 
     return Calibration(
         source_path=str(path.resolve()),
         source_sha256=sha256_file(path),
+        condition_type=CONDITION_TYPE_APPROVED_CALIBRATION,
+        camera_segment=None,
+        approval_status=approval_status,
+        camera_setup_fingerprint_sha256=setup_fingerprint,
         projection=projection,
         fx=fx,
         fy=fy,
@@ -374,6 +413,62 @@ def load_calibration(path: Path | None, width: int, height: int) -> Calibration 
         fov_x_deg=fov_x_deg,
         image_width=int(calibration_width) if calibration_width is not None else None,
         image_height=int(calibration_height) if calibration_height is not None else None,
+    )
+
+
+def metadata_conditioning_for_segment(segment: str, width: int, height: int) -> Calibration:
+    """Build a deliberately exploratory K from the recorded GoPro FOV group.
+
+    This is a convenience mode for the private DA3 pilot. It is not an
+    independently approved camera calibration and must never produce a
+    measurement claim. Wide/stabilized segment 3 is recorded but intentionally
+    passes no pinhole intrinsics to DA3.
+    """
+
+    profile = CAMERA_SEGMENTS.get(segment)
+    if profile is None:
+        raise ExperimentError(f"unknown --camera-segment {segment!r}")
+    if (width, height) != (profile["expected_width"], profile["expected_height"]):
+        raise ExperimentError(
+            f"camera segment {segment} expects {profile['expected_width']}x{profile['expected_height']} input, "
+            f"not {width}x{height}; omit the segment rather than rescaling camera facts"
+        )
+    diagonal_fov = profile["diagonal_fov_deg"]
+    profile_digest = fingerprint(profile)
+    if diagonal_fov is None:
+        return Calibration(
+            source_path=f"built-in-camera-segment-{segment}",
+            source_sha256=profile_digest,
+            condition_type=CONDITION_TYPE_METADATA_NO_PINHOLE,
+            camera_segment=segment,
+            approval_status="not_applicable",
+            camera_setup_fingerprint_sha256=f"segment-{segment}",
+            projection=str(profile["projection"]),
+            fx=None,
+            fy=None,
+            cx=None,
+            cy=None,
+            fov_x_deg=None,
+            image_width=width,
+            image_height=height,
+        )
+    focal = math.hypot(width, height) / (2.0 * math.tan(math.radians(float(diagonal_fov)) / 2.0))
+    fov_x_deg = math.degrees(2.0 * math.atan(width / (2.0 * focal)))
+    return Calibration(
+        source_path=f"built-in-camera-segment-{segment}",
+        source_sha256=profile_digest,
+        condition_type=CONDITION_TYPE_METADATA_FOV,
+        camera_segment=segment,
+        approval_status="not_applicable",
+        camera_setup_fingerprint_sha256=f"segment-{segment}",
+        projection=str(profile["projection"]),
+        fx=focal,
+        fy=focal,
+        cx=width / 2.0,
+        cy=height / 2.0,
+        fov_x_deg=fov_x_deg,
+        image_width=width,
+        image_height=height,
     )
 
 
@@ -541,19 +636,15 @@ def choose_keyframes(records: list[dict[str, Any]], count: int) -> set[int]:
     }
 
 
-def model_specs(models: str) -> list[str]:
-    if models == "both":
-        return ["da3", "moge3"]
-    if models in {"da3", "moge3"}:
-        return [models]
-    raise ExperimentError(f"unsupported --models value: {models}")
+def model_specs() -> list[str]:
+    """Experiment 1 now intentionally runs DA3 only."""
+
+    return ["da3"]
 
 
 def dependencies_for_worker(model_name: str) -> str:
     if model_name == "da3":
         return f"depth-anything-3 @ git+{DA3_CODE_REPOSITORY}@{DA3_CODE_REVISION}"
-    if model_name == "moge3":
-        return f"moge @ git+{MOGE_CODE_REPOSITORY}@{MOGE_CODE_REVISION}"
     raise ExperimentError(f"unknown worker model {model_name!r}")
 
 
@@ -580,16 +671,6 @@ def source_model_metadata(model_name: str) -> dict[str, Any]:
             "code_repository": DA3_CODE_REPOSITORY,
             "code_revision": DA3_CODE_REVISION,
             "worker_dependencies": worker_dependencies("da3"),
-        }
-    if model_name == "moge3":
-        return {
-            "name": "MoGe-3 ViT-L",
-            "model_id": MOGE_MODEL_ID,
-            "model_revision": MOGE_MODEL_REVISION,
-            "license": "MIT",
-            "code_repository": MOGE_CODE_REPOSITORY,
-            "code_revision": MOGE_CODE_REVISION,
-            "worker_dependencies": worker_dependencies("moge3"),
         }
     raise ExperimentError(f"unknown model {model_name!r}")
 
@@ -650,21 +731,16 @@ def build_run_fingerprint(args: argparse.Namespace, input_sha256: str, attestati
         "allow_private_unredacted_input": args.allow_private_unredacted_input,
         "source_clock_sha256": fingerprint(clock),
         "selected_clock_sha256": fingerprint(selected),
-        "requested_models": model_specs(args.models),
+        "requested_models": model_specs(),
         "requested_fps": args.fps,
         "resize": args.resize,
         "max_resolution": args.max_resolution,
         "model_input_size": {"width": input_size[0], "height": input_size[1], "mode": input_size[2]},
-        "requested_moge_precision": args.precision,
         "da3_precision_policy": "upstream_automatic_bf16_if_supported_else_fp16",
-        "moge_num_tokens": args.moge_num_tokens,
-        "moge_resolution_level": args.moge_resolution_level,
-        "moge_refine_steps": args.moge_refine_steps,
         "metric_preview_range_m": [args.metric_min_m, args.metric_max_m],
         "keyframe_count": args.keyframe_count,
-        "export_point_clouds": args.export_point_clouds,
         "calibration": calibration.to_manifest() if calibration else None,
-        "models": {model: source_model_metadata(model) for model in model_specs(args.models)},
+        "models": {"da3": source_model_metadata("da3")},
     }
 
 
@@ -673,7 +749,7 @@ def initial_run_manifest(run_id: str, run_dir: Path, input_metadata: dict[str, A
                          selected: list[dict[str, Any]], run_fingerprint: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "artifact_type": "private_depth_model_comparison",
+        "artifact_type": "private_da3_metric_depth_experiment",
         "status": "preflight_complete",
         "run_id": run_id,
         "run_directory": str(run_dir.resolve()),
@@ -728,34 +804,22 @@ def update_run_manifest(manifest_path: Path, manifest: dict[str, Any], **changes
 
 def build_worker_request(run_dir: Path, model_name: str, input_path: Path,
                          selected_clock: list[dict[str, Any]], run_fingerprint_sha256: str,
-                         calibration: Calibration | None, input_size: tuple[int, int, str],
-                         args: argparse.Namespace, keyframes: set[int]) -> Path:
-    inference_settings: dict[str, Any]
-    if model_name == "da3":
-        inference_settings = {
-            "api": "DepthAnything3.inference",
-            "process_res": max(input_size[0], input_size[1]),
-            "process_res_method": "upper_bound_resize",
-            "export_format": "mini_npz (no upstream export written)",
-            "intrinsics_policy": "pass K only when fx, fy, cx, cy are all supplied",
-            "metric_conversion": "depth_m_estimate = canonical_depth * focal_px / 300",
-            "confidence": (
-                "upstream prediction.conf stored float32 when emitted; if the pinned checkpoint emits none, "
-                "store an all-NaN float32 unavailable sentinel plus confidence_available=0. Never fabricate confidence."
-            ),
-            "precision_policy": "Depth Anything 3 upstream automatically selects bf16 when supported, else fp16; --precision controls MoGe only",
-        }
-    else:
-        inference_settings = {
-            "api": "MoGeModel.infer",
-            "force_projection": True,
-            "apply_mask": True,
-            "num_tokens": args.moge_num_tokens,
-            "resolution_level": args.moge_resolution_level,
-            "refine_steps": args.moge_refine_steps,
-            "use_fp16": args.precision == "fp16",
-            "intrinsics_policy": "always save unconditioned predicted intrinsics; use supplied fov_x_deg when available for output geometry",
-        }
+                         calibration: Calibration | None, input_size: tuple[int, int, str]) -> Path:
+    if model_name != "da3":
+        raise ExperimentError(f"unsupported DA3-only worker model: {model_name}")
+    inference_settings = {
+        "api": "DepthAnything3.inference",
+        "process_res": max(input_size[0], input_size[1]),
+        "process_res_method": "upper_bound_resize",
+        "export_format": "mini_npz (no upstream export written)",
+        "intrinsics_policy": "pass K only when fx, fy, cx, cy are all supplied",
+        "metric_conversion": "depth_m_estimate = canonical_depth * focal_px / 300",
+        "confidence": (
+            "upstream prediction.conf stored float32 when emitted; if the pinned checkpoint emits none, "
+            "store an all-NaN float32 unavailable sentinel plus confidence_available=0. Never fabricate confidence."
+        ),
+        "precision_policy": "Depth Anything 3 upstream automatically selects bf16 when supported, else fp16",
+    }
     request = {
         "schema_version": SCHEMA_VERSION,
         "worker_model": model_name,
@@ -766,12 +830,6 @@ def build_worker_request(run_dir: Path, model_name: str, input_path: Path,
         "model": source_model_metadata(model_name),
         "calibration": calibration.to_manifest() if calibration else None,
         "model_input_size": {"width": input_size[0], "height": input_size[1], "mode": input_size[2]},
-        "moge_precision": args.precision,
-        "moge_num_tokens": args.moge_num_tokens,
-        "moge_resolution_level": args.moge_resolution_level,
-        "moge_refine_steps": args.moge_refine_steps,
-        "keyframe_indices": sorted(keyframes),
-        "export_point_clouds": args.export_point_clouds,
         "inference_settings": inference_settings,
     }
     path = run_dir / "worker-requests" / f"{model_name}.json"
@@ -833,10 +891,9 @@ def validate_worker_result(path: Path, model_name: str) -> dict[str, Any]:
         with np.load(path, allow_pickle=False) as archive:
             keys = set(archive.files)
             required = {"frame_index", "pts", "depth_m_estimate"}
-            if model_name == "da3":
-                required |= {"confidence", "confidence_available"}
-            elif model_name == "moge3":
-                required |= {"valid_mask", "intrinsics_used_normalized", "intrinsics_predicted_normalized"}
+            if model_name != "da3":
+                raise ExperimentError(f"unsupported DA3-only worker model: {model_name}")
+            required |= {"confidence", "confidence_available"}
             missing = required - keys
             if missing:
                 raise ExperimentError(f"{path} is missing required arrays: {sorted(missing)}")
@@ -874,6 +931,10 @@ def calibration_from_manifest(value: dict[str, Any] | None) -> Calibration | Non
     return Calibration(
         source_path=str(value["source_path"]),
         source_sha256=str(value["source_sha256"]),
+        condition_type=str(value.get("condition_type", CONDITION_TYPE_APPROVED_CALIBRATION)),
+        camera_segment=str(value["camera_segment"]) if value.get("camera_segment") is not None else None,
+        approval_status=str(value["approval_status"]),
+        camera_setup_fingerprint_sha256=str(value["camera_setup_fingerprint_sha256"]),
         projection=str(value["projection"]),
         fx=value.get("fx_px"),
         fy=value.get("fy_px"),
@@ -883,6 +944,19 @@ def calibration_from_manifest(value: dict[str, Any] | None) -> Calibration | Non
         image_width=value.get("image_width"),
         image_height=value.get("image_height"),
     )
+
+
+def require_calibration_setup_binding(calibration: Calibration | None, attestation: dict[str, Any]) -> None:
+    """Never apply a calibration profile unless the input attests its exact setup group."""
+
+    if calibration is None or calibration.condition_type != CONDITION_TYPE_APPROVED_CALIBRATION:
+        return
+    input_setup = attestation.get("camera_setup_fingerprint_sha256")
+    if input_setup != calibration.camera_setup_fingerprint_sha256:
+        raise ExperimentError(
+            "camera calibration setup fingerprint does not match the input attestation; "
+            "do not apply a calibration from another GoPro lens/stabilization group"
+        )
 
 
 def intrinsics_for_resized_input(calibration: Calibration | None, source_width: int, source_height: int,
@@ -920,6 +994,17 @@ def focal_for_depth_map(calibration: Calibration | None, source_width: int, sour
     return sum(values) / len(values) if values else None
 
 
+def metric_conditioning_status(calibration: Calibration | None) -> tuple[str, str]:
+    """Keep approved metric conditioning distinct from exploratory metadata use."""
+
+    if calibration is not None and calibration.focal_px is not None:
+        if calibration.condition_type == CONDITION_TYPE_APPROVED_CALIBRATION:
+            return "calibration_conditioned_metres_estimate", "supplied_approved_calibration"
+        if calibration.condition_type == CONDITION_TYPE_METADATA_FOV:
+            return "metadata_fov_conditioned_exploratory_metres_estimate", f"camera_segment_{calibration.camera_segment}_recorded_fov"
+    return "exploratory_metres_estimate_no_calibration", ""
+
+
 def resolve_da3_model() -> tuple[Any, dict[str, Any]]:
     import torch
     from depth_anything_3.api import DepthAnything3
@@ -939,31 +1024,6 @@ def resolve_da3_model() -> tuple[Any, dict[str, Any]]:
         "local_snapshot": snapshot,
         "model_file_sha256": sha256_file(Path(snapshot) / "model.safetensors"),
     }
-
-
-def resolve_moge_model() -> tuple[Any, dict[str, Any]]:
-    import torch
-    from huggingface_hub import HfApi, hf_hub_download
-    from moge.model.v3 import MoGeModel
-
-    info = HfApi().model_info(MOGE_MODEL_ID, revision=MOGE_MODEL_REVISION)
-    if info.sha != MOGE_MODEL_REVISION:
-        raise ExperimentError(
-            f"MoGe resolved {info.sha}, not pinned revision {MOGE_MODEL_REVISION}; refusing a moving checkpoint"
-        )
-    checkpoint = hf_hub_download(repo_id=MOGE_MODEL_ID, filename="model.pt", revision=MOGE_MODEL_REVISION)
-    model = MoGeModel.from_pretrained(checkpoint).to(torch.device("cuda")).eval()
-    return model, {
-        "huggingface_model_id": MOGE_MODEL_ID,
-        "requested_revision": MOGE_MODEL_REVISION,
-        "resolved_revision": info.sha,
-        "checkpoint_path": checkpoint,
-        "checkpoint_sha256": sha256_file(Path(checkpoint)),
-    }
-
-
-def tensor_to_numpy(value: Any) -> Any:
-    return value.detach().float().cpu().numpy()
 
 
 def da3_confidence_for_storage(upstream_confidence: Any, canonical_depth_shape: tuple[int, int],
@@ -1036,9 +1096,9 @@ def infer_da3(model: Any, frame_bgr: Any, source_width: int, source_height: int,
         else np.full((3, 3), np.nan, dtype=np.float32)
     )
     focal_px = focal_for_depth_map(calibration, source_width, source_height, depth_width, depth_height)
+    metric_status, focal_source = metric_conditioning_status(calibration)
     if focal_px is not None:
-        metric_status = "calibration_conditioned_metres_estimate"
-        focal_source = "supplied_calibration"
+        pass
     else:
         candidate = float((predicted_intrinsics_array[0, 0] + predicted_intrinsics_array[1, 1]) / 2.0)
         if not math.isfinite(candidate) or candidate <= 0:
@@ -1047,7 +1107,6 @@ def infer_da3(model: Any, frame_bgr: Any, source_width: int, source_height: int,
         else:
             focal_source = "da3_predicted_intrinsics"
         focal_px = candidate
-        metric_status = "exploratory_metres_estimate_no_calibration"
     depth_m = (raw_depth * np.float32(focal_px / 300.0)).astype(np.float32)
     if not np.isfinite(depth_m).any() or not np.any(depth_m > 0):
         raise ExperimentError("DA3 emitted no positive finite depth values")
@@ -1073,120 +1132,6 @@ def infer_da3(model: Any, frame_bgr: Any, source_width: int, source_height: int,
         "confidence_available": confidence_available,
     }
     return arrays, record
-
-
-def infer_moge(model: Any, frame_bgr: Any, source_width: int, source_height: int,
-               calibration: Calibration | None, request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
-    import cv2
-    import numpy as np
-    import torch
-
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    height, width = rgb.shape[:2]
-    image = torch.from_numpy(rgb).to(device="cuda", dtype=torch.float32).permute(2, 0, 1) / 255.0
-    common: dict[str, Any] = {
-        "num_tokens": request.get("moge_num_tokens"),
-        "resolution_level": request["moge_resolution_level"],
-        "refine_steps": request["moge_refine_steps"],
-        "use_fp16": request["moge_precision"] == "fp16",
-        "apply_mask": True,
-    }
-    torch.cuda.synchronize()
-    started = time.perf_counter()
-    # Save truly model-predicted intrinsics before conditioning with GoPro FOV.
-    predicted = model.infer(image, fov_x=None, **common)
-    torch.cuda.synchronize()
-    prediction_latency_ms = (time.perf_counter() - started) * 1000.0
-    if calibration is not None and calibration.fov_x_deg is not None:
-        torch.cuda.synchronize()
-        conditioned_started = time.perf_counter()
-        output = model.infer(image, fov_x=calibration.fov_x_deg, **common)
-        torch.cuda.synchronize()
-        conditioned_latency_ms = (time.perf_counter() - conditioned_started) * 1000.0
-        intrinsics_source = "supplied_calibration_fov"
-        metric_status = "calibration_conditioned_metres_estimate"
-    else:
-        output = predicted
-        conditioned_latency_ms = 0.0
-        intrinsics_source = "moge_predicted"
-        metric_status = "exploratory_metres_estimate_no_calibration"
-
-    def output_array(mapping: dict[str, Any], key: str) -> Any:
-        if key not in mapping:
-            raise ExperimentError(f"MoGe output did not contain required {key!r}")
-        return tensor_to_numpy(mapping[key])
-
-    depth = output_array(output, "depth").astype(np.float32)
-    valid_mask = output_array(output, "mask").astype(bool)
-    points = output_array(output, "points").astype(np.float32)
-    normal = output_array(output, "normal").astype(np.float32)
-    used_intrinsics = output_array(output, "intrinsics").astype(np.float32)
-    predicted_intrinsics = output_array(predicted, "intrinsics").astype(np.float32)
-    depth = upsample_to_source(depth, source_width, source_height, cv2.INTER_LINEAR).astype(np.float32)
-    valid_mask = upsample_to_source(valid_mask.astype(np.uint8), source_width, source_height, cv2.INTER_NEAREST).astype(bool)
-    depth[~valid_mask] = np.nan
-    if not np.isfinite(depth).any() or not np.any(depth[valid_mask] > 0):
-        raise ExperimentError("MoGe emitted no positive finite valid depth values")
-    arrays = {
-        "depth_m_estimate": depth,
-        "valid_mask": valid_mask,
-        "intrinsics_predicted_normalized": predicted_intrinsics,
-        "intrinsics_used_normalized": used_intrinsics,
-    }
-    geometry = {
-        "points_camera_m_estimate": points,
-        "normal_camera": normal,
-        "valid_mask": output_array(output, "mask").astype(bool),
-        "model_input_width": width,
-        "model_input_height": height,
-    }
-    record = {
-        "latency_ms": prediction_latency_ms + conditioned_latency_ms,
-        "unconditioned_prediction_latency_ms": prediction_latency_ms,
-        "calibration_conditioned_latency_ms": conditioned_latency_ms,
-        "intrinsics_source": intrinsics_source,
-        "metric_status": metric_status,
-        "model_input_resolution": {"width": width, "height": height},
-        "stored_map_resolution": {"width": source_width, "height": source_height},
-    }
-    return arrays, record, geometry
-
-
-def write_point_cloud(path: Path, points: Any, normals: Any, mask: Any) -> dict[str, Any]:
-    """Optional camera-space PLY: explicitly a model estimate, never reconstruction truth."""
-
-    import numpy as np
-
-    valid = mask & np.isfinite(points).all(axis=-1) & np.isfinite(normals).all(axis=-1)
-    points_flat = points[valid]
-    normals_flat = normals[valid]
-    if not len(points_flat):
-        raise ExperimentError("selected MoGe keyframe has no valid points for PLY export")
-    max_points = 200_000
-    stride = max(1, math.ceil(len(points_flat) / max_points))
-    points_flat = points_flat[::stride]
-    normals_flat = normals_flat[::stride]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_name(f".{path.name}.{os.getpid()}.partial")
-    try:
-        with partial.open("w", encoding="ascii") as handle:
-            handle.write("ply\nformat ascii 1.0\n")
-            handle.write("comment Private model estimate from MoGe-3; not ground-truth reconstruction.\n")
-            handle.write("comment OpenCV camera coordinates: x right, y down, z forward; metres estimated.\n")
-            handle.write(f"element vertex {len(points_flat)}\n")
-            for axis in ("x", "y", "z", "nx", "ny", "nz"):
-                handle.write(f"property float {axis}\n")
-            handle.write("end_header\n")
-            for point, normal in zip(points_flat, normals_flat, strict=True):
-                handle.write(" ".join(f"{float(value):.7g}" for value in (*point, *normal)) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(partial, path)
-        fsync_directory(path.parent)
-    finally:
-        if partial.exists():
-            partial.unlink(missing_ok=True)
-    return {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size, "point_count": len(points_flat)}
 
 
 def load_worker_state(path: Path, initial: dict[str, Any]) -> dict[str, Any]:
@@ -1227,12 +1172,11 @@ def worker_results_are_complete(run_dir: Path, model_name: str, selected: list[d
 
 
 def expected_preview_names(models: list[str]) -> set[str]:
-    """Name every preview required for a terminal run, including comparison views."""
+    """Name every DA3 preview required for a terminal run."""
 
-    names = {f"{model_name}_{kind}" for model_name in models for kind in ("metric", "structural")}
-    if set(models) == {"da3", "moge3"}:
-        names |= {"comparison_metric", "comparison_structural"}
-    return names
+    if models != ["da3"]:
+        raise ExperimentError("DA3-only experiment expected exactly the DA3 worker")
+    return {"da3_metric", "da3_structural"}
 
 
 def completed_run_is_valid(run_dir: Path, manifest: dict[str, Any], selected: list[dict[str, Any]],
@@ -1301,17 +1245,12 @@ def worker_process(request: dict[str, Any]) -> None:
     input_path = Path(request["input_path"])
     state_path = worker_state_path(run_dir, model_name)
     model_dir = run_dir / "arrays" / model_name
-    geometry_dir = run_dir / "keyframes" / model_name
     source_clock = request["selected_source_clock"]
     calibration = calibration_from_manifest(request.get("calibration"))
     worker_fingerprint = {
         "run_fingerprint_sha256": request["run_fingerprint_sha256"],
         "model": request["model"],
         "model_input_size": request["model_input_size"],
-        "moge_precision": request["moge_precision"],
-        "moge_num_tokens": request["moge_num_tokens"],
-        "moge_resolution_level": request["moge_resolution_level"],
-        "moge_refine_steps": request["moge_refine_steps"],
         "calibration": request.get("calibration"),
         "inference_settings": request["inference_settings"],
     }
@@ -1337,16 +1276,13 @@ def worker_process(request: dict[str, Any]) -> None:
     try:
         if not torch.cuda.is_available():
             raise ExperimentError("CUDA is unavailable; refusing a CPU fallback for this RunPod GPU experiment")
-        if model_name == "da3":
-            model, model_provenance = resolve_da3_model()
-        elif model_name == "moge3":
-            model, model_provenance = resolve_moge_model()
-        else:
+        if model_name != "da3":
             raise ExperimentError(f"unknown worker model: {model_name}")
+        model, model_provenance = resolve_da3_model()
         state["model_provenance"].update(model_provenance)
         state["environment"] = {
             "python": sys.version,
-            "packages": package_versions(["torch", "torchvision", "numpy", "av", "opencv-python-headless", "depth-anything-3", "moge"]),
+            "packages": package_versions(["torch", "torchvision", "numpy", "av", "opencv-python-headless", "depth-anything-3"]),
             "torch_cuda": torch.version.cuda,
             "gpu_name": torch.cuda.get_device_name(0),
             "gpu_device_count": torch.cuda.device_count(),
@@ -1387,11 +1323,7 @@ def worker_process(request: dict[str, Any]) -> None:
                 model_height = request["model_input_size"]["height"]
                 model_input = resize_bgr_for_model(frame_bgr, model_width, model_height)
                 torch.cuda.reset_peak_memory_stats()
-                if model_name == "da3":
-                    arrays, details = infer_da3(model, model_input, source_width, source_height, calibration)
-                    geometry = None
-                else:
-                    arrays, details, geometry = infer_moge(model, model_input, source_width, source_height, calibration, request)
+                arrays, details = infer_da3(model, model_input, source_width, source_height, calibration)
                 arrays.update(
                     {
                         "frame_index": np.asarray([frame_index], dtype=np.int64),
@@ -1413,32 +1345,6 @@ def worker_process(request: dict[str, Any]) -> None:
                         "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
                     }
                 )
-                if geometry is not None and frame_index in set(request["keyframe_indices"]):
-                    geometry_path = geometry_dir / f"frame_{frame_index:08d}.npz"
-                    atomic_save_npz(
-                        geometry_path,
-                        {
-                            "points_camera_m_estimate": geometry["points_camera_m_estimate"],
-                            "normal_camera": geometry["normal_camera"],
-                            "valid_mask": geometry["valid_mask"],
-                            "frame_index": np.asarray([frame_index], dtype=np.int64),
-                            "pts": np.asarray([record["pts"]], dtype=np.int64),
-                        },
-                    )
-                    geometry_record: dict[str, Any] = {
-                        "npz_path": str(geometry_path),
-                        "npz_sha256": sha256_file(geometry_path),
-                        "npz_size_bytes": geometry_path.stat().st_size,
-                        "coordinate_system": "OpenCV camera: x right, y down, z forward; estimated metres",
-                    }
-                    if request["export_point_clouds"]:
-                        geometry_record["ply"] = write_point_cloud(
-                            geometry_dir / f"frame_{frame_index:08d}.estimated.ply",
-                            geometry["points_camera_m_estimate"],
-                            geometry["normal_camera"],
-                            geometry["valid_mask"],
-                        )
-                    details["keyframe_geometry"] = geometry_record
                 state["completed_frames"][str(frame_index)] = details
                 state["updated_at"] = utc_now()
                 atomic_write_json(state_path, state)
@@ -1503,55 +1409,6 @@ def colourize_structural_depth(depth: Any, valid: Any) -> Any:
     cv2.putText(image, label, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(image, label, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (20, 20, 20), 1, cv2.LINE_AA)
     return image
-
-
-def annotate_panel(image: Any, title: str, subtitle: str | None = None) -> Any:
-    import cv2
-
-    panel = image.copy()
-    header_height = 62 if subtitle else 38
-    cv2.rectangle(panel, (0, 0), (panel.shape[1], header_height), (0, 0, 0), thickness=-1)
-    cv2.putText(panel, title, (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.64, (255, 255, 255), 2, cv2.LINE_AA)
-    if subtitle:
-        cv2.putText(panel, subtitle, (12, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
-    return panel
-
-
-def quality_overlay(da3_confidence: Any, moge_valid: Any, da3_confidence_available: bool) -> Any:
-    import cv2
-    import numpy as np
-
-    finite = da3_confidence[np.isfinite(da3_confidence)]
-    if da3_confidence_available and finite.size >= 4:
-        low, high = np.percentile(finite, [2.0, 98.0])
-        high = max(float(high), float(low) + 1e-6)
-        values = np.clip((da3_confidence - low) / (high - low), 0.0, 1.0)
-        confidence = cv2.applyColorMap((values * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
-        label = "DA3 model confidence | RED = MoGe invalid"
-    else:
-        confidence = np.full((*da3_confidence.shape, 3), 80, dtype=np.uint8)
-        label = "DA3 confidence unavailable | RED = MoGe invalid"
-    invalid = ~moge_valid.astype(bool)
-    confidence[invalid] = (0, 0, 255)
-    cv2.putText(confidence, label, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(confidence, label, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (20, 20, 20), 1, cv2.LINE_AA)
-    return confidence
-
-
-def tile_panels(panels: list[Any], max_width: int) -> Any:
-    import cv2
-
-    if len(panels) != 4:
-        raise ExperimentError("comparison tile needs exactly four panels")
-    source_height, source_width = panels[0].shape[:2]
-    panel_width = min(source_width, max(160, max_width // 2))
-    panel_height = max(2, round(source_height * panel_width / source_width))
-    if panel_height % 2:
-        panel_height -= 1
-    if panel_width % 2:
-        panel_width -= 1
-    resized = [cv2.resize(panel, (panel_width, panel_height), interpolation=cv2.INTER_AREA) for panel in panels]
-    return cv2.vconcat([cv2.hconcat(resized[:2]), cv2.hconcat(resized[2:])])
 
 
 def open_preview_writer(path: Path, width: int, height: int, rate: Fraction, time_base: Fraction) -> tuple[Any, Any]:
@@ -1628,7 +1485,7 @@ def verify_preview_decode(path: Path, expected_records: list[dict[str, Any]]) ->
 
 def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, Any]],
                     probe: dict[str, Any], models: list[str], metric_min_m: float,
-                    metric_max_m: float, preview_max_width: int) -> dict[str, Any]:
+                    metric_max_m: float) -> dict[str, Any]:
     """Render visual artifacts only after every requested numeric map is complete."""
 
     import av
@@ -1636,33 +1493,24 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
 
     if not 0 < metric_min_m < metric_max_m:
         raise ExperimentError("metric preview range must satisfy 0 < --metric-min-m < --metric-max-m")
-    if preview_max_width < 320:
-        raise ExperimentError("--preview-max-width must be at least 320")
     selected_by_index = {record["frame_index"]: record for record in selected}
     time_base = Fraction(probe["time_base"])
     rate = fraction_from_text(probe["avg_frame_rate"], "avg_frame_rate")
+    if models != ["da3"]:
+        raise ExperimentError("DA3-only experiment expected exactly the DA3 worker")
     exploratory_by_model: dict[str, bool] = {}
-    da3_confidence_available = True
     for model_name in models:
         worker = load_json_object(worker_state_path(run_dir, model_name), f"{model_name} worker manifest")
         frame_details = list(worker.get("completed_frames", {}).values())
         exploratory_by_model[model_name] = any(
-            detail.get("metric_status") == "exploratory_metres_estimate_no_calibration"
+            detail.get("metric_status") != "calibration_conditioned_metres_estimate"
             for detail in frame_details
         )
-        if model_name == "da3":
-            da3_confidence_available = bool(frame_details) and all(
-                detail.get("confidence_status") == "upstream_prediction_conf"
-                for detail in frame_details
-            )
     previews_dir = run_dir / "previews"
     targets: dict[str, Path] = {}
     for model_name in models:
         targets[f"{model_name}_metric"] = previews_dir / f"{model_name}_metric_depth.partial.mp4"
         targets[f"{model_name}_structural"] = previews_dir / f"{model_name}_structural_only.partial.mp4"
-    if set(models) == {"da3", "moge3"}:
-        targets["comparison_metric"] = previews_dir / "comparison_metric.partial.mp4"
-        targets["comparison_structural"] = previews_dir / "comparison_structural_only.partial.mp4"
     writers: dict[str, tuple[Any, Any]] = {}
     final_paths = {name: path.with_name(path.name.replace(".partial", "")) for name, path in targets.items()}
     try:
@@ -1686,8 +1534,6 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
             for model_name, arrays in model_data.items():
                 depth = arrays["depth_m_estimate"]
                 valid = np.isfinite(depth)
-                if model_name == "moge3":
-                    valid &= arrays["valid_mask"].astype(bool)
                 panels_metric[model_name] = colourize_metric_depth(
                     depth, valid, metric_min_m, metric_max_m, exploratory_by_model[model_name]
                 )
@@ -1700,64 +1546,9 @@ def render_previews(run_dir: Path, input_path: Path, selected: list[dict[str, An
                     writers[f"{model_name}_structural"] = open_preview_writer(
                         targets[f"{model_name}_structural"], rgb_bgr.shape[1], rgb_bgr.shape[0], rate, time_base
                     )
-                if "comparison_metric" in targets:
-                    comparison_shape = tile_panels([rgb_bgr, rgb_bgr, rgb_bgr, rgb_bgr], preview_max_width)
-                    writers["comparison_metric"] = open_preview_writer(
-                        targets["comparison_metric"], comparison_shape.shape[1], comparison_shape.shape[0], rate, time_base
-                    )
-                    writers["comparison_structural"] = open_preview_writer(
-                        targets["comparison_structural"], comparison_shape.shape[1], comparison_shape.shape[0], rate, time_base
-                    )
             for model_name in models:
                 encode_preview_frame(*writers[f"{model_name}_metric"], panels_metric[model_name], record["pts"], time_base)
                 encode_preview_frame(*writers[f"{model_name}_structural"], panels_structural[model_name], record["pts"], time_base)
-            if "comparison_metric" in writers:
-                da3 = model_data["da3"]
-                moge = model_data["moge3"]
-                quality = quality_overlay(da3["confidence"], moge["valid_mask"], da3_confidence_available)
-                quality_subtitle = (
-                    "DA3 confidence; red = MoGe invalid"
-                    if da3_confidence_available
-                    else "DA3 unavailable; red = MoGe invalid"
-                )
-                metric_tile = tile_panels(
-                    [
-                        annotate_panel(rgb_bgr, "Redacted RGB", "Source PTS preserved"),
-                        annotate_panel(
-                            panels_metric["da3"],
-                            "DA3 Metric Large",
-                            f"Fixed scale {metric_min_m:.2f}-{metric_max_m:.2f} m"
-                            + (" | exploratory, no calibration" if exploratory_by_model["da3"] else ""),
-                        ),
-                        annotate_panel(
-                            panels_metric["moge3"],
-                            "MoGe-3 ViT-L",
-                            f"Fixed scale {metric_min_m:.2f}-{metric_max_m:.2f} m"
-                            + (" | exploratory, no calibration" if exploratory_by_model["moge3"] else ""),
-                        ),
-                        annotate_panel(quality, "Quality / confidence", quality_subtitle),
-                    ],
-                    preview_max_width,
-                )
-                structural_tile = tile_panels(
-                    [
-                        annotate_panel(rgb_bgr, "Redacted RGB", "Source PTS preserved"),
-                        annotate_panel(
-                            panels_structural["da3"],
-                            "DA3 structural only",
-                            "Per-frame normalized; not metric comparison",
-                        ),
-                        annotate_panel(
-                            panels_structural["moge3"],
-                            "MoGe-3 structural only",
-                            "Per-frame normalized; not metric comparison",
-                        ),
-                        annotate_panel(quality, "Quality / confidence", quality_subtitle),
-                    ],
-                    preview_max_width,
-                )
-                encode_preview_frame(*writers["comparison_metric"], metric_tile, record["pts"], time_base)
-                encode_preview_frame(*writers["comparison_structural"], structural_tile, record["pts"], time_base)
         input_container.close()
         for container, stream_writer in writers.values():
             close_preview_writer(container, stream_writer)
@@ -1796,8 +1587,6 @@ def compute_temporal_flicker(run_dir: Path, model_name: str, selected: list[dict
         archive = load_depth_archive(run_dir / "arrays" / model_name / f"frame_{record['frame_index']:08d}.npz", model_name)
         depth = archive["depth_m_estimate"]
         valid = np.isfinite(depth)
-        if model_name == "moge3":
-            valid &= archive["valid_mask"].astype(bool)
         if previous is not None:
             previous_depth, previous_valid = previous
             overlap = valid & previous_valid
@@ -1855,15 +1644,19 @@ def representative_review_rows(selected: list[dict[str, Any]], keyframes: set[in
 def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, Any],
                  keyframes: set[int]) -> Path:
     selected = manifest["selected_source_clock"]
-    models = list(manifest["models"])
-    summaries = {model: model_report_summary(run_dir, model, selected) for model in models}
+    if set(manifest["models"]) != {"da3"}:
+        raise ExperimentError("DA3-only report cannot describe any other model")
+    summary = model_report_summary(run_dir, "da3", selected)
     output_size = byte_size(run_dir)
-    calibration = manifest.get("camera_calibration")
-    metric_note = (
-        "A supplied calibration/FOV was used where the adapter supports it. Outputs remain model estimates; this pilot has no ground-truth depth."
-        if calibration
-        else "No calibrated intrinsics/FOV was supplied. Both models' metre-valued outputs are exploratory estimates, not measurements; this pilot has no ground-truth depth."
-    )
+    calibration = calibration_from_manifest(manifest.get("camera_calibration"))
+    if calibration and calibration.condition_type == CONDITION_TYPE_APPROVED_CALIBRATION:
+        metric_note = "A supplied approved calibration was used to condition DA3's focal conversion. Outputs remain model estimates; this pilot has no ground-truth depth."
+    elif calibration and calibration.condition_type == CONDITION_TYPE_METADATA_FOV:
+        metric_note = "Recorded GoPro FOV from the selected camera segment conditioned DA3's focal conversion. These metre-valued outputs are exploratory estimates, not measurements; this pilot has no ground-truth depth."
+    elif calibration and calibration.condition_type == CONDITION_TYPE_METADATA_NO_PINHOLE:
+        metric_note = "The selected Wide/stabilized camera segment supplies no pinhole intrinsics. DA3 metre-valued outputs are exploratory estimates, not measurements; this pilot has no ground-truth depth."
+    else:
+        metric_note = "No approved calibration was supplied. DA3 metre-valued outputs are exploratory estimates, not measurements; this pilot has no ground-truth depth."
     private_unredacted_exception = manifest["privacy"].get("private_unredacted_exception", False)
     scope_line = (
         "- Scope: one private unredacted source-footage exception, explicitly user-authorized; "
@@ -1872,8 +1665,12 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
         else "- Scope: one private, already-redacted, continuous child; no SLAM, reconstruction, "
         "segmentation, production annotations, VLM calls, or uploads."
     )
+    provenance = summary["model_provenance"]
+    latency = summary["per_frame_latency_ms"]
+    memory = summary["cuda_peak_memory_bytes"]
+    confidence = summary["confidence"]
     lines = [
-        "# Experiment 1 — DA3 Metric Large vs MoGe-3 ViT-L",
+        "# Experiment 1 — Depth Anything 3 Metric Large",
         "",
         "## Scope and result status",
         "",
@@ -1882,7 +1679,7 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
         f"- Source frames: {len(manifest['source_clock'])}; inferred frames: {len(selected)}.",
         f"- Input SHA-256: `{manifest['input']['sha256']}`",
         f"- Input resolution / rate: {manifest['input']['resolution']['width']}x{manifest['input']['resolution']['height']} at `{manifest['input']['frame_rate']['avg_frame_rate']}` fps.",
-        f"- Metric comparison colour scale: {manifest['run_fingerprint']['metric_preview_range_m'][0]:.2f}-{manifest['run_fingerprint']['metric_preview_range_m'][1]:.2f} m, fixed for both models.",
+        f"- Fixed metric-preview colour scale: {manifest['run_fingerprint']['metric_preview_range_m'][0]:.2f}-{manifest['run_fingerprint']['metric_preview_range_m'][1]:.2f} m.",
         f"- {metric_note}",
         f"- Recorded failed attempt(s) before completion: {len(manifest.get('failures', []))}.",
         "- Decode requirement: full source decode matched ffprobe before inference; each preview MP4 was fully decoded after encode.",
@@ -1891,45 +1688,35 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
         "",
         "| Model | Checkpoint | Immutable revision | License | Pinned source revision |",
         "| --- | --- | --- | --- | --- |",
+        f"| {provenance['name']} | `{provenance['huggingface_model_id']}` | `{provenance['resolved_revision']}` | {provenance['license']} | `{provenance['code_revision']}` |",
     ]
     if private_unredacted_exception:
         lines.append(
             "- Privacy restriction: input status is `private_unredacted_user_authorized`; do not publish, "
             "share, or upload this input or any derived artifact."
         )
-    for model in models:
-        provenance = summaries[model]["model_provenance"]
+    lines.extend(
+        [
+            "",
+            "## Runtime, memory, and outputs",
+            "",
+            f"- Per-frame latency: median {latency['median']:.1f} ms; p95 {latency['p95']:.1f} ms; max {latency['max']:.1f} ms.",
+            f"- Practical peak GPU memory: allocated {memory['max_allocated'] / (1024**3):.2f} GiB; reserved {memory['max_reserved'] / (1024**3):.2f} GiB.",
+            f"- Lossless numeric output: {summary['numeric_output_size_bytes'] / (1024**2):.1f} MiB.",
+            f"- Temporal-flicker proxy: {summary['temporal_flicker_proxy']['median_m']!r} m median / {summary['temporal_flicker_proxy']['p95_m']!r} m p95 over {summary['temporal_flicker_proxy']['pair_count']} adjacent selected-frame pairs. This proxy includes true camera/object motion.",
+        ]
+    )
+    if confidence["unavailable_frame_count"]:
         lines.append(
-            f"| {provenance['name']} | `{provenance['huggingface_model_id']}` | `{provenance['resolved_revision']}` | {provenance['license']} | `{provenance['code_revision']}` |"
+            "- DA3 confidence: unavailable for "
+            f"{confidence['unavailable_frame_count']}/{len(selected)} frame(s) "
+            f"({', '.join(confidence['statuses'])}). The float32 `confidence` maps use an all-NaN "
+            "sentinel where upstream emitted no usable confidence; it is not a low-confidence estimate."
         )
-    lines.extend(["", "## Runtime, memory, and outputs", ""])
-    for model in models:
-        summary = summaries[model]
-        latency = summary["per_frame_latency_ms"]
-        memory = summary["cuda_peak_memory_bytes"]
-        lines.extend(
-            [
-                f"### {summary['model_provenance']['name']}",
-                "",
-                f"- Per-frame latency: median {latency['median']:.1f} ms; p95 {latency['p95']:.1f} ms; max {latency['max']:.1f} ms.",
-                f"- Practical peak GPU memory: allocated {memory['max_allocated'] / (1024**3):.2f} GiB; reserved {memory['max_reserved'] / (1024**3):.2f} GiB.",
-                f"- Lossless numeric output: {summary['numeric_output_size_bytes'] / (1024**2):.1f} MiB.",
-                f"- Temporal-flicker proxy: {summary['temporal_flicker_proxy']['median_m']!r} m median / {summary['temporal_flicker_proxy']['p95_m']!r} m p95 over {summary['temporal_flicker_proxy']['pair_count']} adjacent selected-frame pairs. This proxy includes true camera/object motion.",
-            ]
+    else:
+        lines.append(
+            "- DA3 confidence: upstream model output was present for every frame; values are not claimed to be calibrated probabilities."
         )
-        if model == "da3":
-            confidence = summary["confidence"]
-            if confidence["unavailable_frame_count"]:
-                lines.append(
-                    "- DA3 confidence: unavailable for "
-                    f"{confidence['unavailable_frame_count']}/{len(selected)} frame(s) "
-                    f"({', '.join(confidence['statuses'])}). The float32 `confidence` maps use an all-NaN "
-                    "sentinel where upstream emitted no usable confidence; the quality panel only shows MoGe validity there."
-                )
-            else:
-                lines.append(
-                    "- DA3 confidence: upstream model output was present for every frame; values are not claimed to be calibrated probabilities."
-                )
     lines.extend(
         [
             "",
@@ -1938,17 +1725,17 @@ def write_report(run_dir: Path, manifest: dict[str, Any], previews: dict[str, An
             "",
             "## Representative-frame qualitative assessment",
             "",
-            "The job deliberately does **not** make semantic claims about hands or objects from depth arrays. The rows below are a required human assessment record, preselected evenly across the clip. Use the metric comparison first; use the structurally normalised comparison only to inspect shape, never to compare scale.",
+            "The job deliberately does **not** make semantic claims about hands or objects from depth arrays. The rows below are a required human assessment record, preselected evenly across the clip. Use the fixed metric preview for scale plausibility; use the structurally normalised preview only to inspect shape, never to infer metric scale.",
             "",
             "| Source frame | Source time (s) | Assessment status | Review for |",
             "| ---: | ---: | --- | --- |",
             *representative_review_rows(selected, keyframes),
             "",
-            "Required review criteria: hands and fingertips; hand-object separation; contact-adjacent motion; glossy paint cans; thin tools; shelves and clutter; occlusion; edge bleeding; motion blur; and temporal flicker. Record which model is more plausible and any failure frame in this private report before treating the pilot as evidence.",
+            "Required review criteria: hands and fingertips; hand-object separation; contact-adjacent motion; glossy paint cans; thin tools; shelves and clutter; occlusion; edge bleeding; motion blur; and temporal flicker. Record every failure frame in this private report before treating the pilot as evidence.",
             "",
             "## Metric-scale limitation",
             "",
-            "There is no ground-truth depth in this pilot. Visual plausibility, agreement between models, or a stable-looking preview must not be converted into an accuracy claim. DA3's conversion uses `focal_px * canonical_depth / 300`; MoGe reports a model-estimated metric point/depth map. Calibration reduces an input ambiguity but is not a validation target.",
+            "There is no ground-truth depth in this pilot. Visual plausibility or a stable-looking preview must not be converted into an accuracy claim. DA3's conversion uses `focal_px * canonical_depth / 300`. Calibration reduces an input ambiguity but is not a validation target.",
             "",
             "## Preview artifacts",
             "",
@@ -1974,12 +1761,8 @@ def run_orchestrator(args: argparse.Namespace) -> int:
         raise ExperimentError(f"input attestation does not exist: {attestation_path}")
     if args.metric_min_m <= 0 or args.metric_max_m <= args.metric_min_m:
         raise ExperimentError("metric scale requires 0 < --metric-min-m < --metric-max-m")
-    if args.moge_resolution_level < 0 or args.moge_resolution_level > 9:
-        raise ExperimentError("--moge-resolution-level must be in [0, 9]")
-    if args.moge_refine_steps < 0:
-        raise ExperimentError("--moge-refine-steps must be non-negative")
-    if args.moge_num_tokens is not None and args.moge_num_tokens <= 0:
-        raise ExperimentError("--moge-num-tokens must be positive")
+    if args.camera_calibration and args.camera_segment:
+        raise ExperimentError("use either --camera-calibration or --camera-segment, never both")
 
     run_dir = output_dir / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -2023,6 +1806,9 @@ def run_orchestrator(args: argparse.Namespace) -> int:
     transfer_manifest.update({"status": "complete_decode_verified", "decoded_frame_count": len(clock), "updated_at": utc_now()})
     atomic_write_json(transfer_manifest_path, transfer_manifest)
     calibration = load_calibration(args.camera_calibration.resolve() if args.camera_calibration else None, probe["width"], probe["height"])
+    if args.camera_segment:
+        calibration = metadata_conditioning_for_segment(args.camera_segment, probe["width"], probe["height"])
+    require_calibration_setup_binding(calibration, attestation)
     resize = parse_resize(args.resize)
     input_size = model_input_size(probe["width"], probe["height"], resize, args.max_resolution)
     selected = select_source_frames(clock, args.fps)
@@ -2036,7 +1822,7 @@ def run_orchestrator(args: argparse.Namespace) -> int:
         manifest_path,
         initial_run_manifest(args.run_id, run_dir, input_metadata, calibration, clock, selected, run_fingerprint),
     )
-    requested_models = model_specs(args.models)
+    requested_models = model_specs()
     if manifest.get("status") == "complete":
         if completed_run_is_valid(run_dir, manifest, selected, requested_models):
             print(f"experiment already complete and verified: {manifest_path}")
@@ -2066,8 +1852,6 @@ def run_orchestrator(args: argparse.Namespace) -> int:
                 manifest["run_fingerprint_sha256"],
                 calibration,
                 input_size,
-                args,
-                keyframes,
             )
             update_run_manifest(
                 manifest_path,
@@ -2098,7 +1882,6 @@ def run_orchestrator(args: argparse.Namespace) -> int:
             requested_models,
             args.metric_min_m,
             args.metric_max_m,
-            args.preview_max_width,
         )
         manifest["previews"] = {"status": "complete", "artifacts": previews}
         update_run_manifest(manifest_path, manifest)
@@ -2132,23 +1915,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, help="private parent directory for experiment run IDs")
     parser.add_argument("--run-id", help="private experiment run ID")
-    parser.add_argument("--models", choices=["both", "da3", "moge3"], default="both", help="default: both")
     parser.add_argument("--camera-calibration", type=Path, help="optional approved private rectilinear/dewarped calibration JSON")
+    parser.add_argument(
+        "--camera-segment", choices=tuple(CAMERA_SEGMENTS),
+        help="simple private GoPro group: 1=Linear 120fps, 2=Linear 30fps, 3=Wide/EIS with no supplied K",
+    )
     parser.add_argument("--fps", type=float, help="explicit lower inference FPS; default processes every source frame")
     parser.add_argument("--resize", help="explicit model input WIDTHxHEIGHT; maps are upsampled and documented at source alignment")
     parser.add_argument("--max-resolution", type=int, help="aspect-preserving maximum model-input long edge")
-    parser.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
-    parser.add_argument("--moge-num-tokens", type=int, help="optional MoGe token budget; overrides resolution level")
-    parser.add_argument("--moge-resolution-level", type=int, default=9, help="MoGe level 0..9; default 9")
-    parser.add_argument("--moge-refine-steps", type=int, default=3, help="MoGe sparse refinement steps; default 3")
     parser.add_argument("--metric-min-m", type=float, default=DEFAULT_METRIC_MIN_M)
     parser.add_argument("--metric-max-m", type=float, default=DEFAULT_METRIC_MAX_M)
     parser.add_argument("--keyframe-count", type=int, default=DEFAULT_KEYFRAME_COUNT)
-    parser.add_argument("--export-point-clouds", action="store_true", help="write optional selected-keyframe estimated camera-space PLYs")
-    parser.add_argument("--preview-max-width", type=int, default=1920, help="maximum width of 2x2 comparison preview")
     parser.add_argument("--ffprobe-bin", default=os.environ.get("FFPROBE_BIN", "ffprobe"))
     parser.add_argument("--dry-run", action="store_true", help="preflight/hash/decode only; do not download models or infer")
-    parser.add_argument("--worker", choices=["da3", "moge3"], help=argparse.SUPPRESS)
+    parser.add_argument("--worker", choices=["da3"], help=argparse.SUPPRESS)
     parser.add_argument("--worker-request", type=Path, help=argparse.SUPPRESS)
     return parser
 
